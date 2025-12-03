@@ -4,6 +4,9 @@ import cors from "cors";
 import session from "cookie-session";
 import { config } from "./config/app.config";
 import connectDatabase from "./config/database.config";
+import { errorHandler } from "./middlewares/errorHandles.middleware";
+import { BadRequestException } from "./utils/appError";
+import { ErrorCodeEnum } from "./enums/error-code.enums";
 
 
 const app = express();
@@ -34,10 +37,15 @@ app.use(
 
 
 app.get('/', (req: Request, res: Response, next: NextFunction) => {
-    res.status(200).json({
-        message: "Server is running",
-    });
+    throw new BadRequestException(
+        "This is bad Request",
+        ErrorCodeEnum.AUTH_INVALID_TOKEN
+    );
 });
+
+
+
+app.use(errorHandler);
 
 app.listen(config.PORT, async() => {
     console.log(`Server listening on port ${config.PORT} in  ${config.NODE_ENV} Enviornment`);
