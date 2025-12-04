@@ -1,5 +1,6 @@
 import { ErrorRequestHandler,  Response } from "express";
 import { HTTPSTATUS } from "../config/http.config";
+import { AppError } from "../utils/appError";
 
 
 export const errorHandler: ErrorRequestHandler = (
@@ -16,8 +17,13 @@ export const errorHandler: ErrorRequestHandler = (
         });
     }
 
+    if (error instanceof AppError) {
+        return res.status(error.statusCode).json({
+          message: error.message,
+          errorCode: error.errorCode,
+        });
+      }
     
-
 
 
 

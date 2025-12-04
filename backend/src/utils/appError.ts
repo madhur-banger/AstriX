@@ -1,4 +1,3 @@
-import { error } from "console";
 import { HTTPSTATUS, HttpStatusCodeType } from "../config/http.config";
 import { ErrorCodeEnum, ErrorCodeEnumType } from "../enums/error-code.enums";
 
