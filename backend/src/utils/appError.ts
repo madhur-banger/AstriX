@@ -19,7 +19,7 @@ export class AppError extends Error {
 
 export class HttpException extends AppError {
     constructor(
-        message = "Http Exception Error",
+        message = "Http Exceptio]\n Error",
         statusCode: HttpStatusCodeType,
         errorCode?: ErrorCodeEnumType
     ){
