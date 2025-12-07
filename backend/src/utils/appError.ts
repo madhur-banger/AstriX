@@ -1,5 +1,5 @@
 import { HTTPSTATUS, HttpStatusCodeType } from "../config/http.config";
-import { ErrorCodeEnum, ErrorCodeEnumType } from "../enums/error-code.enums";
+import { ErrorCodeEnum, ErrorCodeEnumType } from "../enums/error-code.enum";
 
 export class AppError extends Error {
     public statusCode: HttpStatusCodeType;

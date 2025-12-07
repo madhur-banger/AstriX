@@ -1,13 +1,19 @@
 import "dotenv/config";
-import express, {NextFunction, Request, Response} from "express";
+import express, { NextFunction, Request, Response } from "express";
 import cors from "cors";
 import session from "cookie-session";
 import { config } from "./config/app.config";
 import connectDatabase from "./config/database.config";
+
+import { HTTPSTATUS } from "./config/http.config";
+import { asyncHandler } from "./middlewares/asyncHandler.middleware";
 import { errorHandler } from "./middlewares/errorHandles.middleware";
 import { BadRequestException } from "./utils/appError";
-import { ErrorCodeEnum } from "./enums/error-code.enums";
+import { ErrorCodeEnum } from "./enums/error-code.enum";
 
+import "./config/passport.config";
+import passport from "passport";
+import authRoutes from "./routes/auth.route";
 
 const app = express();
 const BASE_PATH = config.BASE_PATH;
@@ -26,7 +32,8 @@ app.use(session({
 })
 );
 
-
+app.use(passport.initialize());
+app.use(passport.session());
 
 app.use(
     cors({
@@ -43,6 +50,8 @@ app.get('/', (req: Request, res: Response, next: NextFunction) => {
     );
 });
 
+
+app.use(`${BASE_PATH}/auth`, authRoutes)
 
 
 app.use(errorHandler);
