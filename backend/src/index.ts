@@ -3,6 +3,8 @@ import express, { NextFunction, Request, Response } from "express";
 import cors from "cors";
 import session from "cookie-session";
 import { config } from "./config/app.config";
+import swaggerUi from "swagger-ui-express";
+import { swaggerSpec } from "./config/swagger.config";
 import connectDatabase from "./config/database.config";
 
 import { HTTPSTATUS } from "./config/http.config";
@@ -41,6 +43,9 @@ app.use(
         credentials: true,
     })
 );
+
+app.use("/api/docs", swaggerUi.serve, swaggerUi.setup(swaggerSpec));
+
 
 
 app.get('/', (req: Request, res: Response, next: NextFunction) => {
