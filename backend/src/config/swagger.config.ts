@@ -1,12 +1,16 @@
 import swaggerJSDoc from "swagger-jsdoc";
 
+import { authSchemas } from "../docs/schemas/auth.schemas";
+
+
+
 export const swaggerOptions: swaggerJSDoc.Options = {
   definition: {
     openapi: "3.0.0",
     info: {
       title: "Astrix : Project Management App",
       version: "1.0.0",
-      description: "Authentication APIs including Google OAuth",
+      description: "Project Management APIs with Auth implemented",
     },
     servers: [
       {
@@ -14,8 +18,15 @@ export const swaggerOptions: swaggerJSDoc.Options = {
         description: "Local server",
       },
     ],
+
+    components: {
+      schemas: {
+        ...authSchemas,
+      },
+    },
   },
-  apis: ["./src/routes/**/*.ts"], // route files for annotations
+
+  apis: ["./src/routes/**/*.ts"],
 };
 
 export const swaggerSpec = swaggerJSDoc(swaggerOptions);
