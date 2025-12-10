@@ -3,8 +3,8 @@ import {z} from "zod";
 export const nameSchema = z
     .string()
     .trim()
-    .min(1,{message: "Name is required"});
-    .max(255)
+    .min(1,{message: "Name is required"})
+    .max(255);
 
 export const descriptionSchema = z.string().optional();
 
