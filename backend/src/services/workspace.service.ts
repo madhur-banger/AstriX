@@ -141,3 +141,35 @@ export const getWorkspaceAnalyticsService = async (workspaceId: string) => {
 
     return { analytics };
 }
+
+export const changeMemberRoleService = async (
+    workspaceId: string,
+    memberId: string,
+    roleId: string
+  ) => {
+    const workspace = await WorkspaceModel.findById(workspaceId);
+    if (!workspace) {
+      throw new NotFoundException("Workspace not found");
+    }
+  
+    const role = await RoleModel.findById(roleId);
+    if (!role) {
+      throw new NotFoundException("Role not found");
+    }
+  
+    const member = await MemberModel.findOne({
+      userId: memberId,
+      workspaceId: workspaceId,
+    });
+  
+    if (!member) {
+      throw new Error("Member not found in the workspace");
+    }
+  
+    member.role = role;
+    await member.save();
+  
+    return {
+      member,
+    };
+  };
