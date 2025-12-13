@@ -1,5 +1,13 @@
 import { Router } from "express";
-import { changeWorkspaceMemberRoleController, createWorkspaceController, deleteWorkspaceByIdController, getAllWorkspaceUserIsMemberController, getWorkspaceAnalyticsController, getWorkspaceByIdController, getWorkspaceMembersController, updateWorkspaceByIdController } from "../controllers/workspace.controller";
+import { changeWorkspaceMemberRoleController, 
+        createWorkspaceController, 
+        deleteWorkspaceByIdController, 
+        getAllWorkspaceUserIsMemberController, 
+        getWorkspaceAnalyticsController, 
+        getWorkspaceByIdController, 
+        getWorkspaceMembersController, 
+        updateWorkspaceByIdController 
+    } from "../controllers/workspace.controller";
 
 const workspaceRoutes = Router();   
 
