@@ -22,3 +22,28 @@ export const createProjectService = async (
 
     return { project };
     };
+
+
+export const getProjectsInWorkspaceService = async(
+    workspaceId: string,
+    pageSize: number,
+    pageNumber: number
+) => {
+    const totalCount = await ProjectModel.countDocuments({
+        workspace: workspaceId,
+    });
+
+    const skip = (pageNumber - 1 ) * pageSize;
+
+    const projects = await ProjectModel.find({
+        workspace: workspaceId
+    })
+        .skip(skip)
+        .limit(pageSize)
+        .populate("createdBy", "_id name profilePicture -password")
+        .sort({ createdAt: -1 });
+
+    const totalPages = Math.ceil(totalCount / pageSize);
+
+    return { projects, totalCount, totalPages, skip };
+};
