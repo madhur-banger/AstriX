@@ -5,7 +5,7 @@ import { createProjectSchema, projectIdSchema, updateProjectSchema } from "../va
 import { getMemberRoleInWorkspace } from "../services/member.service";
 import { roleGuard } from "../utils/roleGuard";
 import { Permissions } from "../enums/role.enum";
-import { createProjectService, deleteProjectService, getProjectByIdAndWorkspaceIdService, getProjectsInWorkspaceService, updateProjectService } from "../services/project.service";
+import { createProjectService, deleteProjectService, getProjectAnalyticsService, getProjectByIdAndWorkspaceIdService, getProjectsInWorkspaceService, updateProjectService } from "../services/project.service";
 import { HTTPSTATUS } from "../config/http.config";
 
 
@@ -80,13 +80,27 @@ export const getAllProjectsInWorkspaceController = asyncHandler(
 
 
 
-
-
-
-
-
-
-
+  export const getProjectAnalyticsController = asyncHandler(
+    async (req: Request, res: Response) => {
+      const projectId = projectIdSchema.parse(req.params.id);
+      const workspaceId = workspaceIdSchema.parse(req.params.workspaceId);
+  
+      const userId = req.user?._id;
+  
+      const { role } = await getMemberRoleInWorkspace(userId, workspaceId);
+      roleGuard(role, [Permissions.VIEW_ONLY]);
+  
+      const { analytics } = await getProjectAnalyticsService(
+        workspaceId,
+        projectId
+      );
+  
+      return res.status(HTTPSTATUS.OK).json({
+        message: "Project analytics retrieved successfully",
+        analytics,
+      });
+    }
+  );
 
 
 
