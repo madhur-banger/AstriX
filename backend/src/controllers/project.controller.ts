@@ -5,7 +5,7 @@ import { createProjectSchema, projectIdSchema, updateProjectSchema } from "../va
 import { getMemberRoleInWorkspace } from "../services/member.service";
 import { roleGuard } from "../utils/roleGuard";
 import { Permissions } from "../enums/role.enum";
-import { createProjectService, getProjectByIdAndWorkspaceIdService, getProjectsInWorkspaceService, updateProjectService } from "../services/project.service";
+import { createProjectService, deleteProjectService, getProjectByIdAndWorkspaceIdService, getProjectsInWorkspaceService, updateProjectService } from "../services/project.service";
 import { HTTPSTATUS } from "../config/http.config";
 
 
@@ -116,4 +116,21 @@ export const getAllProjectsInWorkspaceController = asyncHandler(
   );
 
 
+  export const deleteProjectController = asyncHandler(
+    async (req: Request, res: Response) => {
+      const userId = req.user?._id;
+  
+      const projectId = projectIdSchema.parse(req.params.id);
+      const workspaceId = workspaceIdSchema.parse(req.params.workspaceId);
+  
+      const { role } = await getMemberRoleInWorkspace(userId, workspaceId);
+      roleGuard(role, [Permissions.DELETE_PROJECT]);
+  
+      await deleteProjectService(workspaceId, projectId);
+  
+      return res.status(HTTPSTATUS.OK).json({
+        message: "Project deleted successfully",
+      });
+    }
+  );
   
