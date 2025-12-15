@@ -1,4 +1,6 @@
 import ProjectModel from "../models/project.model";
+import { NotFoundException } from "../utils/appError";
+import { workspaceIdSchema } from "../validation/workspace.validation";
 
 
 export const createProjectService = async (
@@ -47,3 +49,21 @@ export const getProjectsInWorkspaceService = async(
 
     return { projects, totalCount, totalPages, skip };
 };
+
+export const getProjectByIdAndWorkspaceIdService = async(
+    workspaceId: string,
+    projectId: string
+) => {
+    const project = await ProjectModel.findOne({
+        _id: projectId,
+        workspace: workspaceId
+    }).select("_id emoji name description");
+
+    if(!project){
+        throw new NotFoundException(
+            "Project not found or does not belong to specified workspace"
+        );
+    }
+
+    return {project};
+}
