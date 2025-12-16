@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { createTaskController, deleteTaskController, getTaskByIdController, updateTaskController } from "../controllers/task.controller";
+import { createTaskController, deleteTaskController, getAllTasksController, getTaskByIdController, updateTaskController } from "../controllers/task.controller";
 
 const taskRoutes = Router();
 
@@ -14,7 +14,11 @@ taskRoutes.put(
     updateTaskController
   );
 
+taskRoutes.get("/workspace/:workspaceId/all", getAllTasksController);
+
+
 taskRoutes.delete("/:id/workspace/:workspaceId/delete", deleteTaskController);
+
 
 taskRoutes.get(
     "/:id/project/:projectId/workspace/:workspaceId",
