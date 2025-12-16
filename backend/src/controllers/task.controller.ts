@@ -36,3 +36,30 @@ export const createTaskController = asyncHandler(
   );
 
 
+  export const updateTaskController = asyncHandler(
+    async (req: Request, res: Response) => {
+      const userId = req.user?._id;
+  
+      const body = updateTaskSchema.parse(req.body);
+  
+      const taskId = taskIdSchema.parse(req.params.id);
+      const projectId = projectIdSchema.parse(req.params.projectId);
+      const workspaceId = workspaceIdSchema.parse(req.params.workspaceId);
+  
+      const { role } = await getMemberRoleInWorkspace(userId, workspaceId);
+      roleGuard(role, [Permissions.EDIT_TASK]);
+  
+      const { updatedTask } = await updateTaskService(
+        workspaceId,
+        projectId,
+        taskId,
+        body
+      );
+  
+      return res.status(HTTPSTATUS.OK).json({
+        message: "Task updated successfully",
+        task: updatedTask,
+      });
+    }
+  );
+
