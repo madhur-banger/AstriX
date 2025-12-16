@@ -4,54 +4,50 @@ import connectDatabase from "../config/database.config";
 import RoleModel from "../models/roles-permission.model";
 import { RolePermissions } from "../utils/role-permission";
 
-
 const seedRoles = async () => {
-    console.log("Seeding roles Started...");
+  console.log("Seeding roles started...");
 
-    try {
-        await connectDatabase();
+  try {
+    await connectDatabase();
 
-        const session = await mongoose.startSession(
+    const session = await mongoose.startSession();
+    session.startTransaction();
 
-        );
-        session.startTransaction();
+    console.log("Clearing existing roles...");
+    await RoleModel.deleteMany({}, { session });
 
-        console.log("Clearing existing Roles...");
-        await RoleModel.deleteMany({},{session});
+    for (const roleName in RolePermissions) {
+      const role = roleName as keyof typeof RolePermissions;
+      const permissions = RolePermissions[role];
 
-        for (const roleName in RolePermissions){
-            const role = roleName as keyof typeof RolePermissions;
-            const permissions = RolePermissions[role];
-
-            //check if role already exists
-            const existingRole = await RoleModel.findOne({name: role}).session(
-                session
-            );
-            if(!existingRole){
-                const newRole = new RoleModel({
-                    name: role,
-                    permissions: permissions,
-                });
-                await newRole.save({session});
-                console.log(`Role ${role} added with permissions.`)
-            } else{
-                console.log(`Role ${role} already exists.`)
-            }
-        }
-
-        await session.commitTransaction();
-        console.log("Transaction Committed.");
-
-        session.endSession();
-        console.log("Session Ended");
-
-        console.log("Seeding completed successfully");
-        
-    } catch (error) {
-        console.log("Error during seeding:", error);
+      // Check if the role already exists
+      const existingRole = await RoleModel.findOne({ name: role }).session(
+        session
+      );
+      if (!existingRole) {
+        const newRole = new RoleModel({
+          name: role,
+          permissions: permissions,
+        });
+        await newRole.save({ session });
+        console.log(`Role ${role} added with permissions.`);
+      } else {
+        console.log(`Role ${role} already exists.`);
+      }
     }
-}
 
-seedRoles().catch((error)=>{
-    console.error("Error runnijng seed script: ", error);
-})
+    await session.commitTransaction();
+    console.log("Transaction committed.");
+
+    session.endSession();
+    console.log("Session ended.");
+
+    console.log("Seeding completed successfully.");
+  } catch (error) {
+    console.error("Error during seeding:", error);
+  }
+};
+
+seedRoles().catch((error) =>
+  console.error("Error running seed script:", error)
+);
