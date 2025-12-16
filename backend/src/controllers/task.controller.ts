@@ -1,6 +1,6 @@
 import { Request, Response } from "express";
 import { asyncHandler } from "../middlewares/asyncHandler.middleware";
-import { createTasksSchema, taskIdSchema, updateTaskSchema } from "../validation/task.validation";
+import { createTaskSchema, taskIdSchema, updateTaskSchema } from "../validation/task.validation";
 import { projectIdSchema } from "../validation/project.validation";
 import { workspaceIdSchema } from "../validation/workspace.validation";
 import { getMemberRoleInWorkspace } from "../services/member.service";
@@ -14,7 +14,7 @@ export const createTaskController = asyncHandler(
     async (req: Request, res: Response) => {
       const userId = req.user?._id;
   
-      const body = createTasksSchema.parse(req.body);
+      const body = createTaskSchema.parse(req.body);
       const projectId = projectIdSchema.parse(req.params.projectId);
       const workspaceId = workspaceIdSchema.parse(req.params.workspaceId);
   
