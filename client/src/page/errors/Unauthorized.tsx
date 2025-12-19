@@ -1,4 +1,4 @@
-import React from "react";
+
 
 const Unauthorized = () => {
   return <div>Unauthorized</div>;

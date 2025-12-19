@@ -22,7 +22,9 @@ const ProjectAnalytics = () => {
   return (
     <div className="grid gap-4 md:gap-5 lg:grid-cols-2 xl:grid-cols-3">
       {analyticsList?.map((v) => (
-        <AnalyticsCard title={v.title} value={v.value} key={v.id} />
+        <AnalyticsCard title={v.title} value={v.value} key={v.id} 
+        isLoading={false}
+        />
       ))}
     </div>
   );

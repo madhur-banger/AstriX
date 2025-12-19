@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useRef } from 'react';
+import { useEffect, useState, useRef } from 'react';
 import { Button } from '@/components/ui/button';
 import { 
   CheckCircle2, 
@@ -10,20 +10,21 @@ import {
   Sparkles,
   Target,
   TrendingUp,
-  Clock,
-  FileText,
   GitBranch,
   Rocket,
-  Award,
-  TrendingDown,
   Activity,
   Star,
-  MessageSquare,
   Layers,
   Briefcase,
-  PieChart,
+  
   Layout,
-  Folder,
+  // Folder,
+  // Clock,
+  // FileText,
+  // PieChart,
+  // Award,
+  // TrendingDown,
+  // MessageSquare,
   Shield
 } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
@@ -34,6 +35,8 @@ const LandingPage = () => {
   const [scrollY, setScrollY] = useState(0);
   const [inView, setInView] = useState<{ [key: string]: boolean }>({});
   const sectionRefs = useRef<{ [key: string]: HTMLElement | null }>({});
+
+  console.log(scrollY);
 
   useEffect(() => {
     const handleMouseMove = (e: MouseEvent) => {
@@ -73,27 +76,27 @@ const LandingPage = () => {
     return () => observer.disconnect();
   }, []);
 
-  const FloatingIcon = ({ 
-    icon: Icon, 
-    delay, 
-    duration, 
-    startX, 
-    startY,
-    scale = 1 
-  }: any) => (
-    <div
-      className="absolute opacity-20 dark:opacity-10"
-      style={{
-        left: `${startX}%`,
-        top: `${startY}%`,
-        animation: `float ${duration}s ease-in-out infinite`,
-        animationDelay: `${delay}s`,
-        transform: `scale(${scale})`,
-      }}
-    >
-      <Icon className="w-8 h-8 text-gray-600 dark:text-gray-400" />
-    </div>
-  );
+  // const FloatingIcon = ({ 
+  //   icon: Icon, 
+  //   delay, 
+  //   duration, 
+  //   startX, 
+  //   startY,
+  //   scale = 1 
+  // }: any) => (
+  //   <div
+  //     className="absolute opacity-20 dark:opacity-10"
+  //     style={{
+  //       left: `${startX}%`,
+  //       top: `${startY}%`,
+  //       animation: `float ${duration}s ease-in-out infinite`,
+  //       animationDelay: `${delay}s`,
+  //       transform: `scale(${scale})`,
+  //     }}
+  //   >
+  //     <Icon className="w-8 h-8 text-gray-600 dark:text-gray-400" />
+  //   </div>
+  // );
 
   const features = [
     {
@@ -407,19 +410,19 @@ const LandingPage = () => {
               </div>
             </div>
             
-            <div className="absolute -right-8 top-1/3 animate-scale-in" style={{ animationDelay: '0.8s', animation: 'floatSlow 5s ease-in-out infinite', animationDelay: '1s' }}>
+            <div className="absolute -right-8 top-1/3 animate-scale-in" style={{ animationDelay: '0.8s', animation: 'floatSlow 5s ease-in-out infinite'}}>
               <div className="w-16 h-16 bg-green-100 dark:bg-green-900/30 rounded-2xl flex items-center justify-center shadow-xl">
                 <CheckCircle2 className="w-8 h-8 text-green-600 dark:text-green-400" />
               </div>
             </div>
             
-            <div className="absolute left-1/4 -bottom-4 animate-scale-in" style={{ animationDelay: '1s', animation: 'floatSlow 4.5s ease-in-out infinite', animationDelay: '2s' }}>
+            <div className="absolute left-1/4 -bottom-4 animate-scale-in" style={{ animationDelay: '1s', animation: 'floatSlow 4.5s ease-in-out infinite'}}>
               <div className="w-16 h-16 bg-purple-100 dark:bg-purple-900/30 rounded-2xl flex items-center justify-center shadow-xl">
                 <Rocket className="w-8 h-8 text-purple-600 dark:text-purple-400" />
               </div>
             </div>
             
-            <div className="absolute right-1/4 -top-4 animate-scale-in" style={{ animationDelay: '0.7s', animation: 'floatSlow 5.5s ease-in-out infinite', animationDelay: '0.5s' }}>
+            <div className="absolute right-1/4 -top-4 animate-scale-in" style={{ animationDelay: '0.7s', animation: 'floatSlow 5.5s ease-in-out infinite' }}>
               <div className="w-16 h-16 bg-orange-100 dark:bg-orange-900/30 rounded-2xl flex items-center justify-center shadow-xl">
                 <Target className="w-8 h-8 text-orange-600 dark:text-orange-400" />
               </div>
