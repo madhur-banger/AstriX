@@ -1,4 +1,4 @@
-import { Link } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useForm } from "react-hook-form";
 import { z } from "zod";
@@ -21,8 +21,17 @@ import {
 import { Input } from "@/components/ui/input";
 import Logo from "@/components/logo";
 import GoogleOauthButton from "@/components/auth/google-oauth-button";
+import { useMutation } from "@tanstack/react-query";
+import { registerMutationFn } from "@/lib/api";
+import { toast } from "@/hooks/use-toast";
 
 const SignUp = () => {
+  const navigate = useNavigate();
+
+  const {mutate, isPending } = useMutation({
+    mutationFn: registerMutationFn,
+  })
+
   const formSchema = z.object({
     name: z.string().trim().min(1, {
       message: "Name is required",
@@ -45,7 +54,20 @@ const SignUp = () => {
   });
 
   const onSubmit = (values: z.infer<typeof formSchema>) => {
-    console.log(values);
+    if(isPending) return;
+    mutate(values, {
+      onSuccess: () => {
+        navigate("/");
+      },
+      onError: (error) => {
+        console.log(error);
+        toast({
+          title: "Error",
+          description: error.message,
+          variant: "destructive"
+        })
+      }
+    })
   };
 
   return (
