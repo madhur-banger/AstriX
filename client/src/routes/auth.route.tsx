@@ -14,7 +14,9 @@ const AuthRoute = () => {
 
   if(!user) return <Outlet />
 
-  return <Navigate to={`workspace/${user.currentWorkspace?._id}`} replace/>
+  return <Navigate 
+      to={`workspace/${user.currentWorkspace?._id}`} 
+      replace/>
 };
 
 export default AuthRoute;
