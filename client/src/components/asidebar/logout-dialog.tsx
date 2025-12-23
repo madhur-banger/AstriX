@@ -11,7 +11,6 @@ import { useCallback } from "react";
 import { useNavigate } from "react-router-dom";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { logoutMutationFn } from "@/lib/api";
-import { error } from "console";
 import { toast } from "@/hooks/use-toast";
 import { Loader } from "lucide-react";
 
