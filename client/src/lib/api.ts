@@ -1,5 +1,5 @@
 import API from "./axios-client";
-import { AllWorkspaceResponseType, 
+import { AllMembersInWorkspaceResponseType, AllWorkspaceResponseType, 
       AnalyticsResponseType, 
       CreateWorkspaceResponseType, 
       CreateWorkspaceType, 
@@ -51,6 +51,13 @@ export const getWorkspaceByIdQueryFn = async (
   workspaceId: string
 ): Promise<WorkspaceByIdResponseType> => {
   const response = await API.get(`/workspace/${workspaceId}`);
+  return response.data;
+};
+
+export const getMembersInWorkspaceQueryFn = async (
+  workspaceId: string
+): Promise<AllMembersInWorkspaceResponseType> => {
+  const response = await API.get(`/workspace/members/${workspaceId}`);
   return response.data;
 };
 

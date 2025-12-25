@@ -60,16 +60,16 @@ const InviteUser = () => {
           className="flex items-center gap-2 self-center font-medium"
         >
           <Logo />
-          Team Sync.
+           AstriX
         </Link>
         <div className="flex flex-col gap-6">
           <Card>
             <CardHeader className="text-center">
               <CardTitle className="text-xl">
-                Hey there! You're invited to join a TeamSync Workspace!
+                Hey there! You're invited to join a AstriX Workspace!
               </CardTitle>
               <CardDescription>
-                Looks like you need to be logged into your TeamSync account to
+                Looks like you need to be logged into your AstriX account to
                 join this Workspace.
               </CardDescription>
             </CardHeader>
@@ -103,7 +103,7 @@ const InviteUser = () => {
                       </Link>
                       <Link
                         className="flex-1 w-full text-base"
-                        to={`/?returnUrl=${returnUrl}`}
+                        to={`/sign-in?returnUrl=${returnUrl}`}
                       >
                         <Button variant="secondary" className="w-full border">
                           Login
