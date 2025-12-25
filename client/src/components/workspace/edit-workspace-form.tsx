@@ -18,7 +18,6 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import useWorkspaceId from "@/hooks/use-workspace-id";
 import { editWorkspaceMutationFn } from "@/lib/api";
 import { useEffect } from "react";
-import { error } from "console";
 import { toast } from "@/hooks/use-toast";
 import { Loader } from "lucide-react";
 
