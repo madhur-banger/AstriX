@@ -21,6 +21,8 @@ import useCreateProjectDialog from "@/hooks/use-create-project-dialog";
 import { ConfirmDialog } from "../resuable/confirm-dialog";
 import useConfirmDialog from "@/hooks/use-confirm-dialog";
 import { Button } from "../ui/button";
+import PermissionsGuard from "../resuable/permission-guard";
+import { Permissions } from "@/constant";
 
 export function NavProjects() {
   const navigate = useNavigate();
@@ -63,13 +65,15 @@ export function NavProjects() {
       <SidebarGroup className="group-data-[collapsible=icon]:hidden">
         <SidebarGroupLabel className="w-full justify-between pr-0">
           <span>Projects</span>
-          <button
-            onClick={onOpen}
-            type="button"
-            className="flex size-5 items-center justify-center rounded-full border"
-          >
+          <PermissionsGuard requiredPermission={Permissions.CREATE_PROJECT}>
+            <button
+              onClick={onOpen}
+              type="button"
+              className="flex size-5 items-center justify-center rounded-full border"
+            >
             <Plus className="size-3.5" />
           </button>
+          </PermissionsGuard>
         </SidebarGroupLabel>
         <SidebarMenu className="h-[320px] scrollbar overflow-y-auto pb-2">
           {projects?.length === 0 ? (
