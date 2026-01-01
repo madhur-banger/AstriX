@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useForm } from "react-hook-form";
 import { z } from "zod";
@@ -20,20 +20,32 @@ import { Button } from "@/components/ui/button";
 import { Textarea } from "../../ui/textarea";
 import EmojiPickerComponent from "@/components/emoji-picker";
 import { ProjectType } from "@/types/api.type";
+import useWorkspaceId from "@/hooks/use-workspace-id";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { editProjectMutationFn } from "@/lib/api";
+import { toast } from "@/hooks/use-toast";
 
 export default function EditProjectForm(props: {
   project?: ProjectType;
   onClose: () => void;
 }) {
-  const { onClose } = props;
+  const { project, onClose } = props;
+  const workspaceId = useWorkspaceId();
+  const queryClient = useQueryClient();
 
   const [emoji, setEmoji] = useState("📊");
+
+  const projectId = project?._id as string;
 
   const formSchema = z.object({
     name: z.string().trim().min(1, {
       message: "Project title is required",
     }),
     description: z.string().trim(),
+  });
+
+  const { mutate, isPending } = useMutation({
+    mutationFn: editProjectMutationFn,
   });
 
   const form = useForm<z.infer<typeof formSchema>>({
@@ -44,13 +56,51 @@ export default function EditProjectForm(props: {
     },
   });
 
+  useEffect(() => {
+    if (project) {
+      setEmoji(project.emoji);
+      form.setValue("name", project.name);
+      form.setValue("description", project.description);
+    }
+  }, [form, project]);
+
   const handleEmojiSelection = (emoji: string) => {
     setEmoji(emoji);
   };
 
   const onSubmit = (values: z.infer<typeof formSchema>) => {
-    console.log(values);
-    onClose();
+    if (isPending) return;
+    const payload = {
+      projectId,
+      workspaceId,
+      data: { emoji, ...values },
+    };
+    mutate(payload, {
+      onSuccess: (data) => {
+        queryClient.invalidateQueries({
+          queryKey: ["singleProject", projectId],
+        });
+
+        queryClient.invalidateQueries({
+          queryKey: ["allprojects", workspaceId],
+        });
+
+        toast({
+          title: "Success",
+          description: data.message,
+          variant: "success",
+        });
+
+        setTimeout(() => onClose(), 100);
+      },
+      onError: (error) => {
+        toast({
+          title: "Error",
+          description: error.message,
+          variant: "destructive",
+        });
+      },
+    });
   };
 
   return (

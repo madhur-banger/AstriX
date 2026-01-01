@@ -13,16 +13,16 @@ import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "../ui/textarea";
 import { useAuthContext } from "@/context/auth-provider";
-import { Permissions } from "@/constant";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
-import useWorkspaceId from "@/hooks/use-workspace-id";
-import { editWorkspaceMutationFn } from "@/lib/api";
 import { useEffect } from "react";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { editWorkspaceMutationFn } from "@/lib/api";
+import useWorkspaceId from "@/hooks/use-workspace-id";
 import { toast } from "@/hooks/use-toast";
 import { Loader } from "lucide-react";
+import { Permissions } from "@/constant";
 
 export default function EditWorkspaceForm() {
-  const {workspace, hasPermission } = useAuthContext();
+  const { workspace, hasPermission } = useAuthContext();
   const canEditWorkspace = hasPermission(Permissions.EDIT_WORKSPACE);
 
   const queryClient = useQueryClient();
@@ -30,7 +30,8 @@ export default function EditWorkspaceForm() {
 
   const { mutate, isPending } = useMutation({
     mutationFn: editWorkspaceMutationFn,
-  })
+  });
+
   const formSchema = z.object({
     name: z.string().trim().min(1, {
       message: "Workspace name is required",
@@ -47,27 +48,26 @@ export default function EditWorkspaceForm() {
   });
 
   useEffect(() => {
-    if(workspace){
+    if (workspace) {
       form.setValue("name", workspace.name);
       form.setValue("description", workspace?.description || "");
     }
   }, [form, workspace]);
 
-
   const onSubmit = (values: z.infer<typeof formSchema>) => {
-    if(isPending) return;
-    const payLoad = {
+    if (isPending) return;
+    const payload = {
       workspaceId: workspaceId,
-      data: {...values },
+      data: { ...values },
     };
-    mutate(payLoad, {
+    mutate(payload, {
       onSuccess: () => {
         queryClient.invalidateQueries({
           queryKey: ["workspace"],
         });
         queryClient.invalidateQueries({
           queryKey: ["userWorkspaces"],
-        })
+        });
       },
       onError: (error) => {
         toast({

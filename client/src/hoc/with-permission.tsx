@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 import { PermissionType } from "@/constant";
 import { useAuthContext } from "@/context/auth-provider";
 import useWorkspaceId from "@/hooks/use-workspace-id";
@@ -13,22 +14,23 @@ const withPermission = (
     const navigate = useNavigate();
     const workspaceId = useWorkspaceId();
 
-    useEffect(()=>{
-      if(!user || !hasPermission(requiredPermission)){
+    useEffect(() => {
+      if (!user || !hasPermission(requiredPermission)) {
         navigate(`/workspace/${workspaceId}`);
       }
     }, [user, hasPermission, navigate, workspaceId]);
 
-    if(isLoading){
-      return <div>Loading...</div>
+    if (isLoading) {
+      return <div>Loading...</div>;
     }
 
-    if(!user || hasPermission(requiredPermission)){
+    // Check if user has the required permission
+    if (!user || !hasPermission(requiredPermission)) {
       return;
     }
-
-    return <WrappedComponent {...props} />
-  }
+    // If the user has permission, render the wrapped component
+    return <WrappedComponent {...props} />;
+  };
   return WithPermission;
 };
 
