@@ -5,8 +5,11 @@ declare global {
         interface User extends UserDocument {
             _id?: any;
         }
+        interface Request {
+            jwt?: string;
+        }
     }
-}
+}  
 
 declare module 'swagger-ui-express'
 

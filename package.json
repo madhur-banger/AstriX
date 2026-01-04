@@ -1,0 +1,10 @@
+{
+  "dependencies": {
+    "@types/jsonwebtoken": "^9.0.10",
+    "jsonwebtoken": "^9.0.3",
+    "passport-jwt": "^4.0.1"
+  },
+  "devDependencies": {
+    "@types/passport-jwt": "^4.0.1"
+  }
+}
