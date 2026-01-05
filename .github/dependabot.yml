@@ -1,0 +1,34 @@
+version: 2
+updates:
+  - package-ecosystem: "npm"
+    directory: "/backend"
+    schedule:
+      interval: "weekly"
+    groups:
+      backend-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"
+
+  - package-ecosystem: "npm"
+    directory: "/client"
+    schedule:
+      interval: "weekly"
+    groups:
+      client-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+
+  # Tracks the AWS provider version constraint in the dev environment's
+  # required_providers block. The modules under infra/modules are consumed by
+  # local path, so they inherit whatever this environment pins.
+  - package-ecosystem: "terraform"
+    directory: "/infra/environments/dev"
+    schedule:
+      interval: "weekly"
