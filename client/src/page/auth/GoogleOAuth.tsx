@@ -8,10 +8,8 @@ import { Link, useNavigate, useSearchParams } from "react-router-dom";
 const GoogleOAuth = () => {
   const navigate = useNavigate();
   const [params] = useSearchParams();
-  const setAcccessToken = useStore.use.setAcccessToken();
 
   const status = params.get("status");
-  const accessToken = params.get("access_token");
   const currentWorkspace = params.get("current_workspace");
 
   const [processed, setProcessed] = React.useState(false);
@@ -26,8 +24,7 @@ const GoogleOAuth = () => {
     }
 
     // Success path
-    if (status === "success" && accessToken) {
-      setAcccessToken(accessToken);
+    if (status === "success") {
 
       setProcessed(true);
 
@@ -39,10 +36,8 @@ const GoogleOAuth = () => {
     }
   }, [
     status,
-    accessToken,
     currentWorkspace,
     navigate,
-    setAcccessToken,
     processed,
   ]);
 

@@ -6,20 +6,30 @@ import { HTTPSTATUS } from "../config/http.config";
 import { registerUserService } from "../services/auth.service";
 import passport from "passport";
 import { signJwtToken } from "../utils/jwt";
+import { UserDocument } from "../models/user.model";
 
 export const googleLoginCallback = asyncHandler(
   async (req: Request, res: Response) => {
-    const jwt = req.jwt;
-    const currentWorkspace = req.user?.currentWorkspace;
+    const token = (req.authInfo as { token?: string})?.token;
 
-    if (!jwt) {
+
+    if (!token) {
       return res.redirect(
         `${config.FRONTEND_GOOGLE_CALLBACK_URL}?status=failure`
       );
     }
 
+    const currentWorkspace = req.user?.currentWorkspace;
+
+    res.cookie("access_token", token, {
+      httpOnly: true,
+      secure: config.NODE_ENV === "production",
+      sameSite: "lax",
+      maxAge: 15*60*1000,
+    });
+
     return res.redirect(
-      `${config.FRONTEND_GOOGLE_CALLBACK_URL}?status=success&access_token=${jwt}&current_workspace=${currentWorkspace}`
+      `${config.FRONTEND_GOOGLE_CALLBACK_URL}?status=success&current_workspace=${currentWorkspace}`
     );
   }
 );

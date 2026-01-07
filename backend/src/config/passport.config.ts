@@ -8,7 +8,6 @@ import {
     ExtractJwt,
     StrategyOptions
 } from "passport-jwt"
-
 import { config } from "./app.config"
 import { NotFoundException } from "../utils/appError"
 import { ProviderEnum } from "../enums/account-provider.enum"
@@ -41,9 +40,11 @@ passport.use(
                     email: email,
                 });
 
-                const jwt = signJwtToken({userId: user._id});
-                req.jwt = jwt;  
-                done(null, user);
+                const token = signJwtToken({userId: user._id});
+ 
+                done(null, user, {
+                    token
+                });
             } catch (error) {
                 done(error, false);
             }
