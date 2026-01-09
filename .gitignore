@@ -16,5 +16,5 @@ data.txt
 build/
 dist/
 
-.terrafrom
-infra/environments/dev/.terrafrom
+.terrafrom/
+infra/environments/dev/.terrafrom/
