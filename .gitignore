@@ -16,5 +16,12 @@ data.txt
 build/
 dist/
 
-.terrafrom/
-infra/environments/dev/.terrafrom/
+.terraform/
+infra/environments/dev/.terraform/
+
+# Terraform
+.terraform/
+**/.terraform/
+*.tfstate
+*.tfstate.*
+.terraform.lock.hcl
