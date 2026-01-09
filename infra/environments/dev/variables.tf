@@ -79,7 +79,7 @@ variable "flow_logs_retention_days" {
 variable "app_port" {
   description = "Port the backend application listens on"
   type        = number
-  default     = 3000
+  default     = 8080
 }
 
 variable "database_port" {
