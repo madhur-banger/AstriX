@@ -25,7 +25,11 @@ const GoogleOAuth = () => {
     }
 
     // Success path
-    if (status === "success") {
+    if (status === "success" && token) {
+
+      useStore.getState().setAcccessToken(token);
+
+      window.history.replaceState({}, "", window.location.pathname);
 
       setProcessed(true);
 

@@ -19,7 +19,6 @@ export const accessTokenSignOptions: SignOptsAndSecret = {
     secret: config.JWT_SECRET
 };
 
-
 export const signJwtToken = (
     payload: AccessTPayload,
     options?: SignOptsAndSecret
