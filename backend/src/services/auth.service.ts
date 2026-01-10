@@ -1,8 +1,14 @@
+// backend/src/services/auth.service.ts
+// ============================================
+// AUTHENTICATION SERVICE - Updated with Refresh Tokens
+// ============================================
+
 import mongoose from "mongoose";
 import UserModel from "../models/user.model";
 import AccountModel from "../models/account.model";
 import WorkspaceModel from "../models/workspace.model";
 import RoleModel from "../models/roles-permission.model";
+import SessionModel from "../models/session.model";
 import { Roles } from "../enums/role.enum";
 import {
   BadRequestException,
@@ -11,6 +17,148 @@ import {
 } from "../utils/appError";
 import MemberModel from "../models/member.model";
 import { ProviderEnum } from "../enums/account-provider.enum";
+import {
+  generateTokenPair,
+  verifyRefreshToken,
+  refreshTokenSignOptions,
+  calculateExpiryDate,
+} from "../utils/jwt";
+import { config } from "../config/app.config";
+
+// ============================================
+// TYPE DEFINITIONS
+// ============================================
+
+interface CreateSessionParams {
+  userId: mongoose.Types.ObjectId;
+  userAgent?: string;
+  ipAddress?: string;
+}
+
+interface TokenPairWithSession {
+  accessToken: string;
+  refreshToken: string;
+  sessionId: string;
+}
+
+// ============================================
+// SESSION MANAGEMENT
+// ============================================
+
+/**
+ * Create a new session and generate token pair
+ * Called during login (both email/password and OAuth)
+ */
+export const createSessionService = async ({
+  userId,
+  userAgent,
+  ipAddress,
+}: CreateSessionParams): Promise<TokenPairWithSession> => {
+  // 1. Create session in database
+  const session = await SessionModel.create({
+    userId,
+    userAgent,
+    ipAddress,
+    isValid: true,
+    expiresAt: calculateExpiryDate(
+      config.JWT.REFRESH_TOKEN_EXPIRES_IN
+    ),
+  });
+
+  // 2. Generate token pair with session ID
+  const { accessToken, refreshToken } = generateTokenPair(
+    userId,
+    session._id.toString()
+  );
+
+  return {
+    accessToken,
+    refreshToken,
+    sessionId: session._id.toString(),
+  };
+};
+
+/**
+ * Refresh access token using refresh token
+ */
+export const refreshAccessTokenService = async (
+  refreshToken: string
+): Promise<{ accessToken: string; newRefreshToken?: string }> => {
+  // 1. Verify refresh token
+  const result = verifyRefreshToken(refreshToken);
+
+  if (!result.valid) {
+    throw new UnauthorizedException(result.error);
+  }
+
+  const { userId, sessionId } = result.payload;
+
+  // 2. Check if session exists and is valid
+  const session = await SessionModel.findById(sessionId);
+
+  if (!session || !session.isValid) {
+    throw new UnauthorizedException("Session expired or invalid");
+  }
+
+  // 3. Check if session has expired
+  if (session.expiresAt < new Date()) {
+    // Clean up expired session
+    await SessionModel.findByIdAndDelete(sessionId);
+    throw new UnauthorizedException("Session expired");
+  }
+
+  // 4. Generate new token pair
+  const tokens = generateTokenPair(userId, sessionId);
+
+  // 5. Optional: Implement refresh token rotation
+  // Uncomment below if you want to rotate refresh tokens on each refresh
+  // This provides extra security but can cause issues with concurrent requests
+  /*
+  session.expiresAt = calculateExpiryDate(config.JWT.REFRESH_TOKEN_EXPIRES_IN);
+  await session.save();
+  return { 
+    accessToken: tokens.accessToken, 
+    newRefreshToken: tokens.refreshToken 
+  };
+  */
+
+  return { accessToken: tokens.accessToken };
+};
+
+/**
+ * Invalidate a specific session (logout from one device)
+ */
+export const invalidateSessionService = async (
+  sessionId: string
+): Promise<void> => {
+  await SessionModel.findByIdAndUpdate(sessionId, { isValid: false });
+};
+
+/**
+ * Invalidate all sessions for a user (logout from all devices)
+ */
+export const invalidateAllSessionsService = async (
+  userId: mongoose.Types.ObjectId | string
+): Promise<void> => {
+  await SessionModel.updateMany({ userId }, { isValid: false });
+};
+
+/**
+ * Get all active sessions for a user (for "manage devices" feature)
+ */
+export const getUserSessionsService = async (
+  userId: mongoose.Types.ObjectId | string
+) => {
+  return SessionModel.find({
+    userId,
+    isValid: true,
+    expiresAt: { $gt: new Date() },
+  }).select("userAgent ipAddress createdAt");
+};
+
+// ============================================
+// OAUTH LOGIN/REGISTRATION
+// ============================================
 
 export const loginOrCreateAccountService = async (data: {
   provider: string;
@@ -86,6 +234,10 @@ export const loginOrCreateAccountService = async (data: {
   }
 };
 
+// ============================================
+// EMAIL/PASSWORD REGISTRATION
+// ============================================
+
 export const registerUserService = async (body: {
   email: string;
   name: string;
@@ -159,6 +311,10 @@ export const registerUserService = async (body: {
   }
 };
 
+// ============================================
+// EMAIL/PASSWORD LOGIN VERIFICATION
+// ============================================
+
 export const verifyUserService = async ({
   email,
   password,
@@ -187,10 +343,13 @@ export const verifyUserService = async ({
   return user.omitPassword();
 };
 
+// ============================================
+// USER LOOKUP
+// ============================================
 
-export const findUserByIdService = async(userId: string) => {
+export const findUserByIdService = async (userId: string) => {
   const user = await UserModel.findById(userId, {
-    password: false
+    password: false,
   });
   return user || null;
-}
+};

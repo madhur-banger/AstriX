@@ -1,11 +1,15 @@
-export const getEnv = (key: string, defaultValue: string = ""): string => {
-    const value = process.env[key];
-    if (value === undefined) {
-      if (defaultValue) {
-        return defaultValue;
-      }
-      throw new Error(`Enviroment variable ${key} is not set`);
+export const getEnv = <T extends string>(
+  key: string,
+  defaultValue?: T
+): T => {
+  const value = process.env[key];
+
+  if (value === undefined) {
+    if (defaultValue !== undefined) {
+      return defaultValue;
     }
-    return value;
-  };
-  
+    throw new Error(`Environment variable ${key} is not set`);
+  }
+
+  return value as T;
+};

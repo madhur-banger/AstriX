@@ -15,7 +15,6 @@ import { toast } from "@/hooks/use-toast";
 import { Loader } from "lucide-react";
 import { useStore } from "@/store/store";
 
-
 const LogoutDialog = (props: {
   isOpen: boolean;
   setIsOpen: React.Dispatch<React.SetStateAction<boolean>>;
@@ -23,57 +22,84 @@ const LogoutDialog = (props: {
   const { isOpen, setIsOpen } = props;
   const navigate = useNavigate();
 
-  const {clearAccessToken} = useStore();
+  // Use clearAuth instead of clearAccessToken (clears both token and user)
+  const { clearAuth } = useStore();
 
   const queryClient = useQueryClient();
 
   const { mutate, isPending } = useMutation({
     mutationFn: logoutMutationFn,
     onSuccess: () => {
-      queryClient.resetQueries({
-        queryKey: ["authUser"],
+      // 1. Clear ALL React Query caches (not just authUser)
+      queryClient.clear();
+
+      // 2. Clear Zustand auth state (token + user)
+      clearAuth();
+
+      // 3. Show success toast
+      toast({
+        title: "Logged out",
+        description: "You have been logged out successfully.",
       });
-      clearAccessToken();
-      navigate("/");
+
+      // 4. Close dialog and redirect to sign-in
       setIsOpen(false);
+      navigate("/sign-in", { replace: true });
     },
     onError: (error) => {
-      toast({
-        title: "Error",
-        description: error.message,
-        variant: "destructive",
-      })
-    }
-  })
+      // Even if backend fails, still clear local state
+      // User should be able to "logout" locally
+      console.error("Logout error:", error);
 
-  // Handle logout action
+      queryClient.clear();
+      clearAuth();
+
+      toast({
+        title: "Logged out",
+        description: "You have been logged out.",
+      });
+
+      setIsOpen(false);
+      navigate("/sign-in", { replace: true });
+    },
+  });
+
   const handleLogout = useCallback(() => {
-    if(isPending) return;
+    if (isPending) return;
     mutate();
   }, [isPending, mutate]);
+
   return (
-    <>
-      <Dialog open={isOpen} onOpenChange={setIsOpen}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Are you sure you want to log out?</DialogTitle>
-            <DialogDescription>
-              This will end your current session and you will need to log in
-              again to access your account.
-            </DialogDescription>
-          </DialogHeader>
-          <DialogFooter>
-            <Button disabled={isPending} type="button" onClick={handleLogout}>
-            {isPending && <Loader className="animate-spin" />}
-              Sign out
-            </Button>
-            <Button type="button" onClick={() => setIsOpen(false)}>
-              Cancel
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-    </>
+    <Dialog open={isOpen} onOpenChange={setIsOpen}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>Are you sure you want to log out?</DialogTitle>
+          <DialogDescription>
+            This will end your current session and you will need to log in
+            again to access your account.
+          </DialogDescription>
+        </DialogHeader>
+        <DialogFooter className="gap-2 sm:gap-0">
+          <Button
+            variant="outline"
+            type="button"
+            onClick={() => setIsOpen(false)}
+            disabled={isPending}
+          >
+            Cancel
+          </Button>
+          <Button
+            variant="destructive"
+            type="button"
+            onClick={handleLogout}
+            disabled={isPending}
+          >
+            {isPending && <Loader className="animate-spin mr-2 h-4 w-4" />}
+            Sign out
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 };
 

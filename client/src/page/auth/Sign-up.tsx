@@ -1,3 +1,8 @@
+// client/src/page/auth/SignUp.tsx
+// ============================================
+// SIGN UP PAGE - Updated with Strong Password Validation
+// ============================================
+
 import { Link, useNavigate } from "react-router-dom";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useForm } from "react-hook-form";
@@ -24,27 +29,95 @@ import GoogleOauthButton from "@/components/auth/google-oauth-button";
 import { useMutation } from "@tanstack/react-query";
 import { registerMutationFn } from "@/lib/api";
 import { toast } from "@/hooks/use-toast";
+import { Loader, Check, X } from "lucide-react";
+import { useState } from "react";
+
+// ============================================
+// PASSWORD REQUIREMENTS
+// ============================================
+
+const passwordRequirements = [
+  { regex: /.{8,}/, label: "At least 8 characters" },
+  { regex: /[A-Z]/, label: "One uppercase letter" },
+  { regex: /[a-z]/, label: "One lowercase letter" },
+  { regex: /[0-9]/, label: "One number" },
+  { regex: /[^A-Za-z0-9]/, label: "One special character (!@#$%^&*)" },
+];
+
+// ============================================
+// VALIDATION SCHEMA
+// ============================================
+
+const formSchema = z.object({
+  name: z
+    .string()
+    .trim()
+    .min(2, "Name must be at least 2 characters")
+    .max(50, "Name must be at most 50 characters"),
+  email: z
+    .string()
+    .trim()
+    .email("Invalid email address")
+    .min(1, "Email is required"),
+  password: z
+    .string()
+    .min(8, "Password must be at least 8 characters")
+    .regex(/[A-Z]/, "Password must contain at least one uppercase letter")
+    .regex(/[a-z]/, "Password must contain at least one lowercase letter")
+    .regex(/[0-9]/, "Password must contain at least one number")
+    .regex(
+      /[^A-Za-z0-9]/,
+      "Password must contain at least one special character"
+    ),
+});
+
+type FormValues = z.infer<typeof formSchema>;
+
+// ============================================
+// PASSWORD STRENGTH INDICATOR
+// ============================================
+
+const PasswordStrengthIndicator = ({ password }: { password: string }) => {
+  if (!password) return null;
+
+  return (
+    <div className="mt-2 space-y-1">
+      {passwordRequirements.map((req, index) => {
+        const isMet = req.regex.test(password);
+        return (
+          <div
+            key={index}
+            className={`flex items-center gap-2 text-xs ${
+              isMet ? "text-green-600" : "text-muted-foreground"
+            }`}
+          >
+            {isMet ? (
+              <Check className="w-3 h-3" />
+            ) : (
+              <X className="w-3 h-3" />
+            )}
+            {req.label}
+          </div>
+        );
+      })}
+    </div>
+  );
+};
+
+// ============================================
+// COMPONENT
+// ============================================
 
 const SignUp = () => {
   const navigate = useNavigate();
+  const [showPasswordRequirements, setShowPasswordRequirements] =
+    useState(false);
 
-  const {mutate, isPending } = useMutation({
+  const { mutate, isPending } = useMutation({
     mutationFn: registerMutationFn,
-  })
-
-  const formSchema = z.object({
-    name: z.string().trim().min(1, {
-      message: "Name is required",
-    }),
-    email: z.string().trim().email("Invalid email address").min(1, {
-      message: "Workspace name is required",
-    }),
-    password: z.string().trim().min(1, {
-      message: "Password is required",
-    }),
   });
 
-  const form = useForm<z.infer<typeof formSchema>>({
+  const form = useForm<FormValues>({
     resolver: zodResolver(formSchema),
     defaultValues: {
       name: "",
@@ -53,21 +126,27 @@ const SignUp = () => {
     },
   });
 
-  const onSubmit = (values: z.infer<typeof formSchema>) => {
-    if(isPending) return;
+  const watchedPassword = form.watch("password");
+
+  const onSubmit = (values: FormValues) => {
+    if (isPending) return;
+
     mutate(values, {
       onSuccess: () => {
-        navigate("/");
+        toast({
+          title: "Success",
+          description: "Account created successfully. Please sign in.",
+        });
+        navigate("/sign-in");
       },
-      onError: (error) => {
-        console.log(error);
+      onError: (error: any) => {
         toast({
           title: "Error",
-          description: error.message,
-          variant: "destructive"
-        })
-      }
-    })
+          description: error.response?.data?.message || error.message,
+          variant: "destructive",
+        });
+      },
+    });
   };
 
   return (
@@ -100,80 +179,84 @@ const SignUp = () => {
                         Or continue with
                       </span>
                     </div>
-                    <div className="grid gap-2">
-                      <div className="grid gap-2">
-                        <FormField
-                          control={form.control}
-                          name="name"
-                          render={({ field }) => (
-                            <FormItem>
-                              <FormLabel className="dark:text-[#f1f7feb5] text-sm">
-                                Name
-                              </FormLabel>
-                              <FormControl>
-                                <Input
-                                  placeholder="Joh Doe"
-                                  className="!h-[48px]"
-                                  {...field}
-                                />
-                              </FormControl>
-
-                              <FormMessage />
-                            </FormItem>
-                          )}
-                        />
-                      </div>
-                      <div className="grid gap-2">
-                        <FormField
-                          control={form.control}
-                          name="email"
-                          render={({ field }) => (
-                            <FormItem>
-                              <FormLabel className="dark:text-[#f1f7feb5] text-sm">
-                                Email
-                              </FormLabel>
-                              <FormControl>
-                                <Input
-                                  placeholder="m@example.com"
-                                  className="!h-[48px]"
-                                  {...field}
-                                />
-                              </FormControl>
-
-                              <FormMessage />
-                            </FormItem>
-                          )}
-                        />
-                      </div>
-                      <div className="grid gap-2">
-                        <FormField
-                          control={form.control}
-                          name="password"
-                          render={({ field }) => (
-                            <FormItem>
-                              <FormLabel className="dark:text-[#f1f7feb5] text-sm">
-                                Password
-                              </FormLabel>
-                              <FormControl>
-                                <Input
-                                  type="password"
-                                  className="!h-[48px]"
-                                  {...field}
-                                />
-                              </FormControl>
-
-                              <FormMessage />
-                            </FormItem>
-                          )}
-                        />
-                      </div>
-                      <Button type="submit" className="w-full">
+                    <div className="grid gap-3">
+                      <FormField
+                        control={form.control}
+                        name="name"
+                        render={({ field }) => (
+                          <FormItem>
+                            <FormLabel className="dark:text-[#f1f7feb5] text-sm">
+                              Name
+                            </FormLabel>
+                            <FormControl>
+                              <Input
+                                placeholder="John Doe"
+                                className="!h-[48px]"
+                                autoComplete="name"
+                                {...field}
+                              />
+                            </FormControl>
+                            <FormMessage />
+                          </FormItem>
+                        )}
+                      />
+                      <FormField
+                        control={form.control}
+                        name="email"
+                        render={({ field }) => (
+                          <FormItem>
+                            <FormLabel className="dark:text-[#f1f7feb5] text-sm">
+                              Email
+                            </FormLabel>
+                            <FormControl>
+                              <Input
+                                placeholder="m@example.com"
+                                className="!h-[48px]"
+                                autoComplete="email"
+                                {...field}
+                              />
+                            </FormControl>
+                            <FormMessage />
+                          </FormItem>
+                        )}
+                      />
+                      <FormField
+                        control={form.control}
+                        name="password"
+                        render={({ field }) => (
+                          <FormItem>
+                            <FormLabel className="dark:text-[#f1f7feb5] text-sm">
+                              Password
+                            </FormLabel>
+                            <FormControl>
+                              <Input
+                                type="password"
+                                className="!h-[48px]"
+                                autoComplete="new-password"
+                                onFocus={() => setShowPasswordRequirements(true)}
+                                {...field}
+                              />
+                            </FormControl>
+                            <FormMessage />
+                            {showPasswordRequirements && (
+                              <PasswordStrengthIndicator
+                                password={watchedPassword}
+                              />
+                            )}
+                          </FormItem>
+                        )}
+                      />
+                      <Button disabled={isPending} type="submit" className="w-full">
+                        {isPending && <Loader className="animate-spin mr-2" />}
                         Sign up
                       </Button>
                     </div>
                     <div className="text-center text-sm">
                       Already have an account?{" "}
-                      <Link to="/sign-in" className="underline underline-offset-4">
+                      <Link
+                        to="/sign-in"
+                        className="underline underline-offset-4"
+                      >
                         Sign in
                       </Link>
                     </div>
@@ -182,7 +265,7 @@ const SignUp = () => {
               </Form>
             </CardContent>
           </Card>
-          <div className="text-balance text-center text-xs text-muted-foreground [&_a]:underline [&_a]:underline-offset-4 [&_a]:hover:text-primary  ">
+          <div className="text-balance text-center text-xs text-muted-foreground [&_a]:underline [&_a]:underline-offset-4 [&_a]:hover:text-primary">
             By clicking continue, you agree to our{" "}
             <a href="#">Terms of Service</a> and <a href="#">Privacy Policy</a>.
           </div>

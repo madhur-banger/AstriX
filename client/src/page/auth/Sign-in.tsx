@@ -1,3 +1,8 @@
+// client/src/page/auth/SignIn.tsx
+// ============================================
+// SIGN IN PAGE - Updated
+// ============================================
+
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useForm } from "react-hook-form";
@@ -25,29 +30,39 @@ import { useMutation } from "@tanstack/react-query";
 import { loginMutationFn } from "@/lib/api";
 import { toast } from "@/hooks/use-toast";
 import { Loader } from "lucide-react";
-import { useStore } from "@/store/store";
+import { useStoreBase } from "@/store/store";
+
+// ============================================
+// VALIDATION SCHEMA
+// ============================================
+
+const formSchema = z.object({
+  email: z
+    .string()
+    .trim()
+    .email("Invalid email address")
+    .min(1, "Email is required"),
+  password: z.string().min(1, "Password is required"),
+});
+
+type FormValues = z.infer<typeof formSchema>;
+
+// ============================================
+// COMPONENT
+// ============================================
 
 const SignIn = () => {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const returnUrl = searchParams.get("returnUrl");
 
-  const {setAcccessToken} = useStore();
+  const { setAuth } = useStoreBase();
 
-  const { mutate, isPending }= useMutation({
+  const { mutate, isPending } = useMutation({
     mutationFn: loginMutationFn,
   });
 
-  const formSchema = z.object({
-    email: z.string().trim().email("Invalid email address").min(1, {
-      message: "Workspace name is required",
-    }),
-    password: z.string().trim().min(1, {
-      message: "Password is required",
-    }),
-  });
-
-  const form = useForm<z.infer<typeof formSchema>>({
+  const form = useForm<FormValues>({
     resolver: zodResolver(formSchema),
     defaultValues: {
       email: "",
@@ -55,23 +70,27 @@ const SignIn = () => {
     },
   });
 
-  const onSubmit = (values: z.infer<typeof formSchema>) => {
+  const onSubmit = (values: FormValues) => {
     if (isPending) return;
 
     mutate(values, {
       onSuccess: (data) => {
-        const accessToken = data.access_token;
-        const user = data.user;
-        
-        setAcccessToken(accessToken);
+        // Set both token and user in store
+        setAuth(data.access_token, data.user);
 
+        toast({
+          title: "Success",
+          description: "Logged in successfully",
+        });
+
+        // Navigate to return URL or workspace
         const decodedUrl = returnUrl ? decodeURIComponent(returnUrl) : null;
-        navigate(decodedUrl || `/workspace/${user.currentWorkspace}`);
+        navigate(decodedUrl || `/workspace/${data.user.currentWorkspace}`);
       },
-      onError: (error) => {
+      onError: (error: any) => {
         toast({
           title: "Error",
-          description: error.message,
+          description: error.response?.data?.message || error.message,
           variant: "destructive",
         });
       },
@@ -109,63 +128,56 @@ const SignIn = () => {
                       </span>
                     </div>
                     <div className="grid gap-3">
-                      <div className="grid gap-2">
-                        <FormField
-                          control={form.control}
-                          name="email"
-                          render={({ field }) => (
-                            <FormItem>
+                      <FormField
+                        control={form.control}
+                        name="email"
+                        render={({ field }) => (
+                          <FormItem>
+                            <FormLabel className="dark:text-[#f1f7feb5] text-sm">
+                              Email
+                            </FormLabel>
+                            <FormControl>
+                              <Input
+                                placeholder="m@example.com"
+                                className="!h-[48px]"
+                                autoComplete="email"
+                                {...field}
+                              />
+                            </FormControl>
+                            <FormMessage />
+                          </FormItem>
+                        )}
+                      />
+                      <FormField
+                        control={form.control}
+                        name="password"
+                        render={({ field }) => (
+                          <FormItem>
+                            <div className="flex items-center">
                               <FormLabel className="dark:text-[#f1f7feb5] text-sm">
-                                Email
+                                Password
                               </FormLabel>
-                              <FormControl>
-                                <Input
-                                  placeholder="m@example.com"
-                                  className="!h-[48px]"
-                                  {...field}
-                                />
-                              </FormControl>
-
-                              <FormMessage />
-                            </FormItem>
-                          )}
-                        />
-                      </div>
-                      <div className="grid gap-2">
-                        <FormField
-                          control={form.control}
-                          name="password"
-                          render={({ field }) => (
-                            <FormItem>
-                              <div className="flex items-center">
-                                <FormLabel className="dark:text-[#f1f7feb5] text-sm">
-                                  Password
-                                </FormLabel>
-                                <a
-                                  href="#"
-                                  className="ml-auto text-sm underline-offset-4 hover:underline"
-                                >
-                                  Forgot your password?
-                                </a>
-                              </div>
-                              <FormControl>
-                                <Input
-                                  type="password"
-                                  className="!h-[48px]"
-                                  {...field}
-                                />
-                              </FormControl>
-
-                              <FormMessage />
-                            </FormItem>
-                          )}
-                        />
-                      </div>
-                      <Button 
-                      disabled={isPending}
-                      type="submit" 
-                      className="w-full">
-                        {isPending && <Loader className="animate-spin" />}
+                              <Link
+                                to="/forgot-password"
+                                className="ml-auto text-sm underline-offset-4 hover:underline"
+                              >
+                                Forgot your password?
+                              </Link>
+                            </div>
+                            <FormControl>
+                              <Input
+                                type="password"
+                                className="!h-[48px]"
+                                autoComplete="current-password"
+                                {...field}
+                              />
+                            </FormControl>
+                            <FormMessage />
+                          </FormItem>
+                        )}
+                      />
+                      <Button disabled={isPending} type="submit" className="w-full">
+                        {isPending && <Loader className="animate-spin mr-2" />}
                         Login
                       </Button>
                     </div>
@@ -183,7 +195,7 @@ const SignIn = () => {
               </Form>
             </CardContent>
           </Card>
-          <div className="text-balance text-center text-xs text-muted-foreground [&_a]:underline [&_a]:underline-offset-4 [&_a]:hover:text-primary  ">
+          <div className="text-balance text-center text-xs text-muted-foreground [&_a]:underline [&_a]:underline-offset-4 [&_a]:hover:text-primary">
             By clicking continue, you agree to our{" "}
             <a href="#">Terms of Service</a> and <a href="#">Privacy Policy</a>.
           </div>
