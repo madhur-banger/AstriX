@@ -10,6 +10,7 @@ const GoogleOAuth = () => {
   const [params] = useSearchParams();
 
   const status = params.get("status");
+  const token =  params.get("token");
   const currentWorkspace = params.get("current_workspace");
 
   const [processed, setProcessed] = React.useState(false);

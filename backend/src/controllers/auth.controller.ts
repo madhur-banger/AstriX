@@ -10,8 +10,7 @@ import { UserDocument } from "../models/user.model";
 
 export const googleLoginCallback = asyncHandler(
   async (req: Request, res: Response) => {
-    const token = (req.authInfo as { token?: string})?.token;
-
+    const token = (req.authInfo as { token?: string })?.token;
 
     if (!token) {
       return res.redirect(
@@ -21,16 +20,14 @@ export const googleLoginCallback = asyncHandler(
 
     const currentWorkspace = req.user?.currentWorkspace;
 
-    res.cookie("access_token", token, {
-      httpOnly: true,
-      secure: config.NODE_ENV === "production",
-      sameSite: "lax",
-      maxAge: 15*60*1000,
-    });
-
     return res.redirect(
-      `${config.FRONTEND_GOOGLE_CALLBACK_URL}?status=success&current_workspace=${currentWorkspace}`
+      `${config.FRONTEND_GOOGLE_CALLBACK_URL}` +
+      `?status=success` +
+      `&token=${token}` +
+      `&current_workspace=${currentWorkspace}`
     );
+
+    
   }
 );
 
