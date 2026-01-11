@@ -92,10 +92,7 @@ export const googleLoginCallback = asyncHandler(
       const currentWorkspace = user.currentWorkspace;
 
       return res.redirect(
-        `${config.FRONTEND_GOOGLE_CALLBACK_URL}` +
-          `?status=success` +
-          `&access_token=${accessToken}` +
-          `&current_workspace=${currentWorkspace}`
+        `${config.FRONTEND_ORIGIN}/workspace/${currentWorkspace}`
       );
     } catch (error) {
       console.error("Google OAuth callback error:", error);
