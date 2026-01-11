@@ -1,4 +1,4 @@
-import GoogleOAuth from "@/page/auth/GoogleOAuth";
+// import GoogleOAuth from "@/page/auth/GoogleOAuth";
 import SignIn from "@/page/auth/Sign-in";
 import SignUp from "@/page/auth/Sign-up";
 import WorkspaceDashboard from "@/page/workspace/Dashboard";
