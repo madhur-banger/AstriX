@@ -406,10 +406,11 @@ resource "aws_iam_role" "github_actions" {
         Condition = {
           StringEquals = {
             "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
+            "token.actions.githubusercontent.com:repository_owner" = var.github_org
           }
           StringLike = {
             # Only allow from your specific repository and branches
-            "token.actions.githubusercontent.com:sub" = "repo:${var.github_org}/${var.github_repo}:*"
+            "token.actions.githubusercontent.com:sub" = "repo:${var.github_org}/${var.github_repo}::ref:refs/heads/main"
           }
         }
       }
@@ -445,7 +446,7 @@ resource "aws_iam_role_policy" "github_actions_deploy" {
           "ecr:UploadLayerPart",
           "ecr:CompleteLayerUpload"
         ]
-        Resource = "*"
+        Resource = "arn:aws:ecr:${var.aws_region}:${var.aws_account_id}:repository/${var.project_name}-${var.environment}-*"
       },
       # ECS: Deploy services
       {
@@ -459,7 +460,11 @@ resource "aws_iam_role_policy" "github_actions_deploy" {
           "ecs:DeregisterTaskDefinition",
           "ecs:DescribeClusters"
         ]
-        Resource = "*"
+        "Resource": [
+          "arn:aws:ecs:${var.aws_region}:${var.aws_account_id}:service/${var.project_name}-${var.environment}-*",
+          "arn:aws:ecs:${var.aws_region}:${var.aws_account_id}:task-definition/${var.project_name}-${var.environment}-*:*"
+        ]
+
       },
       # ECS: Pass role to task
       {
