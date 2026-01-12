@@ -53,8 +53,6 @@ output "lambda_security_group_id" {
   value       = module.security.lambda_security_group_id
 }
 
-
-
 # -----------------------------------------------------------------------------
 # IAM OUTPUTS
 # -----------------------------------------------------------------------------
@@ -79,7 +77,6 @@ output "github_actions_role_arn" {
   value       = module.iam.github_actions_role_arn
 }
 
-
 # -----------------------------------------------------------------------------
 # ECR OUTPUTS
 # -----------------------------------------------------------------------------
@@ -96,6 +93,40 @@ output "docker_login_command" {
 }
 
 # -----------------------------------------------------------------------------
+# PARAMETER STORE OUTPUTS (Phase 3)
+# -----------------------------------------------------------------------------
+
+output "parameter_names" {
+  description = "List of parameter store parameter names"
+  value       = module.parameter_store.parameter_names
+}
+
+# -----------------------------------------------------------------------------
+# ALB OUTPUTS (Phase 3)
+# -----------------------------------------------------------------------------
+
+output "alb_dns_name" {
+  description = "DNS name of the ALB - Use this to access your backend"
+  value       = module.alb.alb_dns_name
+}
+
+output "alb_zone_id" {
+  description = "Zone ID of ALB"
+  value       = module.alb.alb_zone_id
+}
+
+output "backend_api_url" {
+  description = "Full backend API URL"
+  value       = module.alb.backend_url
+}
+
+output "target_group_arn" {
+  description = "ARN of target group"
+  value       = module.alb.target_group_arn
+}
+
+
+# -----------------------------------------------------------------------------
 # SUMMARY OUTPUT
 # -----------------------------------------------------------------------------
 
@@ -104,26 +135,26 @@ output "infrastructure_summary" {
   value = {
     environment = var.environment
     region      = var.aws_region
-    
+
     networking = {
       vpc_id          = module.networking.vpc_id
       public_subnets  = module.networking.public_subnet_ids
       private_subnets = module.networking.private_subnet_ids
       nat_gateway_ip  = module.networking.nat_gateway_public_ip
     }
-    
+
     security_groups = {
       alb       = module.security.alb_security_group_id
       ecs_tasks = module.security.ecs_tasks_security_group_id
       lambda    = module.security.lambda_security_group_id
     }
-    
+
     iam_roles = {
       ecs_execution = module.iam.ecs_task_execution_role_arn
       ecs_task      = module.iam.ecs_task_role_arn
       lambda        = module.iam.lambda_execution_role_arn
     }
-    
+
     ecr = {
       backend_repo = module.ecr.backend_repository_url
     }

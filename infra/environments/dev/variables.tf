@@ -79,13 +79,19 @@ variable "flow_logs_retention_days" {
 variable "app_port" {
   description = "Port the backend application listens on"
   type        = number
-  default     = 8000
+  default     = 8080
 }
 
 variable "database_port" {
   description = "Port for database connections"
   type        = number
   default     = 27017
+}
+
+variable "health_check_path" {
+  description = "Health check endpoint path"
+  type        = string
+  default     = "/health"
 }
 
 # -----------------------------------------------------------------------------
@@ -176,4 +182,122 @@ variable "cross_account_ids" {
   description = "AWS account IDs that can pull images"
   type        = list(string)
   default     = []
+}
+
+# -----------------------------------------------------------------------------
+# APPLICATION SECRETS (NEW - Phase 3)
+# -----------------------------------------------------------------------------
+
+
+variable "create_parameter_store_kms_key" {
+  description = "Whether to create a custom KMS key for Parameter Store"
+  type        = bool
+  default     = false
+}
+
+variable "mongo_uri" {
+  description = "MongoDB connection URI"
+  type        = string
+  sensitive   = true
+}
+
+variable "jwt_access_token_secret" {
+  description = "JWT access token secret key"
+  type        = string
+  sensitive   = true
+}
+
+variable "jwt_access_token_expires_in" {
+  description = "JWT access token expiration time"
+  type        = string
+  default     = "15m"
+}
+
+variable "jwt_refresh_token_secret" {
+  description = "JWT refresh token secret key"
+  type        = string
+  sensitive   = true
+}
+
+variable "jwt_refresh_token_expires_in" {
+  description = "JWT refresh token expiration time"
+  type        = string
+  default     = "7d"
+}
+
+variable "google_client_id" {
+  description = "Google OAuth client ID"
+  type        = string
+}
+
+variable "google_client_secret" {
+  description = "Google OAuth client secret"
+  type        = string
+  sensitive   = true
+}
+
+variable "google_callback_url" {
+  description = "Google OAuth callback URL (will be updated with ALB DNS)"
+  type        = string
+  default     = "http://localhost:8000/api/auth/google/callback" # Placeholder
+}
+
+variable "vite_api_base_url" {
+  description = "Backend API URL for frontend (Vite)"
+  type        = string
+  default     = "http://localhost:8000/api"
+}
+
+variable "frontend_origin" {
+  description = "Frontend origin URL (for CORS)"
+  type        = string
+  default     = "http://localhost:5173" # Placeholder, will be updated with CloudFront
+}
+
+variable "frontend_google_callback_url" {
+  description = "Frontend Google OAuth callback URL"
+  type        = string
+  default     = "http://localhost:5173/google/callback" # Placeholder
+}
+
+variable "cookie_domain" {
+  description = "Cookie domain for session management"
+  type        = string
+  default     = "localhost" # Will be updated with actual domain
+}
+
+variable "node_env" {
+  description = "Node environment (development/production)"
+  type        = string
+  default     = "production"
+}
+
+
+
+# -----------------------------------------------------------------------------
+# ALB CONFIGURATION
+# -----------------------------------------------------------------------------
+
+variable "enable_stickiness" {
+  description = "Enable session stickiness on ALB"
+  type        = bool
+  default     = false
+}
+
+variable "certificate_arn" {
+  description = "ARN of ACM certificate for HTTPS (optional)"
+  type        = string
+  default     = null
+}
+
+variable "enable_access_logs" {
+  description = "Enable ALB access logs"
+  type        = bool
+  default     = false
+}
+
+variable "access_logs_bucket" {
+  description = "S3 bucket for ALB access logs"
+  type        = string
+  default     = null
 }

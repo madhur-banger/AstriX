@@ -30,7 +30,7 @@
 # -----------------------------------------------------------------------------
 
 terraform {
-  required_version = ">=1.0.0"
+  required_version = ">= 1.0.0"
 
   required_providers {
     aws = {
@@ -67,6 +67,22 @@ data "aws_caller_identity" "current" {}
 # Get current AWS region
 data "aws_region" "current" {}
 
+
+
+# -----------------------------------------------------------------------------
+# LOCAL VALUES
+# -----------------------------------------------------------------------------
+
+locals {
+  common_tags = {
+    Project     = var.project_name
+    Environment = var.environment
+    ManagedBy   = "terraform"
+    Owner       = var.owner
+  }
+}
+
+
 # -----------------------------------------------------------------------------
 # NETWORKING MODULE
 # -----------------------------------------------------------------------------
@@ -93,6 +109,10 @@ module "networking" {
   common_tags = local.common_tags
 }
 
+# -----------------------------------------------------------------------------
+# SECURITY MODULE
+# -----------------------------------------------------------------------------
+# Creates: Security Groups (ALB, ECS, Lambda, Database)
 
 module "security" {
   source = "../../modules/security"
@@ -116,6 +136,10 @@ module "security" {
   common_tags = local.common_tags
 }
 
+# -----------------------------------------------------------------------------
+# IAM MODULE
+# -----------------------------------------------------------------------------
+# Creates: ECS Roles, Lambda Role, GitHub Actions Role (OIDC)
 
 module "iam" {
   source = "../../modules/iam"
@@ -138,8 +162,6 @@ module "iam" {
 
   common_tags = local.common_tags
 }
-
-
 
 # -----------------------------------------------------------------------------
 # ECR MODULE
@@ -166,18 +188,64 @@ module "ecr" {
   common_tags = local.common_tags
 }
 
-
-
-
 # -----------------------------------------------------------------------------
-# LOCAL VALUES
+# PARAMETER STORE MODULE (Phase 3)
 # -----------------------------------------------------------------------------
+module "parameter_store" {
+  source = "../../modules/parameter-store"
 
-locals {
-  common_tags = {
-    Project     = var.project_name
-    Environment = var.environment
-    ManagedBy   = "terraform"
-    Owner       = var.owner
-  }
+  project_name = var.project_name
+  environment  = var.environment
+
+  # KMS encryption (optional - uses AWS managed key if not provided)
+  create_kms_key = var.create_parameter_store_kms_key
+  kms_key_arn    = var.kms_key_arn
+
+  # MongoDB
+  mongo_uri = var.mongo_uri
+
+  # JWT
+  jwt_access_token_secret      = var.jwt_access_token_secret
+  jwt_access_token_expires_in  = var.jwt_access_token_expires_in
+  jwt_refresh_token_secret     = var.jwt_refresh_token_secret
+  jwt_refresh_token_expires_in = var.jwt_refresh_token_expires_in
+
+  # Google OAuth
+  google_client_id     = var.google_client_id
+  google_client_secret = var.google_client_secret
+  google_callback_url  = var.google_callback_url
+
+  # Frontend URLs
+  frontend_origin              = var.frontend_origin
+  frontend_google_callback_url = var.frontend_google_callback_url
+  vite_api_base_url            = var.vite_api_base_url
+
+  # Cookie config
+  cookie_domain = var.cookie_domain
+
+  # Application
+  node_env = var.node_env
+  port     = tostring(var.app_port)
+
+  common_tags = local.common_tags
+}
+
+
+
+module "alb" {
+  source = "../../modules/alb"
+
+  project_name          = var.project_name
+  environment           = var.environment
+  vpc_id                = module.networking.vpc_id
+  public_subnet_ids     = module.networking.public_subnet_ids
+  alb_security_group_id = module.security.alb_security_group_id
+  backend_port          = var.app_port
+  health_check_path     = var.health_check_path
+  enable_stickiness     = var.enable_stickiness
+  certificate_arn       = var.certificate_arn
+  enable_access_logs    = var.enable_access_logs
+  access_logs_bucket    = var.access_logs_bucket
+
+  common_tags = local.common_tags
 }
