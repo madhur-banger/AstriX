@@ -25,3 +25,4 @@ infra/environments/dev/.terraform/
 *.tfstate
 *.tfstate.*
 .terraform.lock.hcl
+*.tfvars
