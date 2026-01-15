@@ -77,9 +77,9 @@ resource "aws_lb_target_group" "backend" {
     Name = "${var.project_name}-${var.environment}-tg"
   })
 
-  lifecycle {
-    create_before_destroy = true
-  }
+#   lifecycle {
+#     create_before_destroy = true
+#   }
 }
 
 # -----------------------------------------------------------------------------

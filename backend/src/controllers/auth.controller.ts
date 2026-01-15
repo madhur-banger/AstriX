@@ -178,7 +178,6 @@ export const loginController = asyncHandler(
     )(req, res, next);
   }
 );
-
 // ============================================
 // REFRESH TOKEN
 // ============================================

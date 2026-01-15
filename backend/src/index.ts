@@ -24,6 +24,16 @@ import memberRoutes from "./routes/member.route";
 import { passportAuthenticateJWT } from "./config/passport.config";
 
 const app = express();
+
+
+/**
+ * We run behind CloudFront → ALB → Express
+ * So we must trust the first proxy.
+ */
+app.set("trust proxy", 1);
+
+
+
 const BASE_PATH = config.BASE_PATH;
 
 // ============================================
@@ -52,6 +62,8 @@ app.use(express.urlencoded({ extended: true }));
  * so we MUST be able to read it.
  */
 app.use(cookieParser());
+
+
 
 // ============================================
 // CORS CONFIGURATION

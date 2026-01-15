@@ -72,7 +72,6 @@ data "aws_region" "current" {}
 # -----------------------------------------------------------------------------
 # LOCAL VALUES
 # -----------------------------------------------------------------------------
-
 locals {
   common_tags = {
     Project     = var.project_name
@@ -80,7 +79,22 @@ locals {
     ManagedBy   = "terraform"
     Owner       = var.owner
   }
+  # Protocol based on HTTPS enablement
+  protocol = var.enable_https ? "https" : "http"
+  
+  # URLs automatically computed
+  alb_base_url = var.enable_https ? "https://${module.alb.alb_dns_name}" : "http://${module.alb.alb_dns_name}"
+  api_base_url = "${local.alb_base_url}/api"
+  frontend_url = "https://${module.cloudfront_s3.distribution_domain_name}"
+  
+  # Callbacks
+  google_callback_url           = "${local.api_base_url}/auth/google/callback"
+  frontend_google_callback_url  = "${local.frontend_url}/google/callback"
+  
+  # Cookie domain (ALB domain for proper cookie handling)
+  cookie_domain = module.alb.alb_dns_name
 }
+
 
 
 # -----------------------------------------------------------------------------
@@ -188,6 +202,68 @@ module "ecr" {
   common_tags = local.common_tags
 }
 
+module "alb" {
+  source = "../../modules/alb"
+
+  project_name           = var.project_name
+  environment            = var.environment
+  vpc_id                 = module.networking.vpc_id
+  public_subnet_ids      = module.networking.public_subnet_ids
+  alb_security_group_id  = module.security.alb_security_group_id
+  backend_port           = var.app_port
+  health_check_path      = var.health_check_path
+  enable_stickiness      = var.enable_stickiness
+  certificate_arn        = null  # Certificate added after ACM
+  enable_access_logs     = var.enable_access_logs
+  access_logs_bucket     = var.access_logs_bucket
+
+  common_tags = local.common_tags
+}
+
+
+module "acm" {
+  source = "../../modules/acm"
+
+  project_name = var.project_name
+  environment  = var.environment
+  alb_dns_name = module.alb.alb_dns_name
+  organization_name = "AstriX"
+  country_code = "US"
+  save_certificate_locally = true
+  certificate_output_path = "${path.root}/../../certificates"
+
+  # FIXED: Use correct variable names
+  enable_custom_domain = var.enable_alb_custom_domain
+  custom_domain_name   = var.alb_custom_domain_name
+  include_wildcard     = var.include_wildcard_cert
+  certificate_arn      = var.alb_certificate_arn
+  enable_expiration_alerts = false
+
+  depends_on = [module.alb]
+}
+
+resource "aws_lb_listener" "https" {
+  count = var.enable_https ? 1 : 0
+
+  load_balancer_arn = module.alb.alb_arn
+  port              = "443"
+  protocol          = "HTTPS"
+  ssl_policy        = var.ssl_policy
+  certificate_arn   = module.acm.certificate_arn
+
+  default_action {
+    type             = "forward"
+    target_group_arn = module.alb.target_group_arn
+  }
+
+  tags = merge(local.common_tags, {
+    Name = "${var.project_name}-${var.environment}-https-listener"
+  })
+
+  depends_on = [module.acm]
+}
+
+
 # -----------------------------------------------------------------------------
 # PARAMETER STORE MODULE (Phase 3)
 # -----------------------------------------------------------------------------
@@ -196,56 +272,110 @@ module "parameter_store" {
 
   project_name = var.project_name
   environment  = var.environment
-
-  # KMS encryption (optional - uses AWS managed key if not provided)
   create_kms_key = var.create_parameter_store_kms_key
   kms_key_arn    = var.kms_key_arn
 
-  # MongoDB
   mongo_uri = var.mongo_uri
-
-  # JWT
   jwt_access_token_secret      = var.jwt_access_token_secret
   jwt_access_token_expires_in  = var.jwt_access_token_expires_in
   jwt_refresh_token_secret     = var.jwt_refresh_token_secret
   jwt_refresh_token_expires_in = var.jwt_refresh_token_expires_in
+  google_client_id       = var.google_client_id
+  google_client_secret   = var.google_client_secret
+  
+  # AUTOMATED URLS
+  google_callback_url          = local.google_callback_url
+  frontend_origin              = local.frontend_url
+  frontend_google_callback_url = local.frontend_google_callback_url
+  vite_api_base_url            = local.api_base_url
+  cookie_domain                = local.cookie_domain
 
-  # Google OAuth
-  google_client_id     = var.google_client_id
-  google_client_secret = var.google_client_secret
-  google_callback_url  = var.google_callback_url
-
-  # Frontend URLs
-  frontend_origin              = var.frontend_origin
-  frontend_google_callback_url = var.frontend_google_callback_url
-  vite_api_base_url            = var.vite_api_base_url
-
-  # Cookie config
-  cookie_domain = var.cookie_domain
-
-  # Application
   node_env = var.node_env
   port     = tostring(var.app_port)
 
   common_tags = local.common_tags
+  depends_on = [module.acm, aws_lb_listener.https]
+}
+
+# -----------------------------------------------------------------------------
+# ECS MODULE (UNCHANGED)
+# -----------------------------------------------------------------------------
+
+module "ecs" {
+  source                      = "../../modules/ecs"
+  project_name                = var.project_name
+  environment                 = var.environment
+  aws_region                  = var.aws_region
+  aws_account_id              = data.aws_caller_identity.current.account_id
+  private_subnet_ids          = module.networking.private_subnet_ids
+  ecs_security_group_id       = module.security.ecs_tasks_security_group_id
+  target_group_arn            = module.alb.target_group_arn
+  ecs_task_execution_role_arn = module.iam.ecs_task_execution_role_arn
+  ecs_task_role_arn           = module.iam.ecs_task_role_arn
+  ecr_repository_url          = module.ecr.backend_repository_url
+  image_tag                   = var.ecs_image_tag
+  container_port              = var.app_port
+  node_env                    = var.node_env
+  health_check_path           = var.health_check_path
+  task_cpu                    = var.ecs_task_cpu
+  task_memory                 = var.ecs_task_memory
+  desired_count               = var.ecs_desired_count
+  deployment_minimum_healthy_percent = var.ecs_deployment_minimum_healthy_percent
+  deployment_maximum_percent  = var.ecs_deployment_maximum_percent
+  health_check_grace_period   = var.ecs_health_check_grace_period
+  enable_ecs_exec             = var.enable_ecs_exec
+  min_capacity                = var.ecs_min_capacity
+  max_capacity                = var.ecs_max_capacity
+  cpu_target_value            = var.ecs_cpu_target_value
+  memory_target_value         = var.ecs_memory_target_value
+  scale_in_cooldown           = var.ecs_scale_in_cooldown
+  scale_out_cooldown          = var.ecs_scale_out_cooldown
+  fargate_weight              = var.ecs_fargate_weight
+  fargate_base                = var.ecs_fargate_base
+  fargate_spot_weight         = var.ecs_fargate_spot_weight
+  log_retention_days          = var.ecs_log_retention_days
+  enable_container_insights   = var.enable_container_insights
+  enable_alarms               = var.enable_ecs_alarms
+  
+  common_tags = local.common_tags
+  depends_on  = [module.alb, module.parameter_store]
 }
 
 
 
-module "alb" {
-  source = "../../modules/alb"
 
-  project_name          = var.project_name
-  environment           = var.environment
-  vpc_id                = module.networking.vpc_id
-  public_subnet_ids     = module.networking.public_subnet_ids
-  alb_security_group_id = module.security.alb_security_group_id
-  backend_port          = var.app_port
-  health_check_path     = var.health_check_path
-  enable_stickiness     = var.enable_stickiness
-  certificate_arn       = var.certificate_arn
-  enable_access_logs    = var.enable_access_logs
-  access_logs_bucket    = var.access_logs_bucket
+# -----------------------------------------------------------------------------
+# CLOUDFRONT + S3 MODULE (NEW - Phase 4)
+# -----------------------------------------------------------------------------
+
+module "cloudfront_s3" {
+  source = "../../modules/cloudfront_s3"
+
+  project_name = var.project_name
+  environment  = var.environment
+  bucket_name       = var.frontend_bucket_name
+  force_destroy     = var.frontend_force_destroy
+  enable_versioning = var.frontend_enable_versioning
+  kms_key_arn       = var.frontend_kms_key_arn
+  enable_lifecycle_rules             = var.frontend_enable_lifecycle_rules
+  noncurrent_version_expiration_days = var.frontend_noncurrent_version_expiration_days
+  cors_allowed_origins = var.frontend_cors_allowed_origins
+  price_class       = var.cloudfront_price_class
+  enable_spa_routing = var.cloudfront_enable_spa_routing
+  domain_name         = var.frontend_domain_name
+  acm_certificate_arn = var.frontend_acm_certificate_arn
+  route53_zone_id     = var.frontend_route53_zone_id
+  alb_dns_name        = module.alb.alb_dns_name
+  alb_protocol_policy = var.enable_https ? "https-only" : var.cloudfront_alb_protocol_policy
+  web_acl_id              = var.cloudfront_web_acl_id
+  content_security_policy = var.cloudfront_content_security_policy
+  geo_restriction_type    = var.cloudfront_geo_restriction_type
+  geo_restriction_locations = var.cloudfront_geo_restriction_locations
+  enable_logging      = var.cloudfront_enable_logging
+  log_bucket          = var.cloudfront_log_bucket
+  log_prefix          = var.cloudfront_log_prefix
+  log_include_cookies = var.cloudfront_log_include_cookies
 
   common_tags = local.common_tags
+  depends_on = [module.alb, module.acm]
 }

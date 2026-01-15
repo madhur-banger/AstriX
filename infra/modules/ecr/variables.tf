@@ -35,6 +35,14 @@ variable "create_lambda_repository" {
   default     = false
 }
 
+
+variable "force_delete" {
+  description = "Allow deletion of repository even if it contains images (use with caution in prod)"
+  type        = bool
+  default     = true # Safe default for dev, override in prod
+}
+
+
 # -----------------------------------------------------------------------------
 # LIFECYCLE POLICY CONFIGURATION
 # -----------------------------------------------------------------------------

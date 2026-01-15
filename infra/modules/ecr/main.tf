@@ -34,6 +34,10 @@ resource "aws_ecr_repository" "backend" {
     encryption_type = "AES256"
   }
 
+  # Allow deletion even if repository contains images
+  # Safe for dev, should be false in prod
+  force_delete = var.force_delete
+
   tags = merge(var.common_tags, {
     Name = "${var.project_name}-${var.environment}-backend"
   })

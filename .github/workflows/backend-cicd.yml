@@ -3,12 +3,6 @@ name: Backend CI/CD - Build, Test & Deploy
 # =============================================================================
 # TRIGGER CONFIGURATION
 # =============================================================================
-# This workflow runs on:
-# 1. Push to main/develop branches
-# 2. Pull requests to main
-# 3. Manual trigger (workflow_dispatch)
-# 4. Only when backend code changes
-
 on:
   push:
     branches:
@@ -16,7 +10,7 @@ on:
       - develop
     paths:
       - 'backend/**'
-      - '.github/workflows/backend-deploy.yml'
+      - '.github/workflows/backend-cicd.yml'
   
   pull_request:
     branches:
@@ -49,10 +43,9 @@ env:
 # =============================================================================
 # PERMISSIONS
 # =============================================================================
-# Required for OIDC authentication with AWS
 permissions:
-  id-token: write   # Required for requesting JWT
-  contents: read    # Required for actions/checkout
+  id-token: write
+  contents: read
 
 # =============================================================================
 # JOBS
@@ -128,7 +121,7 @@ jobs:
         with:
           role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/astrix-${{ github.event.inputs.environment || 'dev' }}-github-actions-role
           aws-region: ${{ env.AWS_REGION }}
-          role-session-name: GitHubActions-Backend-Deploy
+          role-session-name: GitHubActions-Backend-Build
       
       - name: Login to Amazon ECR
         id: login-ecr
@@ -171,6 +164,7 @@ jobs:
         run: |
           echo "Image pushed successfully!"
           echo "Image URI: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.version }}"
+          echo "image=${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.version }}" >> $GITHUB_OUTPUT
 
   # ---------------------------------------------------------------------------
   # JOB 3: DEPLOY TO ECS
@@ -179,9 +173,13 @@ jobs:
     name: Deploy to ECS Fargate
     runs-on: ubuntu-latest
     needs: build
+    
     environment:
       name: ${{ github.event.inputs.environment || 'dev' }}
-      url: https://${{ steps.deploy.outputs.alb-url }}
+      url: ${{ steps.get-alb.outputs.alb-url }}
+    
+    outputs:
+      alb-url: ${{ steps.get-alb.outputs.alb-url }}
     
     steps:
       - name: Checkout code
@@ -199,6 +197,11 @@ jobs:
           aws ecs describe-task-definition \
             --task-definition astrix-${{ github.event.inputs.environment || 'dev' }}-backend \
             --query taskDefinition > task-definition.json
+          
+          # Remove fields that can't be in a new task definition
+          jq 'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)' \
+            task-definition.json > task-definition-clean.json
+          mv task-definition-clean.json task-definition.json
       
       - name: Fill in new image in task definition
         id: task-def
@@ -209,7 +212,6 @@ jobs:
           image: ${{ needs.build.outputs.image }}
       
       - name: Deploy to Amazon ECS
-        id: deploy
         uses: aws-actions/amazon-ecs-deploy-task-definition@v1
         with:
           task-definition: ${{ steps.task-def.outputs.task-definition }}
@@ -233,19 +235,19 @@ jobs:
           echo "Waiting for deployment to stabilize..."
           sleep 30
           
-          # Health check
           ALB_URL="${{ steps.get-alb.outputs.alb-url }}"
-          HEALTH_URL="${ALB_URL}/api/health"
+          HEALTH_URL="${ALB_URL}/health"
           
           echo "Checking health endpoint: ${HEALTH_URL}"
           
           for i in {1..10}; do
-            if curl -f -s "${HEALTH_URL}" > /dev/null; then
-              echo "✅ Health check passed!"
-              curl -s "${HEALTH_URL}" | jq .
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "${HEALTH_URL}")
+            if [ "$HTTP_CODE" = "200" ]; then
+              echo "✅ Health check passed! (HTTP ${HTTP_CODE})"
+              curl -s "${HEALTH_URL}" | jq . || true
               exit 0
             fi
-            echo "Attempt $i/10 failed, retrying in 10s..."
+            echo "Attempt $i/10: HTTP ${HTTP_CODE}, retrying in 10s..."
             sleep 10
           done
           
@@ -254,7 +256,7 @@ jobs:
       
       - name: Deployment summary
         run: |
-          echo "## 🚀 Deployment Successful" >> $GITHUB_STEP_SUMMARY
+          echo "## 🚀 Backend Deployment Successful" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Environment:** ${{ github.event.inputs.environment || 'dev' }}" >> $GITHUB_STEP_SUMMARY
           echo "**Image:** ${{ needs.build.outputs.image }}" >> $GITHUB_STEP_SUMMARY
@@ -264,46 +266,59 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Test the API:" >> $GITHUB_STEP_SUMMARY
           echo '```bash' >> $GITHUB_STEP_SUMMARY
-          echo "curl ${{ steps.get-alb.outputs.alb-url }}/api/health" >> $GITHUB_STEP_SUMMARY
+          echo "curl ${{ steps.get-alb.outputs.alb-url }}/health" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
 
   # ---------------------------------------------------------------------------
-  # JOB 4: ROLLBACK ON FAILURE (Optional)
+  # JOB 4: ROLLBACK ON FAILURE
   # ---------------------------------------------------------------------------
   rollback:
     name: Rollback on Failure
     runs-on: ubuntu-latest
     needs: [build, deploy]
-    if: failure()
+    if: failure() && needs.build.result == 'success'
     
     steps:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/astrix-${{ github-actions-role
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/astrix-${{ github.event.inputs.environment || 'dev' }}-github-actions-role
           aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActions-Backend-Rollback
       
       - name: Rollback ECS service
         run: |
           echo "Deployment failed, initiating rollback..."
           
-          # Get previous task definition
-          PREVIOUS_TASK_DEF=$(aws ecs describe-services \
-            --cluster ${{ env.ECS_CLUSTER }} \
-            --services ${{ env.ECS_SERVICE }} \
-            --query 'services[0].taskDefinition' \
-            --output text)
+          # ECS with circuit breaker enabled should auto-rollback
+          # But we can force a new deployment with the previous task definition
           
-          echo "Rolling back to: ${PREVIOUS_TASK_DEF}"
+          # Get the list of task definitions
+          TASK_DEFS=$(aws ecs list-task-definitions \
+            --family-prefix astrix-${{ github.event.inputs.environment || 'dev' }}-backend \
+            --sort DESC \
+            --max-items 5 \
+            --query 'taskDefinitionArns' \
+            --output json)
           
-          # Force new deployment with previous task definition
-          aws ecs update-service \
-            --cluster ${{ env.ECS_CLUSTER }} \
-            --service ${{ env.ECS_SERVICE }} \
-            --task-definition "${PREVIOUS_TASK_DEF}" \
-            --force-new-deployment
+          echo "Recent task definitions: ${TASK_DEFS}"
           
-          echo "Rollback initiated"
+          # The current (failed) one should be first, so get the second one
+          PREVIOUS_TASK_DEF=$(echo "${TASK_DEFS}" | jq -r '.[1] // .[0]')
+          
+          if [ -n "${PREVIOUS_TASK_DEF}" ] && [ "${PREVIOUS_TASK_DEF}" != "null" ]; then
+            echo "Rolling back to: ${PREVIOUS_TASK_DEF}"
+            
+            aws ecs update-service \
+              --cluster ${{ env.ECS_CLUSTER }} \
+              --service ${{ env.ECS_SERVICE }} \
+              --task-definition "${PREVIOUS_TASK_DEF}" \
+              --force-new-deployment
+            
+            echo "Rollback initiated"
+          else
+            echo "No previous task definition found for rollback"
+          fi
       
       - name: Notify failure
         run: |
