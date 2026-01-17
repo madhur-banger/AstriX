@@ -29,7 +29,7 @@ const appConfig = () => ({
   COOKIE: {
     REFRESH_TOKEN_NAME: "refresh_token",
     HTTP_ONLY: true,
-    SECURE: NODE_ENV === "production",
+    SECURE: NODE_ENV === "development",
     SAME_SITE: "lax" as const,
     PATH: "/",
     DOMAIN: getEnv("COOKIE_DOMAIN", undefined),
