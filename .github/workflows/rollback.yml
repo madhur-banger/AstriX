@@ -117,7 +117,7 @@ jobs:
         id: cloudfront
         run: |
           DIST_ID=$(aws cloudfront list-distributions \
-            --query "DistributionList.Items[?Origins.Items[?DomainName=='${S3_BUCKET}.s3.amazonaws.com']].Id | [0]" \
+            --query "DistributionList.Items[?Origins.Items[?contains(DomainName, '${S3_BUCKET}')]].Id | [0]" \
             --output text)
           
           if [ "$DIST_ID" == "None" ] || [ -z "$DIST_ID" ]; then
