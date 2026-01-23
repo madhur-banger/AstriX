@@ -406,11 +406,10 @@ resource "aws_iam_role" "github_actions" {
         Condition = {
           StringEquals = {
             "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
-            "token.actions.githubusercontent.com:repository_owner" = var.github_org
           }
           StringLike = {
             # Only allow from your specific repository and branches
-            "token.actions.githubusercontent.com:sub" = "repo:${var.github_org}/${var.github_repo}::ref:refs/heads/main"
+            "token.actions.githubusercontent.com:sub" = "repo:${var.github_org}/${var.github_repo}:*"
           }
         }
       }
@@ -432,19 +431,28 @@ resource "aws_iam_role_policy" "github_actions_deploy" {
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
+      # ECR: Login (GetAuthorizationToken needs * resource)
+      {
+        Sid    = "ECRLogin"
+        Effect = "Allow"
+        Action = [
+          "ecr:GetAuthorizationToken"
+        ]
+        Resource = "*"
+      },
       # ECR: Push Docker images
       {
         Sid    = "ECRPush"
         Effect = "Allow"
         Action = [
-          "ecr:GetAuthorizationToken",
           "ecr:BatchCheckLayerAvailability",
           "ecr:GetDownloadUrlForLayer",
           "ecr:BatchGetImage",
           "ecr:PutImage",
           "ecr:InitiateLayerUpload",
           "ecr:UploadLayerPart",
-          "ecr:CompleteLayerUpload"
+          "ecr:CompleteLayerUpload",
+          "ecr:DescribeImages"
         ]
         Resource = "arn:aws:ecr:${var.aws_region}:${var.aws_account_id}:repository/${var.project_name}-${var.environment}-*"
       },
@@ -458,13 +466,22 @@ resource "aws_iam_role_policy" "github_actions_deploy" {
           "ecs:DescribeTaskDefinition",
           "ecs:RegisterTaskDefinition",
           "ecs:DeregisterTaskDefinition",
-          "ecs:DescribeClusters"
+          "ecs:DescribeClusters",
+          "ecs:ListTasks",
+          "ecs:DescribeTasks"
         ]
-        "Resource": [
-          "arn:aws:ecs:${var.aws_region}:${var.aws_account_id}:service/${var.project_name}-${var.environment}-*",
-          "arn:aws:ecs:${var.aws_region}:${var.aws_account_id}:task-definition/${var.project_name}-${var.environment}-*:*"
+        Resource = "*"
+      },
+      # ECS: Wait for service stability
+      {
+        Sid    = "ECSWait"
+        Effect = "Allow"
+        Action = [
+          "ecs:DescribeServices"
         ]
-
+        Resource = [
+          "arn:aws:ecs:${var.aws_region}:${var.aws_account_id}:service/${var.project_name}-${var.environment}-cluster/*"
+        ]
       },
       # ECS: Pass role to task
       {
@@ -491,15 +508,29 @@ resource "aws_iam_role_policy" "github_actions_deploy" {
           "arn:aws:s3:::${var.project_name}-${var.environment}-*/*"
         ]
       },
-      # CloudFront: Invalidate cache
+      # CloudFront: List distributions and invalidate cache
       {
-        Sid    = "CloudFrontInvalidate"
+        Sid    = "CloudFront"
         Effect = "Allow"
         Action = [
+          "cloudfront:ListDistributions",
           "cloudfront:CreateInvalidation",
           "cloudfront:GetInvalidation"
         ]
         Resource = "*"
+      },
+      # SSM: Read parameters for CI/CD
+      {
+        Sid    = "SSMGetParameters"
+        Effect = "Allow"
+        Action = [
+          "ssm:GetParameter",
+          "ssm:GetParameters",
+          "ssm:GetParametersByPath"
+        ]
+        Resource = [
+          "arn:aws:ssm:${var.aws_region}:${var.aws_account_id}:parameter/${var.project_name}/${var.environment}/*"
+        ]
       },
       # Lambda: Update functions
       {

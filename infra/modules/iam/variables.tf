@@ -73,7 +73,7 @@ variable "create_github_oidc" {
     Much more secure than static credentials.
   EOT
   type        = bool
-  default     = false
+  default     = true
 }
 
 variable "github_org" {

@@ -135,7 +135,7 @@ variable "lambda_vpc_access" {
 variable "create_github_oidc" {
   description = "Whether to create GitHub Actions OIDC provider"
   type        = bool
-  default     = false
+  default     = true
 }
 
 variable "github_org" {

@@ -102,7 +102,6 @@ jobs:
     runs-on: ubuntu-latest
     env:
       S3_BUCKET: astrix-dev-frontend
-      CLOUDFRONT_DISTRIBUTION_ID: ${{ vars.CLOUDFRONT_DISTRIBUTION_ID }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -113,6 +112,20 @@ jobs:
         with:
           role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/astrix-dev-github-actions-role
           aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get CloudFront Distribution ID
+        id: cloudfront
+        run: |
+          DIST_ID=$(aws cloudfront list-distributions \
+            --query "DistributionList.Items[?Origins.Items[?DomainName=='${S3_BUCKET}.s3.amazonaws.com']].Id | [0]" \
+            --output text)
+          
+          if [ "$DIST_ID" == "None" ] || [ -z "$DIST_ID" ]; then
+            echo "❌ CloudFront distribution not found"
+            exit 1
+          fi
+          
+          echo "distribution_id=$DIST_ID" >> $GITHUB_OUTPUT
 
       - name: Get API URL from SSM
         id: ssm
@@ -145,6 +158,6 @@ jobs:
       - name: Invalidate CloudFront
         run: |
           aws cloudfront create-invalidation \
-            --distribution-id $CLOUDFRONT_DISTRIBUTION_ID \
+            --distribution-id ${{ steps.cloudfront.outputs.distribution_id }} \
             --paths "/*"
           echo "✅ Frontend rollback complete!"
