@@ -1,0 +1,150 @@
+name: Rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'What to rollback'
+        required: true
+        type: choice
+        options:
+          - backend
+          - frontend
+          - both
+      commit_sha:
+        description: 'Commit SHA to rollback to'
+        required: true
+        type: string
+
+env:
+  AWS_REGION: us-east-1
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  rollback-backend:
+    name: Rollback Backend
+    if: inputs.target == 'backend' || inputs.target == 'both'
+    runs-on: ubuntu-latest
+    env:
+      ECR_REPOSITORY: astrix-dev-backend
+      ECS_CLUSTER: astrix-dev-cluster
+      ECS_SERVICE: astrix-dev-backend-service
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit_sha }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/astrix-dev-github-actions-role
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Check if image exists
+        id: check-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          if aws ecr describe-images --repository-name $ECR_REPOSITORY --image-ids imageTag=${{ inputs.commit_sha }} 2>/dev/null; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build and push image (if not exists)
+        if: steps.check-image.outputs.exists == 'false'
+        working-directory: backend
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          echo "Image not found in ECR, rebuilding from commit..."
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:${{ inputs.commit_sha }} .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:${{ inputs.commit_sha }}
+
+      - name: Update ECS task definition with rollback image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          # Get current task definition
+          TASK_DEF=$(aws ecs describe-task-definition --task-definition astrix-dev-backend --query 'taskDefinition')
+          
+          # Update image in task definition
+          NEW_TASK_DEF=$(echo $TASK_DEF | jq --arg IMAGE "$ECR_REGISTRY/$ECR_REPOSITORY:${{ inputs.commit_sha }}" \
+            '.containerDefinitions[0].image = $IMAGE | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)')
+          
+          # Register new task definition
+          aws ecs register-task-definition --cli-input-json "$NEW_TASK_DEF"
+          
+          # Update service
+          aws ecs update-service \
+            --cluster $ECS_CLUSTER \
+            --service $ECS_SERVICE \
+            --force-new-deployment
+
+      - name: Wait for service stability
+        run: |
+          echo "Waiting for ECS service to stabilize..."
+          aws ecs wait services-stable \
+            --cluster $ECS_CLUSTER \
+            --services $ECS_SERVICE
+          echo "✅ Backend rollback complete!"
+
+  rollback-frontend:
+    name: Rollback Frontend
+    if: inputs.target == 'frontend' || inputs.target == 'both'
+    runs-on: ubuntu-latest
+    env:
+      S3_BUCKET: astrix-dev-frontend
+      CLOUDFRONT_DISTRIBUTION_ID: ${{ vars.CLOUDFRONT_DISTRIBUTION_ID }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit_sha }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/astrix-dev-github-actions-role
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get API URL from SSM
+        id: ssm
+        run: |
+          API_URL=$(aws ssm get-parameter --name "/astrix/dev/VITE_API_BASE_URL" --query "Parameter.Value" --output text)
+          echo "api_url=$API_URL" >> $GITHUB_OUTPUT
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: client/package-lock.json
+
+      - name: Install dependencies
+        working-directory: client
+        run: npm ci
+
+      - name: Build
+        working-directory: client
+        run: npm run build
+        env:
+          VITE_API_BASE_URL: ${{ steps.ssm.outputs.api_url }}
+
+      - name: Sync to S3
+        working-directory: client
+        run: |
+          aws s3 sync dist/ s3://$S3_BUCKET/ --delete
+
+      - name: Invalidate CloudFront
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id $CLOUDFRONT_DISTRIBUTION_ID \
+            --paths "/*"
+          echo "✅ Frontend rollback complete!"
