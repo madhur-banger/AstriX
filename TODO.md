@@ -6,7 +6,7 @@ It is ordered by **risk first**, then **correctness**, then **hardening**.
 
 ## 1. Authentication & Token Safety (Critical)
 
-* [ ] Remove access tokens from URL query parameters (OAuth callback)
+* [ ] Remove access tokens from URL query x parameters (OAuth callback)
 * [ ] Switch Google OAuth callback to:
 
   * [ ] HttpOnly + Secure cookies **OR**
