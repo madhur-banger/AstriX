@@ -1,0 +1,212 @@
+# =============================================================================
+# DEV ENVIRONMENT - EXAMPLE TERRAFORM VARIABLES
+# =============================================================================
+# Copy this file to `terraform.tfvars` (gitignored - never commit that file)
+# and fill in real values. Every value below is a placeholder or a safe,
+# non-sensitive default - this file is safe to commit.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# PROJECT IDENTIFICATION
+# -----------------------------------------------------------------------------
+
+project_name = "astrix"
+environment  = "dev"
+owner        = "your-name"
+aws_profile  = "your-aws-cli-profile-name"
+
+# -----------------------------------------------------------------------------
+# AWS CONFIGURATION
+# -----------------------------------------------------------------------------
+
+aws_region = "us-east-1"
+
+# -----------------------------------------------------------------------------
+# NETWORKING CONFIGURATION
+# -----------------------------------------------------------------------------
+
+vpc_cidr = "10.0.0.0/16"
+
+public_subnet_cidrs = [
+  "10.0.1.0/24", # AZ-a: ALB, NAT Gateway
+  "10.0.2.0/24"  # AZ-b: ALB (multi-AZ requirement)
+]
+
+private_subnet_cidrs = [
+  "10.0.10.0/24", # AZ-a: ECS tasks, Lambda
+  "10.0.20.0/24"  # AZ-b: ECS tasks, Lambda
+]
+
+# COST NOTE: NAT Gateway costs ~$32/month
+enable_nat_gateway = true
+
+# Set to false for a single, shared NAT Gateway (cheaper); true provisions
+# one NAT per AZ so an AZ outage on the NAT side doesn't take down egress
+# for tasks in the other AZ too. Costs an extra ~$32/month + data when true.
+single_nat_gateway = true
+
+enable_flow_logs         = false
+flow_logs_retention_days = 7
+
+# -----------------------------------------------------------------------------
+# APPLICATION CONFIGURATION
+# -----------------------------------------------------------------------------
+
+enable_initial_docker_push = true
+enable_url_auto_update     = true
+ecr_force_delete           = true
+
+app_port      = 3000
+database_port = 27017
+
+# -----------------------------------------------------------------------------
+# SECURITY CONFIGURATION
+# -----------------------------------------------------------------------------
+
+create_lambda_sg        = true
+create_database_sg      = false
+create_vpc_endpoints_sg = false
+
+# -----------------------------------------------------------------------------
+# IAM CONFIGURATION
+# -----------------------------------------------------------------------------
+
+kms_key_arn = null
+
+lambda_vpc_access   = true
+create_github_oidc  = true
+github_org          = "your-github-org-or-username"
+github_repo         = "your-repo-name"
+
+# -----------------------------------------------------------------------------
+# ECR CONFIGURATION
+# -----------------------------------------------------------------------------
+
+create_lambda_ecr = false
+
+image_retention_count         = 5
+dev_image_retention_count     = 3
+untagged_image_retention_days = 1
+
+cross_account_ids = []
+
+# -----------------------------------------------------------------------------
+# APPLICATION SECRETS
+# -----------------------------------------------------------------------------
+# All values in this section are REAL secrets in terraform.tfvars.
+# CHANGE_ME below marks values that must never be left as placeholders.
+
+mongo_uri = "CHANGE_ME" # mongodb+srv://<user>:<password>@<cluster>.mongodb.net/<db>?retryWrites=true&w=majority
+
+# Generate with: node -e "console.log(require('crypto').randomBytes(64).toString('hex'))"
+jwt_access_token_secret      = "CHANGE_ME"
+jwt_access_token_expires_in  = "15m"
+jwt_refresh_token_secret     = "CHANGE_ME"
+jwt_refresh_token_expires_in = "7d"
+
+google_client_id     = "CHANGE_ME" # from Google Cloud Console OAuth credentials
+google_client_secret = "CHANGE_ME"
+
+# These are placeholders that get auto-updated by the deploy scripts once
+# the ALB/CloudFront domains are known - see infra/scripts/update-urls.sh
+google_callback_url          = "http://localhost:8000/api/auth/google/callback"
+frontend_origin               = "http://localhost:5173"
+frontend_google_callback_url = "http://localhost:5173/google/callback"
+cookie_domain                = "localhost"
+
+node_env = "development"
+
+# -----------------------------------------------------------------------------
+# ECS CONFIGURATION
+# -----------------------------------------------------------------------------
+
+ecs_image_tag                          = "latest"
+ecs_task_cpu                           = 512
+ecs_task_memory                        = 1024
+ecs_desired_count                      = 2
+ecs_deployment_minimum_healthy_percent = 100
+ecs_deployment_maximum_percent         = 200
+ecs_health_check_grace_period          = 60
+enable_ecs_exec                        = false
+ecs_min_capacity                       = 1
+ecs_max_capacity                       = 4
+ecs_cpu_target_value                   = 70
+ecs_memory_target_value                = 80
+ecs_scale_in_cooldown                  = 300
+ecs_scale_out_cooldown                 = 60
+ecs_fargate_weight                     = 1
+ecs_fargate_base                       = 1
+ecs_fargate_spot_weight                = 0
+ecs_log_retention_days                 = 7
+enable_container_insights              = true
+enable_ecs_alarms                      = true
+
+# Email subscribed to the CloudWatch alarm SNS topic
+alert_email = "you@example.com"
+
+# =============================================================================
+# CLOUDFRONT + S3 CONFIGURATION
+# =============================================================================
+
+frontend_bucket_name = null
+
+frontend_force_destroy     = true
+frontend_enable_versioning = true
+frontend_kms_key_arn       = null
+
+frontend_enable_lifecycle_rules             = true
+frontend_noncurrent_version_expiration_days = 30
+
+# No permissive default - set explicit origins once a real frontend domain
+# exists (see PLAN.md's frontend security findings for why "*" is unsafe).
+frontend_cors_allowed_origins = []
+
+cloudfront_price_class       = "PriceClass_100"
+cloudfront_enable_spa_routing = true
+
+# -----------------------------------------------------------------------------
+# CUSTOM DOMAIN (Optional - leave null for CloudFront/ALB default domains)
+# -----------------------------------------------------------------------------
+
+frontend_domain_name         = null # e.g., "app.yourdomain.com"
+frontend_acm_certificate_arn = null # e.g., "arn:aws:acm:us-east-1:123456789012:certificate/abc-123"
+frontend_route53_zone_id     = null # e.g., "Z1234567890ABC"
+
+# -----------------------------------------------------------------------------
+# SECURITY CONFIGURATION
+# -----------------------------------------------------------------------------
+
+cloudfront_web_acl_id              = null
+cloudfront_content_security_policy = null
+
+cloudfront_geo_restriction_type      = "none"
+cloudfront_geo_restriction_locations = []
+
+# -----------------------------------------------------------------------------
+# LOGGING CONFIGURATION
+# -----------------------------------------------------------------------------
+
+cloudfront_enable_logging      = false
+cloudfront_log_bucket          = null
+cloudfront_log_prefix          = null
+cloudfront_log_include_cookies = false
+
+# -----------------------------------------------------------------------------
+# ALB / HTTPS CONFIGURATION
+# -----------------------------------------------------------------------------
+
+enable_https = true
+
+ssl_policy              = "ELBSecurityPolicy-TLS13-1-2-2021-06"
+redirect_http_to_https  = true
+
+# Leave null to have infra/scripts/setup-https.sh generate and import a
+# self-signed certificate (fine for a placeholder domain, NOT fine for
+# anything real users hit in a browser - see PLAN.md's TLS certificate
+# finding). Set to a real ACM certificate ARN once you have a domain.
+alb_certificate_arn = null
+
+include_wildcard_cert = true
+# enable_custom_domain = false
+# custom_domain_name = null
+# route53_zone_id = null
