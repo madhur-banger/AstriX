@@ -1,0 +1,30 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Sid": "AllowTerraformProvisionerOnly",
+        "Effect": "Allow",
+        "Principal": {
+          "AWS": "arn:aws:iam::586794439017:role/aws-reserved/sso.amazonaws.com/AWSReservedSSO_TerraformProvisioner_340e75aafc4301ac"
+        },
+        "Action": [
+          "s3:ListBucket"
+        ],
+        "Resource": "arn:aws:s3:::prod-terraform-state-586794439017"
+      },
+      {
+        "Sid": "AllowTerraformProvisionerObjects",
+        "Effect": "Allow",
+        "Principal": {
+          "AWS": "arn:aws:iam::586794439017:role/aws-reserved/sso.amazonaws.com/AWSReservedSSO_TerraformProvisioner_340e75aafc4301ac"
+        },
+        "Action": [
+          "s3:GetObject",
+          "s3:PutObject",
+          "s3:DeleteObject"
+        ],
+        "Resource": "arn:aws:s3:::prod-terraform-state-586794439017/*"
+      }
+    ]
+  }
+  
