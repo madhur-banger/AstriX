@@ -7,7 +7,6 @@ import {
   getProjectByIdAndWorkspaceIdController,
   updateProjectController,
 } from "../controllers/project.controller";
-
 const projectRoutes = Router();
 
 projectRoutes.post("/workspace/:workspaceId/create", createProjectController);

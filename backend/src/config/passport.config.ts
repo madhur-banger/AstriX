@@ -27,8 +27,7 @@ import SessionModel from "../models/session.model";
 // GOOGLE OAUTH STRATEGY
 // ============================================
 
-passport.use(
-  new GoogleStrategy(
+passport.use( new GoogleStrategy(
     {
       clientID: config.GOOGLE_CLIENT_ID,
       clientSecret: config.GOOGLE_CLIENT_SECRET,
@@ -66,8 +65,7 @@ passport.use(
 // LOCAL (EMAIL/PASSWORD) STRATEGY
 // ============================================
 
-passport.use(
-  new localStrategy(
+passport.use( new localStrategy(
     {
       usernameField: "email",
       passwordField: "password",
@@ -103,8 +101,7 @@ const jwtOptions: StrategyOptionsWithoutRequest = {
   algorithms: ["HS256"],
 };
 
-passport.use(
-  new JwtStrategy(jwtOptions, async (payload: JwtPayload, done) => {
+passport.use( new JwtStrategy(jwtOptions, async (payload: JwtPayload, done) => {
     try {
       // 1. Find user
       const user = await findUserByIdService(payload.userId);

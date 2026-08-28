@@ -234,7 +234,7 @@ resource "aws_ecs_service" "backend" {
   # Give task time to start before ALB starts health checks
   health_check_grace_period_seconds = var.health_check_grace_period
 
-  # Deployment Circuit Breaker
+  # Deployment Circuit Breakerdc
   # Automatically roll back failed deployments
   deployment_circuit_breaker {
     enable   = true

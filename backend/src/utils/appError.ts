@@ -1,4 +1,4 @@
-import { HTTPSTATUS, HttpStatusCodeType } from "../config/http.config";
+ import { HTTPSTATUS, HttpStatusCodeType } from "../config/http.config";
 import { ErrorCodeEnum, ErrorCodeEnumType } from "../enums/error-code.enum";
 
 export class AppError extends Error {
@@ -7,7 +7,7 @@ export class AppError extends Error {
 
   constructor(
     message: string,
-    statusCode = HTTPSTATUS.INTERNAL_SERVER_ERROR,
+    statusCode: HttpStatusCodeType = HTTPSTATUS.INTERNAL_SERVER_ERROR,
     errorCode?: ErrorCodeEnumType
   ) {
     super(message);
