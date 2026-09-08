@@ -1,3 +1,4 @@
+import { SessionDocument } from "../models/session.model";
 import { UserDocument } from "../models/user.model";
 
 declare global {
@@ -7,6 +8,9 @@ declare global {
         }
         interface authInfo {
             token?: string;
+        }
+        interface Request{
+            session?: SessionDocument;
         }
     }
 }  

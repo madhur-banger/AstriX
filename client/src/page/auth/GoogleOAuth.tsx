@@ -43,7 +43,6 @@ const GoogleOAuth: React.FC = () => {
   useEffect(() => {
     const handleOAuthCallback = async () => {
       const urlStatus = params.get("status");
-      const accessToken = params.get("access_token");
       const currentWorkspace = params.get("current_workspace");
       const urlError = params.get("error");
 
@@ -58,8 +57,20 @@ const GoogleOAuth: React.FC = () => {
       }
 
       // Handle success
-      if (urlStatus === "success" && accessToken) {
+      if (urlStatus === "success" ) {
         try {
+
+          const refreshResponse = await fetch(`${import.meta.env.VITE_API_BASE_URL}/api/auth/refresh`, {
+                method: "POST",
+            credentials: "include", // Send httpOnly cookie
+          });
+
+          if (!refreshResponse.ok) {
+            throw new Error("Failed to refresh token after OAuth");
+          }
+
+          
+          const { access_token: accessToken } = await refreshResponse.json();
           // Store access token
           useStoreBase.getState().setAccessToken(accessToken);
 

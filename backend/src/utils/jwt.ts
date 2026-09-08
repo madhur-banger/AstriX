@@ -1,19 +1,11 @@
-// backend/src/utils/jwt.ts
-// ============================================
-// JWT UTILITY WITH ACCESS + REFRESH TOKENS
-// ============================================
-
+import jwt, { SignOptions, VerifyOptions } from "jsonwebtoken";
 import { config } from "../config/app.config";
 import { UserDocument } from "../models/user.model";
-import jwt, { SignOptions, VerifyOptions } from "jsonwebtoken";
-
-// ============================================
-// TYPE DEFINITIONS
-// ============================================
+import { UnauthorizedException } from "./appError";
 
 export type AccessTokenPayload = {
   userId: UserDocument["_id"];
-  sessionId: string; // Links to refresh token for revocation
+  sessionId: string;
 };
 
 export type RefreshTokenPayload = {
@@ -25,56 +17,29 @@ type SignOptsAndSecret = SignOptions & {
   secret: string;
 };
 
-// ============================================
-// TOKEN CONFIGURATION
-// ============================================
-
 const defaults: SignOptions = {
   audience: ["user"],
   algorithm: "HS256",
 };
 
-/**
- * ACCESS TOKEN CONFIG:
- * - Short-lived (15 minutes)
- * - Contains user info for stateless verification
- * - Sent in Authorization header by frontend
- */
 export const accessTokenSignOptions: SignOptsAndSecret = {
   expiresIn: config.JWT.ACCESS_TOKEN_EXPIRES_IN || "15m",
   secret: config.JWT.ACCESS_TOKEN_SECRET,
 };
 
-/**
- * REFRESH TOKEN CONFIG:
- * - Long-lived (7 days)
- * - Used only to get new access tokens
- * - Stored in httpOnly cookie (can't be stolen via XSS)
- * - Stored in DB for revocation capability
- */
 export const refreshTokenSignOptions: SignOptsAndSecret = {
   expiresIn: config.JWT.REFRESH_TOKEN_EXPIRES_IN || "7d",
   secret: config.JWT.REFRESH_TOKEN_SECRET,
 };
-
-// ============================================
-// TOKEN GENERATION
-// ============================================
 
 export const signJwtToken = <T extends object>(
   payload: T,
   options: SignOptsAndSecret = accessTokenSignOptions
 ): string => {
   const { secret, ...opts } = options;
-  return jwt.sign(payload, secret, {
-    ...defaults,
-    ...opts,
-  });
+  return jwt.sign(payload, secret, { ...defaults, ...opts });
 };
 
-/**
- * Generate both tokens at once (for login)
- */
 export const generateTokenPair = (
   userId: UserDocument["_id"],
   sessionId: string
@@ -92,10 +57,6 @@ export const generateTokenPair = (
   return { accessToken, refreshToken };
 };
 
-// ============================================
-// TOKEN VERIFICATION
-// ============================================
-
 export const verifyJwtToken = <T extends object>(
   token: string,
   secret: string = accessTokenSignOptions.secret,
@@ -112,35 +73,35 @@ export const verifyJwtToken = <T extends object>(
   } catch (error: any) {
     return {
       valid: false,
-      error:
-        error.name === "TokenExpiredError" ? "Token expired" : "Invalid token",
+      error: error.name === "TokenExpiredError" ? "Token expired" : "Invalid token",
     };
   }
 };
 
-/**
- * Verify access token
- */
+export const extractBearerToken = (authHeader: string | undefined): string | null => {
+  if (!authHeader) return null;
+
+  const [scheme, token] = authHeader.split(" ");
+  if (scheme !== "Bearer" || !token) return null;
+
+  return token;
+};
+
+export const verifyAccessTokenAndGetPayload = (token: string): AccessTokenPayload => {
+  const result = verifyJwtToken<AccessTokenPayload>(token, accessTokenSignOptions.secret);
+  if (!result.valid) {
+    throw new UnauthorizedException(result.error);
+  }
+  return result.payload;
+};
+
 export const verifyAccessToken = (token: string) => {
-  return verifyJwtToken<AccessTokenPayload>(
-    token,
-    accessTokenSignOptions.secret
-  );
+  return verifyJwtToken<AccessTokenPayload>(token, accessTokenSignOptions.secret);
 };
 
-/**
- * Verify refresh token
- */
 export const verifyRefreshToken = (token: string) => {
-  return verifyJwtToken<RefreshTokenPayload>(
-    token,
-    refreshTokenSignOptions.secret
-  );
+  return verifyJwtToken<RefreshTokenPayload>(token, refreshTokenSignOptions.secret);
 };
-
-// ============================================
-// HELPER: Calculate expiry date for DB storage
-// ============================================
 
 export const calculateExpiryDate = (expiresIn: string): Date => {
   const match = expiresIn.match(/^(\d+)([smhd])$/);
@@ -152,10 +113,10 @@ export const calculateExpiryDate = (expiresIn: string): Date => {
   const unit = match[2];
 
   const multipliers: Record<string, number> = {
-    s: 1000, // seconds
-    m: 60 * 1000, // minutes
-    h: 60 * 60 * 1000, // hours
-    d: 24 * 60 * 60 * 1000, // days
+    s: 1000,
+    m: 60 * 1000,
+    h: 60 * 60 * 1000,
+    d: 24 * 60 * 60 * 1000,
   };
 
   return new Date(Date.now() + value * multipliers[unit]);

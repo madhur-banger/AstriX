@@ -10,10 +10,7 @@ import { swaggerSpec } from "./config/swagger.config";
 import connectDatabase from "./config/database.config";
 
 import { errorHandler } from "./middlewares/errorHandles.middleware";
-import { BadRequestException } from "./utils/appError";
-import { ErrorCodeEnum } from "./enums/error-code.enum";
 
-import "./config/passport.config";
 import passport from "passport";
 import authRoutes from "./routes/auth.route";
 import userRoutes from "./routes/user.route";
@@ -21,7 +18,7 @@ import workspaceRoutes from "./routes/workspace.routes";
 import projectRoutes from "./routes/project.route";
 import taskRoutes from "./routes/task.route";
 import memberRoutes from "./routes/member.route";
-import { passportAuthenticateJWT } from "./config/passport.config";
+import { authenticate } from "./middlewares/auth.middleware";
 
 const app = express();
 
@@ -103,11 +100,11 @@ app.get("/health", (req: Request, res: Response) => {
 app.use(`${BASE_PATH}/auth`, authRoutes);
 
 // Protected routes (require JWT)
-app.use(`${BASE_PATH}/user`, passportAuthenticateJWT, userRoutes);
-app.use(`${BASE_PATH}/workspace`, passportAuthenticateJWT, workspaceRoutes);
-app.use(`${BASE_PATH}/project`, passportAuthenticateJWT, projectRoutes);
-app.use(`${BASE_PATH}/task`, passportAuthenticateJWT, taskRoutes);
-app.use(`${BASE_PATH}/member`, passportAuthenticateJWT, memberRoutes);
+app.use(`${BASE_PATH}/user`, authenticate, userRoutes);
+app.use(`${BASE_PATH}/workspace`, authenticate, workspaceRoutes);
+app.use(`${BASE_PATH}/project`, authenticate, projectRoutes);
+app.use(`${BASE_PATH}/task`, authenticate, taskRoutes);
+app.use(`${BASE_PATH}/member`, authenticate, memberRoutes);
 
 // ============================================
 // ERROR HANDLING

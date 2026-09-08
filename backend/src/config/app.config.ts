@@ -45,4 +45,6 @@ const appConfig = () => ({
   FRONTEND_GOOGLE_CALLBACK_URL: getEnv("FRONTEND_GOOGLE_CALLBACK_URL"),
 });
 
+
+
 export const config = appConfig();
