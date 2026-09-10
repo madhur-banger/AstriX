@@ -4,22 +4,27 @@
 
 variable "project_name" {
   description = "Name of the project"
-  type = string
+  type        = string
 }
 
 variable "environment" {
-  description = "Environment name ( dev, staging, prod)"
-  type = string
+  description = "Environment name (dev, staging, prod)"
+  type        = string
+
+  validation {
+    condition     = contains(["dev", "staging", "prod"], var.environment)
+    error_message = "Environment must be one of: dev, staging, prod."
+  }
 }
 
 variable "vpc_id" {
   description = "ID of the VPC"
-  type = string
+  type        = string
 }
 
 variable "public_subnet_ids" {
   description = "List of public subnets IDs for ALB"
-  type = list(string)
+  type        = list(string)
 }
 
 variable "alb_security_group_id" {
@@ -51,6 +56,12 @@ variable "certificate_arn" {
   default     = null
 }
 
+variable "redirect_http_to_https" {
+  description = "When true, the port-80 listener 301-redirects to HTTPS instead of forwarding to the target group. Should be true whenever an HTTPS listener exists."
+  type        = bool
+  default     = false
+}
+
 variable "enable_access_logs" {
   description = "Enable ALB access logs"
   type        = bool
@@ -67,4 +78,16 @@ variable "common_tags" {
   description = "Common tags to apply to all resources"
   type        = map(string)
   default     = {}
+}
+
+variable "enable_alarms" {
+  description = "Enable CloudWatch alarms for the ALB (5xx rate, unhealthy hosts)"
+  type        = bool
+  default     = false
+}
+
+variable "alarm_actions" {
+  description = "ARNs (e.g. an SNS topic) to notify when an alarm changes state - both ALARM and OK."
+  type        = list(string)
+  default     = []
 }

@@ -24,10 +24,27 @@ permissions:
   contents: read
 
 jobs:
+  validate-input:
+    name: Validate commit_sha
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check commit_sha looks like a git SHA
+        run: |
+          if ! [[ "${{ inputs.commit_sha }}" =~ ^[0-9a-f]{7,40}$ ]]; then
+            echo "::error::commit_sha must be a 7-40 character hex git SHA, got: '${{ inputs.commit_sha }}'"
+            exit 1
+          fi
+
   rollback-backend:
     name: Rollback Backend
     if: inputs.target == 'backend' || inputs.target == 'both'
+    needs: validate-input
     runs-on: ubuntu-latest
+    # Same "production" GitHub Environment gate as the deploy workflows. A
+    # rollback rewrites what's actually serving traffic, so it gets the same
+    # approval treatment as a roll-forward. Required reviewers are configured
+    # on the environment in repo settings, not here.
+    environment: production
     env:
       ECR_REPOSITORY: astrix-dev-backend
       ECS_CLUSTER: astrix-dev-cluster
@@ -99,7 +116,9 @@ jobs:
   rollback-frontend:
     name: Rollback Frontend
     if: inputs.target == 'frontend' || inputs.target == 'both'
+    needs: validate-input
     runs-on: ubuntu-latest
+    environment: production
     env:
       S3_BUCKET: astrix-dev-frontend
     steps:

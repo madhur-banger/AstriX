@@ -81,21 +81,74 @@ locals {
   }
   # Protocol based on HTTPS enablement
   protocol = var.enable_https ? "https" : "http"
-  
+
   # URLs automatically computed
   alb_base_url = var.enable_https ? "https://${module.alb.alb_dns_name}" : "http://${module.alb.alb_dns_name}"
   api_base_url = "${local.alb_base_url}/api"
   frontend_url = "https://${module.cloudfront_s3.distribution_domain_name}"
-  
+
   # Callbacks
-  google_callback_url           = "${local.api_base_url}/auth/google/callback"
-  frontend_google_callback_url  = "${local.frontend_url}/google/callback"
-  
+  google_callback_url          = "${local.api_base_url}/auth/google/callback"
+  frontend_google_callback_url = "${local.frontend_url}/google/callback"
+
   # Cookie domain (ALB domain for proper cookie handling)
   cookie_domain = module.alb.alb_dns_name
 }
 
 
+
+# -----------------------------------------------------------------------------
+# ALERTING (SNS)
+# -----------------------------------------------------------------------------
+# Single topic for every CloudWatch alarm in this environment. Without a
+# subscriber, an alarm changes state in the console and notifies nobody -
+# see infra/PLAN.md §5.1.
+
+resource "aws_sns_topic" "alerts" {
+  name = "${var.project_name}-${var.environment}-alerts"
+
+  tags = local.common_tags
+}
+
+resource "aws_sns_topic_subscription" "alerts_email" {
+  count     = var.alert_email != null ? 1 : 0
+  topic_arn = aws_sns_topic.alerts.arn
+  protocol  = "email"
+  endpoint  = var.alert_email
+}
+
+# -----------------------------------------------------------------------------
+# COST GUARDRAIL (AWS Budgets)
+# -----------------------------------------------------------------------------
+# For a personal project an unexpected bill is a more likely near-term
+# problem than a security incident (NAT Gateway + Fargate + CloudFront are
+# all metered) - see infra/PLAN.md §7.1.
+
+resource "aws_budgets_budget" "monthly" {
+  count = var.monthly_budget_usd != null && var.alert_email != null ? 1 : 0
+
+  name         = "${var.project_name}-${var.environment}-monthly-budget"
+  budget_type  = "COST"
+  limit_amount = tostring(var.monthly_budget_usd)
+  limit_unit   = "USD"
+  time_unit    = "MONTHLY"
+
+  notification {
+    comparison_operator        = "GREATER_THAN"
+    threshold                  = 80
+    threshold_type             = "PERCENTAGE"
+    notification_type          = "FORECASTED"
+    subscriber_email_addresses = [var.alert_email]
+  }
+
+  notification {
+    comparison_operator        = "GREATER_THAN"
+    threshold                  = 100
+    threshold_type             = "PERCENTAGE"
+    notification_type          = "ACTUAL"
+    subscriber_email_addresses = [var.alert_email]
+  }
+}
 
 # -----------------------------------------------------------------------------
 # NETWORKING MODULE
@@ -113,8 +166,11 @@ module "networking" {
   public_subnet_cidrs  = var.public_subnet_cidrs
   private_subnet_cidrs = var.private_subnet_cidrs
 
-  # Cost optimization: Single NAT for dev
+  # Cost optimization: single NAT shared by both AZs. Set single_nat_gateway
+  # to false to get one NAT per AZ (removes the single-AZ egress dependency,
+  # adds ~$32/month per AZ).
   enable_nat_gateway = var.enable_nat_gateway
+  single_nat_gateway = var.single_nat_gateway
 
   # Disable flow logs for dev (save costs)
   enable_flow_logs         = var.enable_flow_logs
@@ -163,8 +219,16 @@ module "iam" {
   aws_region     = var.aws_region
   aws_account_id = data.aws_caller_identity.current.account_id
 
-  # KMS key for secrets (optional)
-  kms_key_arn = var.kms_key_arn
+  # KMS key the ECS execution role must be able to decrypt with. Prefer an
+  # explicitly-supplied key, otherwise the CMK the parameter-store module
+  # creates - this is what keeps the role's kms:Decrypt statement scoped to a
+  # single key instead of "*".
+  #
+  # No dependency cycle here despite parameter_store also consuming an iam
+  # output: Terraform's graph is per-resource, and the two edges touch
+  # different resources (aws_iam_role.ecs_task_execution -> aws_kms_key ->
+  # aws_iam_role_policy.ecs_task_execution_secrets).
+  kms_key_arn = var.kms_key_arn != null ? var.kms_key_arn : module.parameter_store.kms_key_arn
 
   # Lambda VPC access
   lambda_vpc_access = var.lambda_vpc_access
@@ -213,9 +277,12 @@ module "alb" {
   backend_port           = var.app_port
   health_check_path      = var.health_check_path
   enable_stickiness      = var.enable_stickiness
-  certificate_arn        = null  # Certificate added after ACM
+  certificate_arn        = null # Certificate added after ACM
   enable_access_logs     = var.enable_access_logs
   access_logs_bucket     = var.access_logs_bucket
+  redirect_http_to_https = var.enable_https && var.redirect_http_to_https
+  enable_alarms          = var.enable_ecs_alarms
+  alarm_actions          = [aws_sns_topic.alerts.arn]
 
   common_tags = local.common_tags
 }
@@ -224,19 +291,19 @@ module "alb" {
 module "acm" {
   source = "../../modules/acm"
 
-  project_name = var.project_name
-  environment  = var.environment
-  alb_dns_name = module.alb.alb_dns_name
-  organization_name = "AstriX"
-  country_code = "US"
+  project_name             = var.project_name
+  environment              = var.environment
+  alb_dns_name             = module.alb.alb_dns_name
+  organization_name        = "AstriX"
+  country_code             = "US"
   save_certificate_locally = true
-  certificate_output_path = "${path.root}/../../certificates"
+  certificate_output_path  = "${path.root}/../../certificates"
 
   # FIXED: Use correct variable names
-  enable_custom_domain = var.enable_alb_custom_domain
-  custom_domain_name   = var.alb_custom_domain_name
-  include_wildcard     = var.include_wildcard_cert
-  certificate_arn      = var.alb_certificate_arn
+  enable_custom_domain     = var.enable_alb_custom_domain
+  custom_domain_name       = var.alb_custom_domain_name
+  include_wildcard         = var.include_wildcard_cert
+  certificate_arn          = var.alb_certificate_arn
   enable_expiration_alerts = false
 
   depends_on = [module.alb]
@@ -270,19 +337,24 @@ resource "aws_lb_listener" "https" {
 module "parameter_store" {
   source = "../../modules/parameter-store"
 
-  project_name = var.project_name
-  environment  = var.environment
+  project_name   = var.project_name
+  environment    = var.environment
   create_kms_key = var.create_parameter_store_kms_key
   kms_key_arn    = var.kms_key_arn
 
-  mongo_uri = var.mongo_uri
+  # Goes into the CMK's key policy so tasks can actually decrypt their secrets
+  # at startup. A KMS key policy is authoritative: an IAM policy alone is not
+  # enough to grant access to a customer-managed key.
+  ecs_task_execution_role_arn = module.iam.ecs_task_execution_role_arn
+
+  mongo_uri                    = var.mongo_uri
   jwt_access_token_secret      = var.jwt_access_token_secret
   jwt_access_token_expires_in  = var.jwt_access_token_expires_in
   jwt_refresh_token_secret     = var.jwt_refresh_token_secret
   jwt_refresh_token_expires_in = var.jwt_refresh_token_expires_in
-  google_client_id       = var.google_client_id
-  google_client_secret   = var.google_client_secret
-  
+  google_client_id             = var.google_client_id
+  google_client_secret         = var.google_client_secret
+
   # AUTOMATED URLS
   google_callback_url          = local.google_callback_url
   frontend_origin              = local.frontend_url
@@ -294,7 +366,7 @@ module "parameter_store" {
   port     = tostring(var.app_port)
 
   common_tags = local.common_tags
-  depends_on = [module.acm, aws_lb_listener.https]
+  depends_on  = [module.acm, aws_lb_listener.https]
 }
 
 # -----------------------------------------------------------------------------
@@ -302,41 +374,42 @@ module "parameter_store" {
 # -----------------------------------------------------------------------------
 
 module "ecs" {
-  source                      = "../../modules/ecs"
-  project_name                = var.project_name
-  environment                 = var.environment
-  aws_region                  = var.aws_region
-  aws_account_id              = data.aws_caller_identity.current.account_id
-  private_subnet_ids          = module.networking.private_subnet_ids
-  ecs_security_group_id       = module.security.ecs_tasks_security_group_id
-  target_group_arn            = module.alb.target_group_arn
-  ecs_task_execution_role_arn = module.iam.ecs_task_execution_role_arn
-  ecs_task_role_arn           = module.iam.ecs_task_role_arn
-  ecr_repository_url          = module.ecr.backend_repository_url
-  image_tag                   = var.ecs_image_tag
-  container_port              = var.app_port
-  node_env                    = var.node_env
-  health_check_path           = var.health_check_path
-  task_cpu                    = var.ecs_task_cpu
-  task_memory                 = var.ecs_task_memory
-  desired_count               = var.ecs_desired_count
+  source                             = "../../modules/ecs"
+  project_name                       = var.project_name
+  environment                        = var.environment
+  aws_region                         = var.aws_region
+  aws_account_id                     = data.aws_caller_identity.current.account_id
+  private_subnet_ids                 = module.networking.private_subnet_ids
+  ecs_security_group_id              = module.security.ecs_tasks_security_group_id
+  target_group_arn                   = module.alb.target_group_arn
+  ecs_task_execution_role_arn        = module.iam.ecs_task_execution_role_arn
+  ecs_task_role_arn                  = module.iam.ecs_task_role_arn
+  ecr_repository_url                 = module.ecr.backend_repository_url
+  image_tag                          = var.ecs_image_tag
+  container_port                     = var.app_port
+  node_env                           = var.node_env
+  health_check_path                  = var.health_check_path
+  task_cpu                           = var.ecs_task_cpu
+  task_memory                        = var.ecs_task_memory
+  desired_count                      = var.ecs_desired_count
   deployment_minimum_healthy_percent = var.ecs_deployment_minimum_healthy_percent
-  deployment_maximum_percent  = var.ecs_deployment_maximum_percent
-  health_check_grace_period   = var.ecs_health_check_grace_period
-  enable_ecs_exec             = var.enable_ecs_exec
-  min_capacity                = var.ecs_min_capacity
-  max_capacity                = var.ecs_max_capacity
-  cpu_target_value            = var.ecs_cpu_target_value
-  memory_target_value         = var.ecs_memory_target_value
-  scale_in_cooldown           = var.ecs_scale_in_cooldown
-  scale_out_cooldown          = var.ecs_scale_out_cooldown
-  fargate_weight              = var.ecs_fargate_weight
-  fargate_base                = var.ecs_fargate_base
-  fargate_spot_weight         = var.ecs_fargate_spot_weight
-  log_retention_days          = var.ecs_log_retention_days
-  enable_container_insights   = var.enable_container_insights
-  enable_alarms               = var.enable_ecs_alarms
-  
+  deployment_maximum_percent         = var.ecs_deployment_maximum_percent
+  health_check_grace_period          = var.ecs_health_check_grace_period
+  enable_ecs_exec                    = var.enable_ecs_exec
+  min_capacity                       = var.ecs_min_capacity
+  max_capacity                       = var.ecs_max_capacity
+  cpu_target_value                   = var.ecs_cpu_target_value
+  memory_target_value                = var.ecs_memory_target_value
+  scale_in_cooldown                  = var.ecs_scale_in_cooldown
+  scale_out_cooldown                 = var.ecs_scale_out_cooldown
+  fargate_weight                     = var.ecs_fargate_weight
+  fargate_base                       = var.ecs_fargate_base
+  fargate_spot_weight                = var.ecs_fargate_spot_weight
+  log_retention_days                 = var.ecs_log_retention_days
+  enable_container_insights          = var.enable_container_insights
+  enable_alarms                      = var.enable_ecs_alarms
+  alarm_actions                      = [aws_sns_topic.alerts.arn]
+
   common_tags = local.common_tags
   depends_on  = [module.alb, module.parameter_store]
 }
@@ -351,31 +424,29 @@ module "ecs" {
 module "cloudfront_s3" {
   source = "../../modules/cloudfront_s3"
 
-  project_name = var.project_name
-  environment  = var.environment
-  bucket_name       = var.frontend_bucket_name
-  force_destroy     = var.frontend_force_destroy
-  enable_versioning = var.frontend_enable_versioning
-  kms_key_arn       = var.frontend_kms_key_arn
+  project_name                       = var.project_name
+  environment                        = var.environment
+  bucket_name                        = var.frontend_bucket_name
+  force_destroy                      = var.frontend_force_destroy
+  enable_versioning                  = var.frontend_enable_versioning
+  kms_key_arn                        = var.frontend_kms_key_arn
   enable_lifecycle_rules             = var.frontend_enable_lifecycle_rules
   noncurrent_version_expiration_days = var.frontend_noncurrent_version_expiration_days
-  cors_allowed_origins = var.frontend_cors_allowed_origins
-  price_class       = var.cloudfront_price_class
-  enable_spa_routing = var.cloudfront_enable_spa_routing
-  domain_name         = var.frontend_domain_name
-  acm_certificate_arn = var.frontend_acm_certificate_arn
-  route53_zone_id     = var.frontend_route53_zone_id
-  alb_dns_name        = module.alb.alb_dns_name
-  alb_protocol_policy = var.enable_https ? "https-only" : var.cloudfront_alb_protocol_policy
-  web_acl_id              = var.cloudfront_web_acl_id
-  content_security_policy = var.cloudfront_content_security_policy
-  geo_restriction_type    = var.cloudfront_geo_restriction_type
-  geo_restriction_locations = var.cloudfront_geo_restriction_locations
-  enable_logging      = var.cloudfront_enable_logging
-  log_bucket          = var.cloudfront_log_bucket
-  log_prefix          = var.cloudfront_log_prefix
-  log_include_cookies = var.cloudfront_log_include_cookies
+  cors_allowed_origins               = var.frontend_cors_allowed_origins
+  price_class                        = var.cloudfront_price_class
+  enable_spa_routing                 = var.cloudfront_enable_spa_routing
+  domain_name                        = var.frontend_domain_name
+  acm_certificate_arn                = var.frontend_acm_certificate_arn
+  route53_zone_id                    = var.frontend_route53_zone_id
+  web_acl_id                         = var.cloudfront_web_acl_id
+  content_security_policy            = var.cloudfront_content_security_policy
+  geo_restriction_type               = var.cloudfront_geo_restriction_type
+  geo_restriction_locations          = var.cloudfront_geo_restriction_locations
+  enable_logging                     = var.cloudfront_enable_logging
+  log_bucket                         = var.cloudfront_log_bucket
+  log_prefix                         = var.cloudfront_log_prefix
+  log_include_cookies                = var.cloudfront_log_include_cookies
 
   common_tags = local.common_tags
-  depends_on = [module.alb, module.acm]
+  depends_on  = [module.alb, module.acm]
 }

@@ -60,6 +60,20 @@ variable "enable_nat_gateway" {
   default     = true
 }
 
+variable "single_nat_gateway" {
+  description = <<-EOT
+    Share one NAT Gateway across all private subnets (true, ~$32/month) or run
+    one per AZ (false, ~$32/month per AZ).
+
+    Left at true: with a single NAT, an outage in that NAT's AZ cuts outbound
+    internet for private subnets in every AZ, so the two-AZ ECS service is only
+    as available as one AZ. Flipping this to false is the fix and the code path
+    is wired for it - it just costs another NAT per AZ.
+  EOT
+  type        = bool
+  default     = true
+}
+
 variable "enable_flow_logs" {
   description = "Whether to enable VPC Flow Logs"
   type        = bool
@@ -190,9 +204,19 @@ variable "cross_account_ids" {
 
 
 variable "create_parameter_store_kms_key" {
-  description = "Whether to create a custom KMS key for Parameter Store"
+  description = <<-EOT
+    Whether to create a dedicated customer-managed KMS key for the Parameter
+    Store SecureStrings (Mongo URI, JWT secrets, Google client secret).
+
+    Defaults to true: the AWS-managed alias/aws/ssm key has an uneditable key
+    policy, so with it "who can decrypt these secrets" is decided entirely by
+    IAM, and the ECS execution role's kms:Decrypt grant has to fall back to
+    Resource = "*". A CMK makes that a single named key.
+
+    COST: ~$1/month.
+  EOT
   type        = bool
-  default     = false
+  default     = true
 }
 
 variable "mongo_uri" {
@@ -426,6 +450,18 @@ variable "enable_ecs_alarms" {
   default     = false
 }
 
+variable "alert_email" {
+  description = "Email address subscribed to the CloudWatch alarm SNS topic. Required if enable_ecs_alarms is true - alarms with no subscriber change state silently."
+  type        = string
+  default     = null
+}
+
+variable "monthly_budget_usd" {
+  description = "Monthly AWS cost budget (USD) - triggers an email at 80% and 100% forecasted spend. Set to null to skip creating a budget."
+  type        = number
+  default     = 50
+}
+
 
 # =============================================================================
 # CLOUDFRONT + S3 CONFIGURATION (NEW - Phase 4)
@@ -472,9 +508,9 @@ variable "frontend_noncurrent_version_expiration_days" {
 }
 
 variable "frontend_cors_allowed_origins" {
-  description = "Allowed origins for CORS on S3 bucket"
+  description = "Allowed origins for CORS on S3 bucket. No permissive default - set explicitly once a real frontend domain exists."
   type        = list(string)
-  default     = ["*"]
+  default     = []
 }
 
 
@@ -592,6 +628,15 @@ variable "ssl_policy" {
   description = "SSL policy for HTTPS listener"
   type        = string
   default     = "ELBSecurityPolicy-TLS13-1-2-2021-06"
+
+  validation {
+    # AWS's list of valid ELB security policies changes over time - rather
+    # than hardcode (and let go stale) an exact enum, this catches the most
+    # common mistake: passing something that isn't an ELB security policy
+    # name at all (e.g. a raw TLS version string, or a typo).
+    condition     = can(regex("^ELBSecurityPolicy-", var.ssl_policy))
+    error_message = "ssl_policy must be a valid ELB security policy name, e.g. \"ELBSecurityPolicy-TLS13-1-2-2021-06\"."
+  }
 }
 
 variable "redirect_http_to_https" {

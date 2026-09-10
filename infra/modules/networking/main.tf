@@ -36,7 +36,7 @@
 
 data "aws_availability_zones" "available" {
   state = "available"
-  
+
   # Exclude local zones and wavelength zones for simplicity
   filter {
     name   = "opt-in-status"
@@ -62,7 +62,7 @@ resource "aws_vpc" "main" {
   # - RDS endpoint resolution
   # - Many AWS services that need DNS names
   enable_dns_hostnames = true
-  
+
   # Enable DNS support - required for internal DNS resolution
   enable_dns_support = true
 
@@ -137,13 +137,41 @@ resource "aws_internet_gateway" "main" {
 }
 
 # -----------------------------------------------------------------------------
-# ELASTIC IP FOR NAT GATEWAY
+# NAT GATEWAY TOPOLOGY
 # -----------------------------------------------------------------------------
-# Static IP address for the NAT Gateway
-# This IP won't change even if NAT Gateway is recreated
+# Two shapes, selected by var.single_nat_gateway:
+#
+#   single_nat_gateway = true  (default, ~$32/month)
+#     One NAT in the first public subnet; every private subnet routes through
+#     it. Cheapest, but an AZ failure in that one AZ takes outbound internet
+#     away from private subnets in *every* AZ - ECS tasks in the healthy AZ
+#     stop being able to pull images or reach MongoDB Atlas.
+#
+#   single_nat_gateway = false (~$32/month per AZ)
+#     One NAT + one EIP per public subnet/AZ, and one private route table per
+#     AZ pointing at the NAT in its own AZ. An AZ failure is then contained to
+#     that AZ. This is the correct production shape.
+#
+# Flipping this to false costs real money per AZ, so it stays true until
+# somebody decides to spend it.
+
+locals {
+  nat_gateway_count = var.enable_nat_gateway ? (var.single_nat_gateway ? 1 : length(var.public_subnet_cidrs)) : 0
+
+  # One route table shared by all private subnets when a single NAT serves
+  # everything; one per private subnet when each AZ has its own NAT.
+  private_route_table_count = var.enable_nat_gateway && !var.single_nat_gateway ? length(var.private_subnet_cidrs) : 1
+}
+
+# -----------------------------------------------------------------------------
+# ELASTIC IPS FOR NAT GATEWAYS
+# -----------------------------------------------------------------------------
+# Static IP addresses for the NAT Gateways.
+# These IPs won't change even if a NAT Gateway is recreated - which matters for
+# any third party that allowlists this environment's egress IPs.
 
 resource "aws_eip" "nat" {
-  count = var.enable_nat_gateway ? 1 : 0
+  count = local.nat_gateway_count
 
   domain = "vpc"
 
@@ -151,37 +179,40 @@ resource "aws_eip" "nat" {
   depends_on = [aws_internet_gateway.main]
 
   tags = merge(var.common_tags, {
-    Name = "${var.project_name}-${var.environment}-nat-eip"
+    Name = "${var.project_name}-${var.environment}-nat-eip-${count.index + 1}"
   })
 }
 
 
 # -----------------------------------------------------------------------------
-# NAT GATEWAY
+# NAT GATEWAYS
 # -----------------------------------------------------------------------------
-# Allows private subnet resources to access the internet (outbound only)
-# 
-# COST NOTE: NAT Gateway costs ~$32/month + data transfer
-# For dev environments, consider:
-# - Using a single NAT (not multi-AZ) - what we do here
-# - Scheduling NAT deletion on weekends
-# - Using NAT instances (more work, but cheaper)
+# Allows private subnet resources to access the internet (outbound only).
 #
-# We place NAT in the first public subnet only (cost optimization)
-# For production, you'd want one NAT per AZ for high availability
+# COST NOTE: ~$32/month each + data transfer. Other ways to cut this:
+# - Scheduling NAT deletion on weekends
+# - VPC endpoints for ECR/S3/SSM (removes most NAT data transfer)
+# - NAT instances (more work, but cheaper)
 
 resource "aws_nat_gateway" "main" {
-  count = var.enable_nat_gateway ? 1 : 0
+  count = local.nat_gateway_count
 
-  allocation_id = aws_eip.nat[0].id
-  subnet_id     = aws_subnet.public[0].id
+  allocation_id = aws_eip.nat[count.index].id
+  subnet_id     = aws_subnet.public[count.index].id
 
   tags = merge(var.common_tags, {
-    Name = "${var.project_name}-${var.environment}-nat"
+    Name = "${var.project_name}-${var.environment}-nat-${count.index + 1}"
   })
 
   # NAT Gateway needs IGW to exist first
   depends_on = [aws_internet_gateway.main]
+
+  lifecycle {
+    precondition {
+      condition     = var.single_nat_gateway || length(var.private_subnet_cidrs) <= length(var.public_subnet_cidrs)
+      error_message = "Per-AZ NAT Gateways (single_nat_gateway = false) need at least as many public subnets as private subnets - each private subnet routes to the NAT in its own AZ."
+    }
+  }
 }
 
 
@@ -218,36 +249,50 @@ resource "aws_route_table_association" "public" {
 
 
 # -----------------------------------------------------------------------------
-# PRIVATE ROUTE TABLE
+# PRIVATE ROUTE TABLES
 # -----------------------------------------------------------------------------
 # Routes for private subnets:
 # - Local traffic stays in VPC (implicit)
-# - Everything else (0.0.0.0/0) goes to NAT Gateway (if enabled)
-
+# - Everything else (0.0.0.0/0) goes to a NAT Gateway (if enabled)
+#
+# One table shared by every private subnet in single-NAT mode; one table per AZ
+# otherwise, so each AZ's egress stays inside that AZ.
+#
+# MIGRATION NOTE: this resource gained `count`, so its state address moved from
+# aws_route_table.private to aws_route_table.private[0]. On an environment
+# applied before this change, run this once or Terraform will propose
+# destroying and recreating the route table:
+#   terraform state mv 'module.networking.aws_route_table.private' \
+#                      'module.networking.aws_route_table.private[0]'
 
 resource "aws_route_table" "private" {
+  count = local.private_route_table_count
+
   vpc_id = aws_vpc.main.id
 
   tags = merge(var.common_tags, {
-    Name = "${var.project_name}-${var.environment}-private-rt"
+    Name = local.private_route_table_count == 1 ? "${var.project_name}-${var.environment}-private-rt" : "${var.project_name}-${var.environment}-private-rt-${count.index + 1}"
   })
 }
 
-# Route to NAT Gateway for private subnets (only if NAT is enabled)
+# Route to NAT Gateway for private subnets (only if NAT is enabled).
+# In per-AZ mode each table points at the NAT sharing its index, which is the
+# NAT in the same availability zone (public and private subnets are both
+# indexed against the same AZ list).
 resource "aws_route" "private_nat" {
-  count = var.enable_nat_gateway ? 1 : 0
+  count = var.enable_nat_gateway ? local.private_route_table_count : 0
 
-  route_table_id         = aws_route_table.private.id
+  route_table_id         = aws_route_table.private[count.index].id
   destination_cidr_block = "0.0.0.0/0"
-  nat_gateway_id         = aws_nat_gateway.main[0].id
+  nat_gateway_id         = aws_nat_gateway.main[var.single_nat_gateway ? 0 : count.index].id
 }
 
-# Associate private subnets with private route table
+# Associate private subnets with their route table
 resource "aws_route_table_association" "private" {
   count = length(aws_subnet.private)
 
   subnet_id      = aws_subnet.private[count.index].id
-  route_table_id = aws_route_table.private.id
+  route_table_id = aws_route_table.private[local.private_route_table_count == 1 ? 0 : count.index].id
 }
 
 # -----------------------------------------------------------------------------

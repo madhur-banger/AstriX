@@ -12,17 +12,17 @@
 
 output "vpc_id" {
   description = "The ID of the VPC"
-  value = aws_vpc.main.id
+  value       = aws_vpc.main.id
 }
 
 output "vpc_cidr" {
   description = "The CIDR block of the VPC"
-  value = aws_vpc.main.cidr_block
+  value       = aws_vpc.main.cidr_block
 }
 
 output "vpc_arn" {
   description = "The ARN of the VPC"
-  value = aws_vpc.main.arn
+  value       = aws_vpc.main.arn
 }
 
 # -----------------------------------------------------------------------------
@@ -75,13 +75,23 @@ output "internet_gateway_id" {
 }
 
 output "nat_gateway_id" {
-  description = "The ID of the NAT Gateway (null if disabled)"
-  value       = var.enable_nat_gateway ? aws_nat_gateway.main[0].id : null
+  description = "The ID of the first NAT Gateway (null if disabled). See nat_gateway_ids for all of them."
+  value       = length(aws_nat_gateway.main) > 0 ? aws_nat_gateway.main[0].id : null
+}
+
+output "nat_gateway_ids" {
+  description = "IDs of every NAT Gateway (one per AZ when single_nat_gateway is false)"
+  value       = aws_nat_gateway.main[*].id
 }
 
 output "nat_gateway_public_ip" {
-  description = "The public IP of the NAT Gateway (null if disabled)"
-  value       = var.enable_nat_gateway ? aws_eip.nat[0].public_ip : null
+  description = "The public IP of the first NAT Gateway (null if disabled). See nat_gateway_public_ips for all of them."
+  value       = length(aws_eip.nat) > 0 ? aws_eip.nat[0].public_ip : null
+}
+
+output "nat_gateway_public_ips" {
+  description = "Public IPs of every NAT Gateway - this is the full egress IP set to hand to anyone allowlisting this environment"
+  value       = aws_eip.nat[*].public_ip
 }
 
 # -----------------------------------------------------------------------------
@@ -94,8 +104,13 @@ output "public_route_table_id" {
 }
 
 output "private_route_table_id" {
-  description = "The ID of the private route table"
-  value       = aws_route_table.private.id
+  description = "The ID of the first private route table. See private_route_table_ids when running one per AZ."
+  value       = aws_route_table.private[0].id
+}
+
+output "private_route_table_ids" {
+  description = "IDs of every private route table (one per AZ when single_nat_gateway is false)"
+  value       = aws_route_table.private[*].id
 }
 
 # -----------------------------------------------------------------------------
@@ -124,6 +139,7 @@ output "network_summary" {
     public_subnets      = aws_subnet.public[*].id
     private_subnets     = aws_subnet.private[*].id
     nat_gateway_enabled = var.enable_nat_gateway
+    nat_gateway_count   = length(aws_nat_gateway.main)
     flow_logs_enabled   = var.enable_flow_logs
   }
 }

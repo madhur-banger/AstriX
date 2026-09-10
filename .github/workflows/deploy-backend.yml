@@ -22,6 +22,12 @@ jobs:
   deploy:
     name: Build and Deploy
     runs-on: ubuntu-latest
+    # Gated behind the "production" GitHub Environment, the same mechanism
+    # infra.yml's apply job uses ("infra-apply"). This is what makes a push to
+    # main pause for approval instead of shipping straight to the environment
+    # that de facto serves real users - add required reviewers to the
+    # "production" environment in repo settings, or this is a no-op.
+    environment: production
     steps:
       - uses: actions/checkout@v4
 
@@ -46,6 +52,39 @@ jobs:
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
           echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+      - name: Wait for ECR image scan and check findings
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          echo "Waiting for ECR image scan to complete..."
+          for i in $(seq 1 30); do
+            STATUS=$(aws ecr describe-image-scan-findings \
+              --repository-name "$ECR_REPOSITORY" \
+              --image-id imageTag="$IMAGE_TAG" \
+              --query 'imageScanStatus.status' --output text 2>/dev/null || echo "IN_PROGRESS")
+            if [ "$STATUS" = "COMPLETE" ] || [ "$STATUS" = "FAILED" ]; then
+              break
+            fi
+            sleep 10
+          done
+
+          if [ "$STATUS" != "COMPLETE" ]; then
+            echo "::warning::ECR scan did not complete in time (status: $STATUS) - not blocking deploy, but check the scan manually."
+            exit 0
+          fi
+
+          CRITICAL=$(aws ecr describe-image-scan-findings \
+            --repository-name "$ECR_REPOSITORY" \
+            --image-id imageTag="$IMAGE_TAG" \
+            --query 'imageScanFindings.findingSeverityCounts.CRITICAL' --output text 2>/dev/null || echo "0")
+          CRITICAL=${CRITICAL/None/0}
+
+          echo "Critical vulnerabilities found: $CRITICAL"
+          if [ "$CRITICAL" != "0" ]; then
+            echo "::error::$CRITICAL CRITICAL vulnerabilities found in the image. Review: aws ecr describe-image-scan-findings --repository-name $ECR_REPOSITORY --image-id imageTag=$IMAGE_TAG"
+            exit 1
+          fi
 
       - name: Update ECS service
         run: |

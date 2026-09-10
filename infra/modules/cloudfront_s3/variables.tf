@@ -14,6 +14,11 @@ variable "project_name" {
 variable "environment" {
   description = "Environment name (dev, staging, prod)"
   type        = string
+
+  validation {
+    condition     = contains(["dev", "staging", "prod"], var.environment)
+    error_message = "Environment must be one of: dev, staging, prod."
+  }
 }
 
 variable "common_tags" {
@@ -64,9 +69,9 @@ variable "noncurrent_version_expiration_days" {
 }
 
 variable "cors_allowed_origins" {
-  description = "Allowed origins for CORS"
+  description = "Allowed origins for CORS. No permissive default - callers must opt in with real origins."
   type        = list(string)
-  default     = ["*"]
+  default     = []
 }
 
 # -----------------------------------------------------------------------------
@@ -105,31 +110,6 @@ variable "route53_zone_id" {
   description = "Route53 hosted zone ID for DNS records"
   type        = string
   default     = null
-}
-
-# -----------------------------------------------------------------------------
-# BACKEND API CONFIGURATION
-# -----------------------------------------------------------------------------
-
-variable "alb_dns_name" {
-  description = "ALB DNS name for API origin"
-  type        = string
-  default     = null
-}
-
-variable "alb_protocol_policy" {
-  description = "Protocol policy for ALB origin (http-only, https-only, match-viewer)"
-  type        = string
-  default     = "http-only" # Use http-only if ALB doesn't have HTTPS
-}
-
-variable "origin_custom_headers" {
-  description = "Custom headers to send to origin"
-  type = list(object({
-    name  = string
-    value = string
-  }))
-  default = []
 }
 
 # -----------------------------------------------------------------------------

@@ -15,6 +15,11 @@ variable "project_name" {
 variable "environment" {
   description = "Environment name (dev, staging, prod)"
   type        = string
+
+  validation {
+    condition     = contains(["dev", "staging", "prod"], var.environment)
+    error_message = "Environment must be one of: dev, staging, prod."
+  }
 }
 
 variable "aws_region" {
@@ -118,12 +123,27 @@ variable "task_cpu" {
   description = "CPU units for the task (256, 512, 1024, 2048, 4096)"
   type        = number
   default     = 512 # 0.5 vCPU - cheapest option
+
+  validation {
+    condition     = contains([256, 512, 1024, 2048, 4096], var.task_cpu)
+    error_message = "task_cpu must be a valid Fargate CPU value: 256, 512, 1024, 2048, or 4096."
+  }
 }
 
 variable "task_memory" {
   description = "Memory for the task in MB (512, 1024, 2048, 3072, 4096, etc.)"
   type        = number
   default     = 1024 # 1 GB - cheapest option for 512 CPU
+
+  validation {
+    # Fargate only allows specific (cpu, memory) pairings - this doesn't
+    # cross-validate against task_cpu (Terraform variable validations can't
+    # reference sibling variables), but it does reject memory values Fargate
+    # would never accept for ANY CPU size, catching the most common typo
+    # (e.g. a raw GB value like `1` instead of `1024` MB).
+    condition     = var.task_memory >= 512 && var.task_memory <= 30720 && var.task_memory % 1024 == 0 || var.task_memory % 512 == 0
+    error_message = "task_memory must be a valid Fargate memory value in MB (e.g. 512, 1024, 2048, ... up to 30720), matching your task_cpu per AWS's Fargate CPU/memory table."
+  }
 }
 
 # -----------------------------------------------------------------------------
@@ -248,4 +268,10 @@ variable "enable_alarms" {
   description = "Enable CloudWatch alarms"
   type        = bool
   default     = false
+}
+
+variable "alarm_actions" {
+  description = "ARNs (e.g. an SNS topic) to notify when an alarm changes state - both ALARM and OK. Alarms with an empty list here change state silently."
+  type        = list(string)
+  default     = []
 }

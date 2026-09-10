@@ -64,7 +64,7 @@ resource "aws_ecs_cluster_capacity_providers" "main" {
   #   capacity_provider = "FARGATE_SPOT"
   #   weight            = var.fargate_spot_weight
   # }
-  
+
 }
 
 # -----------------------------------------------------------------------------
@@ -170,8 +170,11 @@ resource "aws_ecs_task_definition" "backend" {
       }
 
       # Health Check
+      # node:20-alpine (the production image) doesn't ship curl - it does
+      # ship BusyBox wget, so this avoids adding a package just for the
+      # health check.
       healthCheck = {
-        command     = ["CMD-SHELL", "curl -f http://localhost:${var.container_port}${var.health_check_path} || exit 1"]
+        command     = ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:${var.container_port}${var.health_check_path} || exit 1"]
         interval    = 30
         timeout     = 5
         retries     = 3
@@ -188,6 +191,17 @@ resource "aws_ecs_task_definition" "backend" {
       ]
     }
   ])
+
+  # CI (deploy-backend.yml force-new-deployment against the ":latest" tag,
+  # and rollback.yml registering a commit-SHA-pinned revision directly) owns
+  # the running image after the first apply - not Terraform. Without this,
+  # the next `terraform apply` re-registers a revision pointing at whatever
+  # ":latest" currently resolves to in ECR, silently undoing any rollback.
+  # Terraform still owns everything else about the task def (CPU/memory,
+  # secrets wiring, log config, health check).
+  lifecycle {
+    ignore_changes = [container_definitions]
+  }
 
   tags = merge(var.common_tags, {
     Name = "${var.project_name}-${var.environment}-backend-task"
@@ -322,6 +336,8 @@ resource "aws_cloudwatch_metric_alarm" "high_cpu" {
   threshold           = 80
   alarm_description   = "Alert when ECS CPU utilization is high"
   treat_missing_data  = "notBreaching"
+  alarm_actions       = var.alarm_actions
+  ok_actions          = var.alarm_actions
 
   dimensions = {
     ClusterName = aws_ecs_cluster.main.name
@@ -345,6 +361,8 @@ resource "aws_cloudwatch_metric_alarm" "high_memory" {
   threshold           = 80
   alarm_description   = "Alert when ECS memory utilization is high"
   treat_missing_data  = "notBreaching"
+  alarm_actions       = var.alarm_actions
+  ok_actions          = var.alarm_actions
 
   dimensions = {
     ClusterName = aws_ecs_cluster.main.name
@@ -368,6 +386,8 @@ resource "aws_cloudwatch_metric_alarm" "no_running_tasks" {
   threshold           = 1
   alarm_description   = "Alert when no ECS tasks are running"
   treat_missing_data  = "breaching"
+  alarm_actions       = var.alarm_actions
+  ok_actions          = var.alarm_actions
 
   dimensions = {
     ClusterName = aws_ecs_cluster.main.name

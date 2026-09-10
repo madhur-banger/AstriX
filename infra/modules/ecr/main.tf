@@ -87,6 +87,24 @@ resource "aws_ecr_lifecycle_policy" "backend" {
         action = {
           type = "expire"
         }
+      },
+      {
+        # Catch-all for how images are ACTUALLY tagged today: deploy-backend.yml
+        # and rollback.yml push the raw commit SHA and "latest", neither of
+        # which matches the "v"/"release" prefixes rule 1 expects. Without this,
+        # rules 1-3 never fire for real deploys and tagged images accumulate
+        # unbounded. Lowest priority so the more specific rules above still get
+        # first pick of what to keep/expire.
+        rulePriority = 4
+        description  = "Keep last ${var.image_retention_count} images of any other tag (e.g. commit-SHA, latest)"
+        selection = {
+          tagStatus   = "any"
+          countType   = "imageCountMoreThan"
+          countNumber = var.image_retention_count
+        }
+        action = {
+          type = "expire"
+        }
       }
     ]
   })

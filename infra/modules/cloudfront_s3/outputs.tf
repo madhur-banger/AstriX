@@ -92,13 +92,13 @@ output "invalidation_command" {
 output "deployment_commands" {
   description = "Complete deployment commands"
   value = {
-    build          = "npm run build"
-    sync           = "aws s3 sync ./dist s3://${aws_s3_bucket.frontend.id} --delete"
-    invalidate     = "aws cloudfront create-invalidation --distribution-id ${aws_cloudfront_distribution.frontend.id} --paths '/*'"
-    full_deploy    = "npm run build && aws s3 sync ./dist s3://${aws_s3_bucket.frontend.id} --delete && aws cloudfront create-invalidation --distribution-id ${aws_cloudfront_distribution.frontend.id} --paths '/*'"
-    check_status   = "aws cloudfront get-distribution --id ${aws_cloudfront_distribution.frontend.id} --query 'Distribution.Status'"
-    list_objects   = "aws s3 ls s3://${aws_s3_bucket.frontend.id} --recursive"
-    bucket_size    = "aws s3 ls s3://${aws_s3_bucket.frontend.id} --recursive --summarize | tail -2"
+    build        = "npm run build"
+    sync         = "aws s3 sync ./dist s3://${aws_s3_bucket.frontend.id} --delete"
+    invalidate   = "aws cloudfront create-invalidation --distribution-id ${aws_cloudfront_distribution.frontend.id} --paths '/*'"
+    full_deploy  = "npm run build && aws s3 sync ./dist s3://${aws_s3_bucket.frontend.id} --delete && aws cloudfront create-invalidation --distribution-id ${aws_cloudfront_distribution.frontend.id} --paths '/*'"
+    check_status = "aws cloudfront get-distribution --id ${aws_cloudfront_distribution.frontend.id} --query 'Distribution.Status'"
+    list_objects = "aws s3 ls s3://${aws_s3_bucket.frontend.id} --recursive"
+    bucket_size  = "aws s3 ls s3://${aws_s3_bucket.frontend.id} --recursive --summarize | tail -2"
   }
 }
 

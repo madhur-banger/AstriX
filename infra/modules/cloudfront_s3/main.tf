@@ -23,8 +23,8 @@ data "aws_region" "current" {}
 locals {
   # AWS global managed CloudFront policies (do NOT change)
   cloudfront_cache_policies = {
-    optimized = "658327ea-f89d-4fab-a63d-7e88639e58f6"   # Managed-CachingOptimized
-    disabled  = "413f83b7-8c41-4bb7-9f3f-3f83c2d3f01b"   # Managed-CachingDisabled
+    optimized = "658327ea-f89d-4fab-a63d-7e88639e58f6" # Managed-CachingOptimized
+    disabled  = "413f83b7-8c41-4bb7-9f3f-3f83c2d3f01b" # Managed-CachingDisabled
   }
 
   cloudfront_origin_request_policies = {
@@ -228,74 +228,18 @@ resource "aws_cloudfront_response_headers_policy" "security_headers" {
 
 
 # -----------------------------------------------------------------------------
-# CLOUDFRONT CACHE POLICY FOR API
-# -----------------------------------------------------------------------------
-
-resource "aws_cloudfront_cache_policy" "api_cache_policy" {
-  name        = "${var.project_name}-${var.environment}-api-cache-policy"
-  comment     = "Cache policy for API requests - no caching"
-  default_ttl = 0
-  min_ttl     = 0
-  max_ttl     = 300
-
-  parameters_in_cache_key_and_forwarded_to_origin {
-    cookies_config {
-      cookie_behavior = "all"
-    }
-    headers_config {
-      header_behavior = "whitelist"
-      headers {
-        items = ["Authorization", "Host", "Origin", "Accept", "Accept-Language"]
-      }
-    }
-    query_strings_config {
-      query_string_behavior = "all"
-    }
-    enable_accept_encoding_brotli = true
-    enable_accept_encoding_gzip   = true
-  }
-}
-
-
-# -----------------------------------------------------------------------------
-# CLOUDFRONT ORIGIN REQUEST POLICY FOR API
-# -----------------------------------------------------------------------------
-
-resource "aws_cloudfront_origin_request_policy" "api_origin_policy" {
-  name    = "${var.project_name}-${var.environment}-api-origin-policy"
-  comment = "Forward API request data to ALB"
-
-  cookies_config {
-    cookie_behavior = "all"
-  }
-
-  headers_config {
-    header_behavior = "whitelist"
-    headers {
-      items = [
-        "Accept",
-        "Accept-Charset",
-        "Accept-Language",
-        "Content-Type",
-        "Host",
-        "Origin",
-        "Referer",
-        "User-Agent",
-        "X-Requested-With"
-      ]
-    }
-  }
-
-  query_strings_config {
-    query_string_behavior = "all"
-  }
-}
-
-
-
-# -----------------------------------------------------------------------------
 # CLOUDFRONT DISTRIBUTION
 # -----------------------------------------------------------------------------
+#
+# Deliberately frontend-only: the API is NOT routed through this
+# distribution. Caching a cookie-authenticated API response at the edge
+# risks serving one user's response to another - see infra/README.md and
+# scripts/update-urls.sh for the full rationale. Earlier revisions of this
+# module wired an /api/* behavior to the ALB origin anyway (dead, unused
+# code that contradicted the documented architecture); it's been removed
+# rather than left as latent, contradictory surface. If a future need
+# genuinely requires proxying the API through CloudFront, reintroduce it
+# deliberately alongside updated docs, not as a default.
 
 resource "aws_cloudfront_distribution" "frontend" {
   enabled             = true
@@ -316,34 +260,6 @@ resource "aws_cloudfront_distribution" "frontend" {
   }
 
   # ---------------------------------------------------------------------------
-  # ORIGIN: ALB (Backend API)
-  # ---------------------------------------------------------------------------
-  dynamic "origin" {
-    for_each = var.alb_dns_name != null ? [1] : []
-    content {
-      domain_name = var.alb_dns_name
-      origin_id   = "ALB-Backend"
-
-      custom_origin_config {
-        http_port                = 80
-        https_port               = 443
-        origin_protocol_policy   = var.alb_protocol_policy
-        origin_ssl_protocols     = ["TLSv1.2"]
-        origin_keepalive_timeout = 60
-        origin_read_timeout      = 60
-      }
-
-      dynamic "custom_header" {
-        for_each = var.origin_custom_headers
-        content {
-          name  = custom_header.value.name
-          value = custom_header.value.value
-        }
-      }
-    }
-  }
-
-  # ---------------------------------------------------------------------------
   # DEFAULT BEHAVIOR: S3 (Static Files + SPA Routing)
   # ---------------------------------------------------------------------------
   default_cache_behavior {
@@ -352,7 +268,7 @@ resource "aws_cloudfront_distribution" "frontend" {
     target_origin_id = "S3-${aws_s3_bucket.frontend.id}"
 
     # Use managed caching policy for static assets
-    cache_policy_id = local.cloudfront_cache_policies.optimized
+    cache_policy_id            = local.cloudfront_cache_policies.optimized
     response_headers_policy_id = aws_cloudfront_response_headers_policy.security_headers.id
 
     viewer_protocol_policy = "redirect-to-https"
@@ -369,25 +285,6 @@ resource "aws_cloudfront_distribution" "frontend" {
   }
 
   # ---------------------------------------------------------------------------
-  # BEHAVIOR: /api/* → Backend ALB
-  # ---------------------------------------------------------------------------
-  dynamic "ordered_cache_behavior" {
-    for_each = var.alb_dns_name != null ? [1] : []
-    content {
-      path_pattern     = "/api/*"
-      allowed_methods  = ["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"]
-      cached_methods   = ["GET", "HEAD"]
-      target_origin_id = "ALB-Backend"
-
-      cache_policy_id          = aws_cloudfront_cache_policy.api_cache_policy.id
-      origin_request_policy_id = aws_cloudfront_origin_request_policy.api_origin_policy.id
-
-      viewer_protocol_policy = "redirect-to-https"
-      compress               = true
-    }
-  }
-
-  # ---------------------------------------------------------------------------
   # BEHAVIOR: Static Assets with Long Cache
   # ---------------------------------------------------------------------------
   ordered_cache_behavior {
@@ -396,7 +293,7 @@ resource "aws_cloudfront_distribution" "frontend" {
     cached_methods   = ["GET", "HEAD"]
     target_origin_id = "S3-${aws_s3_bucket.frontend.id}"
 
-    cache_policy_id = local.cloudfront_cache_policies.optimized
+    cache_policy_id            = local.cloudfront_cache_policies.optimized
     response_headers_policy_id = aws_cloudfront_response_headers_policy.security_headers.id
 
     viewer_protocol_policy = "redirect-to-https"
@@ -412,7 +309,7 @@ resource "aws_cloudfront_distribution" "frontend" {
     cached_methods   = ["GET", "HEAD"]
     target_origin_id = "S3-${aws_s3_bucket.frontend.id}"
 
-    cache_policy_id = local.cloudfront_cache_policies.optimized
+    cache_policy_id            = local.cloudfront_cache_policies.optimized
     response_headers_policy_id = aws_cloudfront_response_headers_policy.security_headers.id
 
     viewer_protocol_policy = "redirect-to-https"
@@ -425,7 +322,7 @@ resource "aws_cloudfront_distribution" "frontend" {
     cached_methods   = ["GET", "HEAD"]
     target_origin_id = "S3-${aws_s3_bucket.frontend.id}"
 
-    cache_policy_id = local.cloudfront_cache_policies.optimized
+    cache_policy_id            = local.cloudfront_cache_policies.optimized
     response_headers_policy_id = aws_cloudfront_response_headers_policy.security_headers.id
 
     viewer_protocol_policy = "redirect-to-https"

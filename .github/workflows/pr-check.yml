@@ -5,6 +5,19 @@ on:
     branches: [main]
 
 jobs:
+  secret-scan:
+    name: Secret Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
   check-backend:
     name: Backend Build Check
     runs-on: ubuntu-latest
@@ -24,8 +37,22 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Build
+      - name: Type-check & build
         run: npm run build
+
+      - name: Test (coverage-gated)
+        run: npm run test:coverage
+
+      - name: Build Docker image (not pushed)
+        run: docker build -t astrix-backend:pr-${{ github.event.pull_request.number }} .
+
+      - name: Scan image for vulnerabilities
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: astrix-backend:pr-${{ github.event.pull_request.number }}
+          severity: CRITICAL,HIGH
+          exit-code: '1'
+          ignore-unfixed: true
 
   check-frontend:
     name: Frontend Build Check
@@ -45,6 +72,12 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Test
+        run: npm run test
 
       - name: Build (with placeholder API URL)
         run: npm run build

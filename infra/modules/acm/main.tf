@@ -31,7 +31,7 @@ terraform {
 locals {
   use_custom_domain = var.enable_custom_domain && var.custom_domain_name != null
   use_self_signed   = !local.use_custom_domain && var.certificate_arn == null
-  
+
   # Certificate ARN to use
   certificate_arn = var.certificate_arn != null ? var.certificate_arn : (
     local.use_custom_domain ? aws_acm_certificate.custom_domain[0].arn : null
@@ -87,9 +87,9 @@ resource "local_file" "private_key" {
 # ============================================
 
 resource "aws_acm_certificate" "self_signed" {
-  count             = local.use_self_signed ? 1 : 0
-  private_key       = tls_private_key.alb[0].private_key_pem
-  certificate_body  = tls_self_signed_cert.alb[0].cert_pem
+  count            = local.use_self_signed ? 1 : 0
+  private_key      = tls_private_key.alb[0].private_key_pem
+  certificate_body = tls_self_signed_cert.alb[0].cert_pem
 
   lifecycle {
     create_before_destroy = true

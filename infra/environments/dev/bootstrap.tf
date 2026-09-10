@@ -18,20 +18,20 @@
 locals {
   # Frontend URL: CloudFront (for React SPA)
   computed_frontend_url = var.frontend_domain_name != null ? "https://${var.frontend_domain_name}" : "https://${module.cloudfront_s3.distribution_domain_name}"
-  
+
   # Protocol based on HTTPS enablement
   alb_protocol = var.enable_https ? "https" : "http"
 
 
   # API URL: Direct to ALB - NOW RESPECTS HTTPS SETTING!
   computed_api_url = "${local.alb_protocol}://${module.alb.alb_dns_name}/api"
-  
+
   # Cookie domain - CloudFront domain as requested
   computed_cookie_domain = var.frontend_domain_name != null ? var.frontend_domain_name : module.cloudfront_s3.distribution_domain_name
-  
-   # Google OAuth callback URL - goes to ALB directly - NOW RESPECTS HTTPS!
+
+  # Google OAuth callback URL - goes to ALB directly - NOW RESPECTS HTTPS!
   computed_google_callback_url = "${local.alb_protocol}://${module.alb.alb_dns_name}/api/auth/google/callback"
-  
+
   # Frontend Google callback URL - CloudFront (where user lands after OAuth)
   computed_frontend_google_callback_url = "${local.computed_frontend_url}/google/callback"
 
@@ -56,7 +56,7 @@ resource "null_resource" "initial_docker_push" {
   provisioner "local-exec" {
     working_dir = path.root
     interpreter = ["/bin/bash", "-c"]
-    
+
     command = <<-EOT
       set -e
       
@@ -115,7 +115,7 @@ resource "null_resource" "update_urls" {
 
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
-    
+
     command = <<-EOT
       set -e
       
@@ -225,7 +225,7 @@ resource "null_resource" "force_ecs_redeploy" {
 
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
-    
+
     command = <<-EOT
       set -e
       
@@ -265,13 +265,13 @@ output "computed_urls" {
   description = "Computed URLs for the deployed infrastructure (Correct Architecture)"
   value = {
     architecture = "Frontend on CloudFront, API on ALB (Direct)"
-    
-    frontend_url                  = local.computed_frontend_url
-    api_url                       = local.computed_api_url
-    cookie_domain                 = local.computed_cookie_domain
-    google_callback_url           = local.computed_google_callback_url
-    frontend_google_callback_url  = local.computed_frontend_google_callback_url
-    
+
+    frontend_url                 = local.computed_frontend_url
+    api_url                      = local.computed_api_url
+    cookie_domain                = local.computed_cookie_domain
+    google_callback_url          = local.computed_google_callback_url
+    frontend_google_callback_url = local.computed_frontend_google_callback_url
+
     google_console_update = {
       message = "Update these in Google Cloud Console > APIs & Services > Credentials"
       authorized_javascript_origins = [
@@ -280,7 +280,7 @@ output "computed_urls" {
       ]
       authorized_redirect_uris = [local.computed_google_callback_url]
     }
-    
+
     note = "API calls go directly to ALB, NOT through CloudFront. This is correct for proper cookie/auth handling."
   }
 }

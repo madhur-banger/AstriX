@@ -20,6 +20,10 @@ jobs:
   deploy:
     name: Build and Deploy
     runs-on: ubuntu-latest
+    # Gated behind the "production" GitHub Environment - see the same comment
+    # in deploy-backend.yml. Required reviewers must be configured on that
+    # environment in repo settings for this to be an actual approval gate.
+    environment: production
     steps:
       - uses: actions/checkout@v4
 

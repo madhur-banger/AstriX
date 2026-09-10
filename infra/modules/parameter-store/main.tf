@@ -16,10 +16,20 @@
 # =============================================================================
 
 # -----------------------------------------------------------------------------
-# KMS KEY FOR PARAMETER STORE ENCRYPTION (Optional)
+# KMS KEY FOR PARAMETER STORE ENCRYPTION
 # -----------------------------------------------------------------------------
-# If you don't provide a KMS key, AWS uses a default key (free)
-# Custom KMS key gives you more control and audit capability
+# Falling back to the AWS-managed `alias/aws/ssm` key is free, but it is shared
+# with every other SSM consumer in the account and its key policy cannot be
+# edited - so "who may decrypt these secrets" collapses into "who has any SSM
+# permission". A customer-managed key makes that an explicit, auditable
+# decision (and shows up per-key in CloudTrail).
+#
+# COST: ~$1/month per key + $0.03 per 10k requests. Parameters are read once
+# per task start, so request cost here is effectively zero.
+
+data "aws_caller_identity" "current" {}
+
+data "aws_region" "current" {}
 
 resource "aws_kms_key" "parameter_store" {
   count = var.create_kms_key ? 1 : 0
@@ -27,6 +37,46 @@ resource "aws_kms_key" "parameter_store" {
   description             = "KMS key for ${var.project_name}-${var.environment} Parameter Store encryption"
   deletion_window_in_days = var.kms_deletion_window
   enable_key_rotation     = true
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = concat([
+      # Without this, the key becomes unmanageable - IAM policies in the
+      # account stop being able to grant any access to it, including to the
+      # principal running Terraform. This is AWS's required default statement.
+      {
+        Sid    = "EnableIAMUserPermissions"
+        Effect = "Allow"
+        Principal = {
+          AWS = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root"
+        }
+        Action   = "kms:*"
+        Resource = "*"
+      }
+      ],
+      # The ECS task execution role is what pulls the SecureString parameters
+      # at container start. It needs decrypt only, and only when the call comes
+      # via SSM - a leaked task role cannot use this key for anything else.
+      var.ecs_task_execution_role_arn != null ? [
+        {
+          Sid    = "AllowECSExecutionRoleDecrypt"
+          Effect = "Allow"
+          Principal = {
+            AWS = var.ecs_task_execution_role_arn
+          }
+          Action = [
+            "kms:Decrypt",
+            "kms:DescribeKey"
+          ]
+          Resource = "*"
+          Condition = {
+            StringEquals = {
+              "kms:ViaService" = "ssm.${data.aws_region.current.name}.amazonaws.com"
+            }
+          }
+        }
+    ] : [])
+  })
 
   tags = merge(var.common_tags, {
     Name = "${var.project_name}-${var.environment}-parameter-store-key"
@@ -40,6 +90,17 @@ resource "aws_kms_alias" "parameter_store" {
   target_key_id = aws_kms_key.parameter_store[0].key_id
 }
 
+locals {
+  # An explicitly-passed key wins (lets a caller share one key across modules);
+  # otherwise the key this module created. null falls back to the AWS-managed
+  # alias/aws/ssm key.
+  parameter_kms_key_id = (
+    var.kms_key_arn != null ? var.kms_key_arn :
+    var.create_kms_key ? aws_kms_key.parameter_store[0].arn :
+    null
+  )
+}
+
 # -----------------------------------------------------------------------------
 # MONGODB CONNECTION
 # -----------------------------------------------------------------------------
@@ -49,7 +110,7 @@ resource "aws_ssm_parameter" "mongo_uri" {
   description = "MongoDB connection URI"
   type        = "SecureString"
   value       = var.mongo_uri
-  key_id      = var.kms_key_arn
+  key_id      = local.parameter_kms_key_id
 
   tags = merge(var.common_tags, {
     Name        = "MONGO_URI"
@@ -71,7 +132,7 @@ resource "aws_ssm_parameter" "jwt_access_token_secret" {
   description = "JWT access token secret key"
   type        = "SecureString"
   value       = var.jwt_access_token_secret
-  key_id      = var.kms_key_arn
+  key_id      = local.parameter_kms_key_id
 
   tags = merge(var.common_tags, {
     Name        = "JWT_ACCESS_TOKEN_SECRET"
@@ -101,7 +162,7 @@ resource "aws_ssm_parameter" "jwt_refresh_token_secret" {
   description = "JWT refresh token secret key"
   type        = "SecureString"
   value       = var.jwt_refresh_token_secret
-  key_id      = var.kms_key_arn
+  key_id      = local.parameter_kms_key_id
 
   tags = merge(var.common_tags, {
     Name        = "JWT_REFRESH_TOKEN_SECRET"
@@ -147,7 +208,7 @@ resource "aws_ssm_parameter" "google_client_secret" {
   description = "Google OAuth client secret"
   type        = "SecureString"
   value       = var.google_client_secret
-  key_id      = var.kms_key_arn
+  key_id      = local.parameter_kms_key_id
 
   tags = merge(var.common_tags, {
     Name        = "GOOGLE_CLIENT_SECRET"
@@ -274,7 +335,7 @@ resource "aws_ssm_parameter" "base_path" {
     project     = var.project_name
     environment = var.environment
     created_at  = timestamp()
-    parameters  = [
+    parameters = [
       "MONGO_URI",
       "JWT_ACCESS_TOKEN_SECRET",
       "JWT_REFRESH_TOKEN_SECRET",

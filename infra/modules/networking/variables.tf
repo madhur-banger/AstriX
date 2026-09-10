@@ -116,6 +116,26 @@ variable "enable_nat_gateway" {
   default     = true
 }
 
+variable "single_nat_gateway" {
+  description = <<-EOT
+    Whether all private subnets share one NAT Gateway.
+
+    true  (default): one NAT in the first public subnet. ~$32/month total.
+                     Losing that one AZ removes outbound internet from private
+                     subnets in EVERY AZ - ECS tasks in the surviving AZ can no
+                     longer pull images or reach MongoDB Atlas. Acceptable
+                     while cost matters more than AZ-fault isolation.
+
+    false:           one NAT + EIP per public subnet/AZ, with each private
+                     subnet routing through the NAT in its own AZ.
+                     ~$32/month PER AZ. This is the production shape.
+
+    Requires at least as many public subnets as private subnets when false.
+  EOT
+  type        = bool
+  default     = true
+}
+
 # -----------------------------------------------------------------------------
 # FLOW LOGS CONFIGURATION
 # -----------------------------------------------------------------------------

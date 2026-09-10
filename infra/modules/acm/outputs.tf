@@ -21,12 +21,12 @@ output "certificate_type" {
 
 output "certificate_domain" {
   description = "Domain name on the certificate"
-  value = var.enable_custom_domain && var.custom_domain_name != null ? var.custom_domain_name : var.alb_dns_name
+  value       = var.enable_custom_domain && var.custom_domain_name != null ? var.custom_domain_name : var.alb_dns_name
 }
 
 output "certificate_status" {
   description = "Certificate status"
-  value = var.enable_custom_domain && var.custom_domain_name != null ? aws_acm_certificate.custom_domain[0].status : "ISSUED"
+  value       = var.enable_custom_domain && var.custom_domain_name != null ? aws_acm_certificate.custom_domain[0].status : "ISSUED"
 }
 
 output "certificate_pem" {

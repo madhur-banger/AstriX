@@ -90,6 +90,11 @@ resource "aws_iam_role_policy" "ecs_task_execution_secrets" {
           "arn:aws:ssm:${var.aws_region}:${var.aws_account_id}:parameter/${var.project_name}/${var.environment}/*"
         ]
       },
+      # Scoped to the Parameter Store CMK (threaded in from the parameter-store
+      # module by environments/dev/main.tf). The "*" fallback only applies when
+      # no CMK exists - the AWS-managed alias/aws/ssm key has no stable ARN to
+      # name here - and even then the ViaService condition confines this to
+      # decrypt calls made through SSM.
       {
         Sid    = "DecryptSecrets"
         Effect = "Allow"
@@ -408,8 +413,17 @@ resource "aws_iam_role" "github_actions" {
             "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
           }
           StringLike = {
-            # Only allow from your specific repository and branches
-            "token.actions.githubusercontent.com:sub" = "repo:${var.github_org}/${var.github_repo}:*"
+            # Scoped to main only - every workflow that assumes this role
+            # (deploy-backend, deploy-frontend, rollback, infra) triggers on
+            # push to main or workflow_dispatch, and GitHub's OIDC "sub"
+            # claim for a manually-dispatched run is still
+            # "ref:refs/heads/<branch>" for the branch selected in the
+            # dispatch UI - so this also covers workflow_dispatch runs off
+            # main, just not off other branches. Add another entry to this
+            # list if a workflow genuinely needs to deploy from elsewhere.
+            "token.actions.githubusercontent.com:sub" = [
+              "repo:${var.github_org}/${var.github_repo}:ref:refs/heads/main"
+            ]
           }
         }
       }
@@ -456,32 +470,83 @@ resource "aws_iam_role_policy" "github_actions_deploy" {
         ]
         Resource = "arn:aws:ecr:${var.aws_region}:${var.aws_account_id}:repository/${var.project_name}-${var.environment}-*"
       },
-      # ECS: Deploy services
+      # ECS: Deploy to this environment's service, and wait for it to
+      # stabilise. Scoped to the service ARN under this project's cluster so a
+      # leaked CI token cannot redeploy anything else in the account.
       {
-        Sid    = "ECSDeploy"
+        Sid    = "ECSDeployService"
         Effect = "Allow"
         Action = [
           "ecs:UpdateService",
-          "ecs:DescribeServices",
-          "ecs:DescribeTaskDefinition",
-          "ecs:RegisterTaskDefinition",
-          "ecs:DeregisterTaskDefinition",
-          "ecs:DescribeClusters",
-          "ecs:ListTasks",
-          "ecs:DescribeTasks"
-        ]
-        Resource = "*"
-      },
-      # ECS: Wait for service stability
-      {
-        Sid    = "ECSWait"
-        Effect = "Allow"
-        Action = [
           "ecs:DescribeServices"
         ]
         Resource = [
           "arn:aws:ecs:${var.aws_region}:${var.aws_account_id}:service/${var.project_name}-${var.environment}-cluster/*"
         ]
+      },
+      # ECS: Register new task definition revisions (rollback.yml re-registers
+      # the family with an older image). Scoped to this project/environment's
+      # families; the trailing wildcard covers the ":<revision>" suffix.
+      {
+        Sid    = "ECSRegisterTaskDefinition"
+        Effect = "Allow"
+        Action = [
+          "ecs:RegisterTaskDefinition"
+        ]
+        Resource = [
+          "arn:aws:ecs:${var.aws_region}:${var.aws_account_id}:task-definition/${var.project_name}-${var.environment}-*"
+        ]
+      },
+      # ECS: AWS does not support resource-level permissions for these two
+      # actions - the Service Authorization Reference lists no resource type
+      # for either, so "*" is the only value IAM will accept. Scoping them to a
+      # task-definition ARN would deny the call outright. Both are
+      # read/deregister-only; nothing can be launched with them.
+      {
+        Sid    = "ECSTaskDefinitionNoResourceLevel"
+        Effect = "Allow"
+        Action = [
+          "ecs:DescribeTaskDefinition",
+          "ecs:DeregisterTaskDefinition"
+        ]
+        Resource = "*"
+      },
+      # ECS: Read this environment's cluster and the tasks inside it.
+      {
+        Sid    = "ECSDescribeCluster"
+        Effect = "Allow"
+        Action = [
+          "ecs:DescribeClusters"
+        ]
+        Resource = [
+          "arn:aws:ecs:${var.aws_region}:${var.aws_account_id}:cluster/${var.project_name}-${var.environment}-cluster"
+        ]
+      },
+      {
+        Sid    = "ECSDescribeTasks"
+        Effect = "Allow"
+        Action = [
+          "ecs:DescribeTasks"
+        ]
+        Resource = [
+          "arn:aws:ecs:${var.aws_region}:${var.aws_account_id}:task/${var.project_name}-${var.environment}-cluster/*"
+        ]
+      },
+      # ECS: ListTasks' only resource type is container-instance, which does
+      # not exist on Fargate - so the resource must be "*" and the ecs:cluster
+      # condition key is what actually confines it to this cluster.
+      {
+        Sid    = "ECSListTasks"
+        Effect = "Allow"
+        Action = [
+          "ecs:ListTasks"
+        ]
+        Resource = "*"
+        Condition = {
+          ArnEquals = {
+            "ecs:cluster" = "arn:aws:ecs:${var.aws_region}:${var.aws_account_id}:cluster/${var.project_name}-${var.environment}-cluster"
+          }
+        }
       },
       # ECS: Pass role to task
       {

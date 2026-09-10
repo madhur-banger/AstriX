@@ -113,11 +113,40 @@ echo ""
 
 cd "$ENV_DIR"
 
-# Backup existing tfvars
+# Backup existing tfvars.
+#
+# terraform.tfvars is plaintext secrets (Mongo URI, JWT secrets, Google OAuth
+# client secret). Backups therefore go into a dedicated gitignored directory
+# rather than sitting next to the original as terraform.tfvars.backup.<ts>,
+# which the root .gitignore's `*.tfvars` pattern does NOT match. They are also
+# pruned so copies of every secret this project has ever used don't pile up on
+# disk forever.
+BACKUP_DIR="$ENV_DIR/.tfvars-backups"
+KEEP_BACKUPS=5
+
 if [ -f "terraform.tfvars" ]; then
-    cp terraform.tfvars terraform.tfvars.backup.$(date +%Y%m%d_%H%M%S)
-    echo "✓ Backup created"
+    mkdir -p "$BACKUP_DIR"
+    chmod 700 "$BACKUP_DIR"
+    BACKUP_FILE="$BACKUP_DIR/terraform.tfvars.backup.$(date +%Y%m%d_%H%M%S)"
+    cp terraform.tfvars "$BACKUP_FILE"
+    chmod 600 "$BACKUP_FILE"
+    echo "✓ Backup created: $BACKUP_FILE"
+
+    # Prune all but the $KEEP_BACKUPS most recent (newest first, drop the head)
+    ls -1t "$BACKUP_DIR"/terraform.tfvars.backup.* 2>/dev/null \
+        | tail -n +$((KEEP_BACKUPS + 1)) \
+        | while read -r old; do
+            rm -f "$old"
+            echo "  pruned old backup: $(basename "$old")"
+        done
 fi
+
+# Sweep up any stray backups from before this script wrote to $BACKUP_DIR.
+for stray in "$ENV_DIR"/terraform.tfvars.backup.*; do
+    [ -e "$stray" ] || continue
+    rm -f "$stray"
+    echo "  removed legacy plaintext backup: $(basename "$stray")"
+done
 
 # Update or add HTTPS configuration
 if grep -q "enable_https" terraform.tfvars; then

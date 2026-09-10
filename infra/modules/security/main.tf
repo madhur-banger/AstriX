@@ -200,14 +200,11 @@ resource "aws_security_group" "database" {
     }
   }
 
-  # Outbound: None needed for databases
-  egress {
-    description = "No outbound needed"
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
+  # No egress block: a database SG only accepts inbound connections, it
+  # never initiates outbound ones - omitting egress rules here (rather than
+  # declaring a 0.0.0.0/0 "allow all" rule that contradicted this SG's own
+  # "no outbound needed" comment) means Terraform provisions zero egress
+  # rules, which AWS treats as deny-all for this security group.
 
   tags = merge(var.common_tags, {
     Name = "${var.project_name}-${var.environment}-database-sg"

@@ -379,13 +379,13 @@ output "useful_commands" {
     docker_push  = "./infra/scripts/push-backend-image.sh"
 
     # Frontend Commands (NEW - Phase 4)
-    frontend_deploy    = "cd frontend && npm run build && ${module.cloudfront_s3.s3_sync_command}"
-    frontend_sync      = module.cloudfront_s3.s3_sync_command
-    frontend_invalidate = module.cloudfront_s3.invalidation_command
+    frontend_deploy      = "cd frontend && npm run build && ${module.cloudfront_s3.s3_sync_command}"
+    frontend_sync        = module.cloudfront_s3.s3_sync_command
+    frontend_invalidate  = module.cloudfront_s3.invalidation_command
     frontend_full_deploy = "cd frontend && npm run build && ${module.cloudfront_s3.s3_sync_command} && ${module.cloudfront_s3.invalidation_command}"
 
     # CloudFront Commands
-    cloudfront_status = "aws cloudfront get-distribution --id ${module.cloudfront_s3.distribution_id} --query 'Distribution.Status' --profile prod-terraform"
+    cloudfront_status             = "aws cloudfront get-distribution --id ${module.cloudfront_s3.distribution_id} --query 'Distribution.Status' --profile prod-terraform"
     cloudfront_list_invalidations = "aws cloudfront list-invalidations --distribution-id ${module.cloudfront_s3.distribution_id} --profile prod-terraform"
 
     # S3 Commands

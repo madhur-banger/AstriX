@@ -119,9 +119,9 @@ output "ecs_summary" {
 output "useful_commands" {
   description = "Useful AWS CLI commands for ECS management"
   value = {
-    view_service = "aws ecs describe-services --cluster ${aws_ecs_cluster.main.name} --services ${aws_ecs_service.backend.name}"
-    view_tasks   = "aws ecs list-tasks --cluster ${aws_ecs_cluster.main.name} --service-name ${aws_ecs_service.backend.name}"
-    view_logs    = "aws logs tail ${aws_cloudwatch_log_group.ecs.name} --follow"
+    view_service  = "aws ecs describe-services --cluster ${aws_ecs_cluster.main.name} --services ${aws_ecs_service.backend.name}"
+    view_tasks    = "aws ecs list-tasks --cluster ${aws_ecs_cluster.main.name} --service-name ${aws_ecs_service.backend.name}"
+    view_logs     = "aws logs tail ${aws_cloudwatch_log_group.ecs.name} --follow"
     scale_service = "aws ecs update-service --cluster ${aws_ecs_cluster.main.name} --service ${aws_ecs_service.backend.name} --desired-count 3"
     force_deploy  = "aws ecs update-service --cluster ${aws_ecs_cluster.main.name} --service ${aws_ecs_service.backend.name} --force-new-deployment"
   }

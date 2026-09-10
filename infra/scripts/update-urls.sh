@@ -8,8 +8,11 @@
 #
 # CORRECT Architecture:
 #   Browser
-#      ├── https://d1234.cloudfront.net     → S3 (React)
-#      └── http://alb-xxx.elb.amazonaws.com → ECS (API)
+#      ├── https://d1234.cloudfront.net      → S3 (React)
+#      └── https://alb-xxx.elb.amazonaws.com → ECS (API)
+#
+# The API protocol is derived from the ALB's live listeners, not hardcoded -
+# it is https whenever a :443 listener exists (enable_https = true).
 #
 # Why NOT put API behind CloudFront:
 # 1. CloudFront caches responses - can leak auth cookies to other users
@@ -67,12 +70,12 @@ echo -e "  CloudFront Domain: ${GREEN}${CLOUDFRONT_DOMAIN}${NC}"
 # -----------------------------------------------------------------------------
 echo -e "${YELLOW}Getting ALB DNS name (Backend API)...${NC}"
 
-ALB_DNS=$(aws elbv2 describe-load-balancers \
+read -r ALB_DNS ALB_ARN <<< "$(aws elbv2 describe-load-balancers \
     --names "${PROJECT_NAME}-${ENVIRONMENT}-alb" \
     --profile "$AWS_PROFILE" \
     --region "$AWS_REGION" \
-    --query 'LoadBalancers[0].DNSName' \
-    --output text 2>/dev/null)
+    --query 'LoadBalancers[0].[DNSName,LoadBalancerArn]' \
+    --output text 2>/dev/null)"
 
 if [ -z "$ALB_DNS" ] || [ "$ALB_DNS" == "None" ]; then
     echo -e "${RED}❌ Could not find ALB: ${PROJECT_NAME}-${ENVIRONMENT}-alb${NC}"
@@ -83,6 +86,32 @@ fi
 echo -e "  ALB DNS Name: ${GREEN}${ALB_DNS}${NC}"
 
 # -----------------------------------------------------------------------------
+# DETERMINE API PROTOCOL
+# -----------------------------------------------------------------------------
+# The ALB's listeners are the ground truth for whether HTTPS is actually
+# serving - more reliable than reading `enable_https` out of terraform.tfvars,
+# which says what was *intended* at last apply, not what is live. Terraform
+# computes the same thing from var.enable_https (see environments/dev/main.tf's
+# `local.alb_base_url`); this keeps the script's URLs in agreement with the
+# URLs Terraform writes to Parameter Store.
+
+HTTPS_LISTENER=$(aws elbv2 describe-listeners \
+    --load-balancer-arn "$ALB_ARN" \
+    --profile "$AWS_PROFILE" \
+    --region "$AWS_REGION" \
+    --query 'Listeners[?Port==`443`].Port' \
+    --output text 2>/dev/null)
+
+if [ -n "$HTTPS_LISTENER" ] && [ "$HTTPS_LISTENER" != "None" ]; then
+    API_PROTOCOL="https"
+    echo -e "  API Protocol: ${GREEN}https${NC} (ALB has a :443 listener)"
+else
+    API_PROTOCOL="http"
+    echo -e "  API Protocol: ${YELLOW}http${NC} (no :443 listener on the ALB)"
+    echo -e "  ${YELLOW}Cookies with Secure/SameSite=None will not work over HTTP.${NC}"
+fi
+
+# -----------------------------------------------------------------------------
 # COMPUTE URLS (CORRECT ARCHITECTURE)
 # -----------------------------------------------------------------------------
 # Frontend = CloudFront (static content, cached)
@@ -91,13 +120,13 @@ echo -e "  ALB DNS Name: ${GREEN}${ALB_DNS}${NC}"
 FRONTEND_URL="https://${CLOUDFRONT_DOMAIN}"
 
 # API URL points DIRECTLY to ALB, NOT through CloudFront!
-# Using HTTP because ALB doesn't have HTTPS cert (add cert for production!)
-API_URL="http://${ALB_DNS}/api"
+# Protocol is whatever the ALB is actually listening on (see above).
+API_URL="${API_PROTOCOL}://${ALB_DNS}/api"
 
 # Google OAuth callbacks
 # - Backend callback: Goes to ALB (where the API handles the OAuth flow)
 # - Frontend callback: Goes to CloudFront (where React handles the redirect)
-GOOGLE_CALLBACK_URL="http://${ALB_DNS}/api/auth/google/callback"
+GOOGLE_CALLBACK_URL="${API_PROTOCOL}://${ALB_DNS}/api/auth/google/callback"
 FRONTEND_GOOGLE_CALLBACK_URL="${FRONTEND_URL}/google/callback"
 
 # Cookie domain: CloudFront domain
@@ -235,7 +264,7 @@ echo "Go to: Google Cloud Console > APIs & Services > Credentials"
 echo ""
 echo -e "${BLUE}Authorized JavaScript origins:${NC}"
 echo "  ${FRONTEND_URL}"
-echo "  http://${ALB_DNS}"
+echo "  ${API_PROTOCOL}://${ALB_DNS}"
 echo ""
 echo -e "${BLUE}Authorized redirect URIs:${NC}"
 echo "  ${GOOGLE_CALLBACK_URL}"
