@@ -530,12 +530,6 @@ variable "cloudfront_enable_spa_routing" {
   default     = true
 }
 
-variable "cloudfront_alb_protocol_policy" {
-  description = "Protocol policy for ALB origin (http-only, https-only, match-viewer)"
-  type        = string
-  default     = "http-only" # Change to https-only if ALB has HTTPS
-}
-
 
 # -----------------------------------------------------------------------------
 # CUSTOM DOMAIN CONFIGURATION

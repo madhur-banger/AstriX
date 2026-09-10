@@ -7,9 +7,11 @@
 #   - HTTPS enforcement
 #   - SPA routing support (no refresh errors)
 #   - Optimal caching strategies
-#   - API proxy to backend ALB
 #   - Security headers
 #   - Gzip/Brotli compression
+#
+# Frontend-only: the API is NOT proxied through this distribution - see the
+# CLOUDFRONT DISTRIBUTION section below for why.
 # =============================================================================
 
 # -----------------------------------------------------------------------------
@@ -25,10 +27,6 @@ locals {
   cloudfront_cache_policies = {
     optimized = "658327ea-f89d-4fab-a63d-7e88639e58f6" # Managed-CachingOptimized
     disabled  = "413f83b7-8c41-4bb7-9f3f-3f83c2d3f01b" # Managed-CachingDisabled
-  }
-
-  cloudfront_origin_request_policies = {
-    all_viewer = "216adef6-5c7f-47e4-b989-5492eafa07d3" # Managed-AllViewer
   }
 }
 
@@ -87,6 +85,12 @@ resource "aws_s3_bucket_lifecycle_configuration" "frontend" {
     id     = "cleanup-old-versions"
     status = "Enabled"
 
+    # Empty filter = apply to every object. The AWS provider warns that a
+    # rule with neither `filter` nor `prefix` will become a hard error in a
+    # future version - this makes "applies to everything" explicit instead
+    # of implicit.
+    filter {}
+
     noncurrent_version_expiration {
       noncurrent_days = var.noncurrent_version_expiration_days
     }
@@ -99,6 +103,8 @@ resource "aws_s3_bucket_lifecycle_configuration" "frontend" {
   rule {
     id     = "cleanup-incomplete-uploads"
     status = "Enabled"
+
+    filter {}
 
     abort_incomplete_multipart_upload {
       days_after_initiation = 1
