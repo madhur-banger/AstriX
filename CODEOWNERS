@@ -1,0 +1,8 @@
+# Default owner for everything not matched below.
+* @madhur-banger
+
+# Infra and CI changes get flagged for review even if everything else in a
+# PR is self-mergeable - these have a much bigger blast radius than app code.
+/infra/ @madhur-banger
+/.github/workflows/ @madhur-banger
+/backend/Dockerfile @madhur-banger
