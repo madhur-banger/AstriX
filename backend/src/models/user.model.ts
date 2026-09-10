@@ -7,6 +7,9 @@ export interface UserDocument extends Document {
   password?: string;
   profilePicture: string | null;
   isActive: boolean;
+  // Advisory only - never gates login (see PLAN.md §3). Set true immediately
+  // for OAuth signups whose provider already confirmed the email.
+  isEmailVerified: boolean;
   lastLogin: Date | null;
   createdAt: Date;
   updatedAt: Date;
@@ -39,6 +42,7 @@ const userSchema = new Schema<UserDocument>(
       ref: "Workspace",
     },
     isActive: { type: Boolean, default: true },
+    isEmailVerified: { type: Boolean, default: false },
     lastLogin: { type: Date, default: null },
   },
   {

@@ -1,87 +1,56 @@
 /**
  * END-TO-END (E2E) TESTS: workspace routes
  * --------------------------------------------
- * This is the OUTERMOST layer of testing: we build a real Express app,
- * mount the REAL workspace routes on it, and fire REAL HTTP requests at it
- * using `supertest` - exactly like a frontend or Postman would. Nothing is
- * mocked except your actual auth middleware (passport/session), because
- * setting up a real login flow in a test is usually more trouble than it's
- * worth - we just inject `req.user` directly the way your real auth
- * middleware would after a successful login.
+ * Real Express app, real `authenticate` middleware (via `buildRoutedApp`),
+ * real routes, real DB (in-memory), real `errorHandler` - exactly how
+ * `src/index.ts` wires `${BASE_PATH}/workspace` behind `authenticate`.
+ * Authenticated requests carry a REAL access token + SessionModel row
+ * (see `createAuthenticatedUser` in tests/setup/e2eAuth.ts), so the whole
+ * chain (JWT -> authenticate -> route -> zod -> roleGuard -> service -> DB)
+ * is exercised, not a stubbed `req.user`.
  *
  * WHAT E2E TESTS ARE FOR (and NOT for):
- * They confirm the whole chain wires together correctly: routing -> zod
- * validation -> permission checks -> service -> real DB -> JSON response
- * shape -> HTTP status code. They are NOT the place to enumerate every
- * business-logic edge case (that's what the service unit tests are for) -
- * keep this file to a handful of "does the happy path work end-to-end" and
- * "does an obviously bad request get rejected with the right status" cases.
- *
- * ASSUMPTION CALLOUT:
- * We seed the OWNER role with ALL permission values from your Permissions
- * enum, so that a workspace owner passes every roleGuard check in these
- * tests. If your enums/role.enum.ts is structured differently, adjust the
- * `Object.values(Permissions)` line below.
+ * They confirm the whole chain wires together correctly. They are NOT the
+ * place to enumerate every business-logic edge case (that's what the
+ * service unit/integration tests are for) - keep this file to "does the
+ * happy path work end-to-end" and "does an obviously bad request get
+ * rejected with the right status" per route.
  */
 
 import { describe, it, expect, beforeEach } from "vitest";
-import express, { NextFunction, Request, Response } from "express";
 import request from "supertest";
 
 import workspaceRoutes from "../../src/routes/workspace.routes";
-import UserModel from "../../src/models/user.model";
+import MemberModel from "../../src/models/member.model";
 import RoleModel from "../../src/models/roles-permission.model";
 import { Roles, Permissions } from "../../src/enums/role.enum";
-
-function buildTestApp(fakeUserId: string) {
-  const app = express();
-  app.use(express.json());
-
-  // Stand-in for your real passport/session auth middleware: in production
-  // this would populate req.user after verifying a JWT/cookie. Here we just
-  // hardcode it, since we're testing the ROUTES, not the auth system itself.
-  app.use((req: Request, _res: Response, next: NextFunction) => {
-    (req as any).user = { _id: fakeUserId };
-    next();
-  });
-
-  app.use("/api/workspace", workspaceRoutes);
-
-  // Minimal error handler so a thrown/rejected controller error becomes a
-  // JSON response instead of supertest seeing a raw connection error.
-  // Replace this with your real src/middlewares/errorHandles.middleware.ts
-  // if you want the exact production error shape asserted here too.
-  app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
-    const statusCode = err.statusCode || 500;
-    res.status(statusCode).json({ message: err.message || "Internal error" });
-  });
-
-  return app;
-}
+import { buildRoutedApp } from "../setup/buildTestApp";
+import { createAuthenticatedUser } from "../setup/e2eAuth";
 
 describe("Workspace routes (E2E via supertest + in-memory DB)", () => {
-  let userId: string;
-  let app: express.Express;
+  let app: ReturnType<typeof buildRoutedApp>;
 
   beforeEach(async () => {
-    // Seed a role with EVERY permission so this user (as OWNER) clears every
-    // roleGuard check across all the routes exercised below.
+    // Seed a role with EVERY permission so an OWNER clears every roleGuard
+    // check across all the routes exercised below.
     await RoleModel.create({
       name: Roles.OWNER,
       permissions: Object.values(Permissions),
     });
-
-    const user = await UserModel.create({
-      name: "E2E Test User",
-      email: `e2e-${Date.now()}@example.com`,
+    await RoleModel.create({
+      name: Roles.MEMBER,
+      permissions: [Permissions.VIEW_ONLY],
     });
-    userId = user._id.toString();
-    app = buildTestApp(userId);
+
+    app = buildRoutedApp("/api/workspace", workspaceRoutes);
   });
 
   it("POST /api/workspace/create/new -> 201 with the created workspace", async () => {
+    const { authHeader } = await createAuthenticatedUser();
+
     const res = await request(app)
       .post("/api/workspace/create/new")
+      .set("Authorization", authHeader)
       .send({ name: "E2E Workspace", description: "made via supertest" });
 
     expect(res.status).toBe(201);
@@ -89,69 +58,341 @@ describe("Workspace routes (E2E via supertest + in-memory DB)", () => {
     expect(res.body.workspace.name).toBe("E2E Workspace");
   });
 
-  it("POST /api/workspace/create/new -> 400-level status when name is missing", async () => {
+  it("POST /api/workspace/create/new -> 401 with no Authorization header", async () => {
     const res = await request(app)
       .post("/api/workspace/create/new")
+      .send({ name: "No Auth" });
+
+    expect(res.status).toBe(401);
+  });
+
+  it("POST /api/workspace/create/new -> 400 when name is missing", async () => {
+    const { authHeader } = await createAuthenticatedUser();
+
+    const res = await request(app)
+      .post("/api/workspace/create/new")
+      .set("Authorization", authHeader)
       .send({ description: "no name provided" });
 
-    // Zod's thrown error should be caught by asyncHandler -> next(err) ->
-    // our error handler above, resulting in SOME 4xx/5xx status.
-    // If your real error handler maps ZodError to exactly 400, tighten
-    // this assertion to `expect(res.status).toBe(400)`.
-    expect(res.status).toBeGreaterThanOrEqual(400);
+    expect(res.status).toBe(400);
+    expect(res.body.errorCode).toBe("VALIDATION_ERROR");
   });
 
   it("full lifecycle: create -> get by id -> update -> delete", async () => {
+    const { authHeader } = await createAuthenticatedUser();
+
     // 1. Create
     const createRes = await request(app)
       .post("/api/workspace/create/new")
+      .set("Authorization", authHeader)
       .send({ name: "Lifecycle Workspace" });
     expect(createRes.status).toBe(201);
     const workspaceId = createRes.body.workspace._id;
 
     // 2. Get by id - confirms the membership check (getMemberRoleInWorkspace)
     //    correctly recognizes the creator as a member.
-    const getRes = await request(app).get(`/api/workspace/${workspaceId}`);
+    const getRes = await request(app)
+      .get(`/api/workspace/${workspaceId}`)
+      .set("Authorization", authHeader);
     expect(getRes.status).toBe(200);
     expect(getRes.body.workspace._id).toBe(workspaceId);
 
     // 3. Update - confirms the EDIT_WORKSPACE permission check passes for the owner.
     const updateRes = await request(app)
       .put(`/api/workspace/update/${workspaceId}`)
+      .set("Authorization", authHeader)
       .send({ name: "Renamed via E2E" });
     expect(updateRes.status).toBe(200);
     expect(updateRes.body.workspace.name).toBe("Renamed via E2E");
 
     // 4. Delete - confirms the DELETE_WORKSPACE permission check + ownership check pass.
-    const deleteRes = await request(app).delete(
-      `/api/workspace/delete/${workspaceId}`
-    );
+    const deleteRes = await request(app)
+      .delete(`/api/workspace/delete/${workspaceId}`)
+      .set("Authorization", authHeader);
     expect(deleteRes.status).toBe(200);
     expect(deleteRes.body.message).toBe("Workspace deleted successfully");
 
-    // 5. Confirm it's REALLY gone by trying to fetch it again -> should now 404-ish.
-    const getAfterDeleteRes = await request(app).get(
-      `/api/workspace/${workspaceId}`
-    );
-    expect(getAfterDeleteRes.status).toBeGreaterThanOrEqual(400);
+    // 5. Confirm it's REALLY gone by trying to fetch it again -> 404.
+    const getAfterDeleteRes = await request(app)
+      .get(`/api/workspace/${workspaceId}`)
+      .set("Authorization", authHeader);
+    expect(getAfterDeleteRes.status).toBe(404);
   });
 
   it("GET /api/workspace/:id -> error status for a workspace the user never joined", async () => {
-    // Create a SECOND, unrelated user+app who was never added as a member
-    // of any workspace, then try to access one that belongs to `userId`.
-    const outsiderUser = await UserModel.create({
-      name: "Outsider",
-      email: `outsider-${Date.now()}@example.com`,
-    });
-    const outsiderApp = buildTestApp(outsiderUser._id.toString());
+    const owner = await createAuthenticatedUser();
+    const outsider = await createAuthenticatedUser();
 
     const createRes = await request(app)
       .post("/api/workspace/create/new")
+      .set("Authorization", owner.authHeader)
       .send({ name: "Private Workspace" });
     const workspaceId = createRes.body.workspace._id;
 
-    const res = await request(outsiderApp).get(`/api/workspace/${workspaceId}`);
+    const res = await request(app)
+      .get(`/api/workspace/${workspaceId}`)
+      .set("Authorization", outsider.authHeader);
 
     expect(res.status).toBeGreaterThanOrEqual(400);
+  });
+
+  it("GET /api/workspace/members/:id -> 200 listing the owner as a member", async () => {
+    const { authHeader, user } = await createAuthenticatedUser();
+
+    const createRes = await request(app)
+      .post("/api/workspace/create/new")
+      .set("Authorization", authHeader)
+      .send({ name: "Members Workspace" });
+    const workspaceId = createRes.body.workspace._id;
+
+    const res = await request(app)
+      .get(`/api/workspace/members/${workspaceId}`)
+      .set("Authorization", authHeader);
+
+    expect(res.status).toBe(200);
+    expect(Array.isArray(res.body.members)).toBe(true);
+    expect(
+      res.body.members.some(
+        (m: any) => String(m.userId?._id ?? m.userId) === String(user._id)
+      )
+    ).toBe(true);
+  });
+
+  it("GET /api/workspace/analytics/:id -> 200 with zeroed task counts for a fresh workspace", async () => {
+    const { authHeader } = await createAuthenticatedUser();
+
+    const createRes = await request(app)
+      .post("/api/workspace/create/new")
+      .set("Authorization", authHeader)
+      .send({ name: "Analytics Workspace" });
+    const workspaceId = createRes.body.workspace._id;
+
+    const res = await request(app)
+      .get(`/api/workspace/analytics/${workspaceId}`)
+      .set("Authorization", authHeader);
+
+    expect(res.status).toBe(200);
+    expect(res.body.analytics).toEqual({
+      totalTasks: 0,
+      overdueTasks: 0,
+      completedTasks: 0,
+    });
+  });
+
+  it("PUT /api/workspace/change/member/role/:id -> 200 and persists the new role for a member", async () => {
+    const owner = await createAuthenticatedUser();
+    const member = await createAuthenticatedUser();
+
+    const createRes = await request(app)
+      .post("/api/workspace/create/new")
+      .set("Authorization", owner.authHeader)
+      .send({ name: "Role Change Workspace" });
+    const workspaceId = createRes.body.workspace._id;
+
+    const memberRole = await RoleModel.findOne({ name: Roles.MEMBER });
+    await MemberModel.create({
+      userId: member.user._id,
+      workspaceId,
+      role: memberRole!._id,
+    });
+
+    const ownerRole = await RoleModel.findOne({ name: Roles.OWNER });
+    const res = await request(app)
+      .put(`/api/workspace/change/member/role/${workspaceId}`)
+      .set("Authorization", owner.authHeader)
+      .send({
+        memberId: String(member.user._id),
+        roleId: String(ownerRole!._id),
+      });
+
+    expect(res.status).toBe(200);
+    expect(res.body.member.role._id ?? res.body.member.role).toBeTruthy();
+
+    const persisted = await MemberModel.findOne({
+      userId: member.user._id,
+      workspaceId,
+    });
+    expect(String(persisted!.role)).toBe(String(ownerRole!._id));
+  });
+
+  it("PUT /api/workspace/change/member/role/:id -> 400 when targeting the workspace owner", async () => {
+    const owner = await createAuthenticatedUser();
+
+    const createRes = await request(app)
+      .post("/api/workspace/create/new")
+      .set("Authorization", owner.authHeader)
+      .send({ name: "Owner Role Change Workspace" });
+    const workspaceId = createRes.body.workspace._id;
+
+    const memberRole = await RoleModel.findOne({ name: Roles.MEMBER });
+    const res = await request(app)
+      .put(`/api/workspace/change/member/role/${workspaceId}`)
+      .set("Authorization", owner.authHeader)
+      .send({
+        memberId: String(owner.user._id),
+        roleId: String(memberRole!._id),
+      });
+
+    expect(res.status).toBe(400);
+  });
+
+  it("DELETE /api/workspace/:id/member/:memberId -> 200 and removes the member", async () => {
+    const owner = await createAuthenticatedUser();
+    const member = await createAuthenticatedUser();
+
+    const createRes = await request(app)
+      .post("/api/workspace/create/new")
+      .set("Authorization", owner.authHeader)
+      .send({ name: "Remove Member Workspace" });
+    const workspaceId = createRes.body.workspace._id;
+
+    const memberRole = await RoleModel.findOne({ name: Roles.MEMBER });
+    await MemberModel.create({
+      userId: member.user._id,
+      workspaceId,
+      role: memberRole!._id,
+    });
+
+    const res = await request(app)
+      .delete(`/api/workspace/${workspaceId}/member/${member.user._id}`)
+      .set("Authorization", owner.authHeader);
+
+    expect(res.status).toBe(200);
+
+    const persisted = await MemberModel.findOne({
+      userId: member.user._id,
+      workspaceId,
+    });
+    expect(persisted).toBeNull();
+  });
+
+  it("DELETE /api/workspace/:id/member/:memberId -> 400 when targeting the workspace owner", async () => {
+    const owner = await createAuthenticatedUser();
+
+    const createRes = await request(app)
+      .post("/api/workspace/create/new")
+      .set("Authorization", owner.authHeader)
+      .send({ name: "Cannot Remove Owner Workspace" });
+    const workspaceId = createRes.body.workspace._id;
+
+    const res = await request(app)
+      .delete(`/api/workspace/${workspaceId}/member/${owner.user._id}`)
+      .set("Authorization", owner.authHeader);
+
+    expect(res.status).toBe(400);
+
+    const stillThere = await MemberModel.findOne({
+      userId: owner.user._id,
+      workspaceId,
+    });
+    expect(stillThere).not.toBeNull();
+  });
+
+  it("DELETE /api/workspace/:id/member/:memberId -> 403/401-ish when a MEMBER (no REMOVE_MEMBER permission) tries to remove someone", async () => {
+    const owner = await createAuthenticatedUser();
+    const member = await createAuthenticatedUser();
+    const target = await createAuthenticatedUser();
+
+    const createRes = await request(app)
+      .post("/api/workspace/create/new")
+      .set("Authorization", owner.authHeader)
+      .send({ name: "Permission Check Workspace" });
+    const workspaceId = createRes.body.workspace._id;
+
+    const memberRole = await RoleModel.findOne({ name: Roles.MEMBER });
+    await MemberModel.create({
+      userId: member.user._id,
+      workspaceId,
+      role: memberRole!._id,
+    });
+    await MemberModel.create({
+      userId: target.user._id,
+      workspaceId,
+      role: memberRole!._id,
+    });
+
+    const res = await request(app)
+      .delete(`/api/workspace/${workspaceId}/member/${target.user._id}`)
+      .set("Authorization", member.authHeader);
+
+    expect(res.status).toBeGreaterThanOrEqual(400);
+    expect(res.status).toBeLessThan(500);
+
+    const stillThere = await MemberModel.findOne({
+      userId: target.user._id,
+      workspaceId,
+    });
+    expect(stillThere).not.toBeNull();
+  });
+
+  it("POST /api/workspace/:id/leave -> 200 and removes the caller's own membership", async () => {
+    const owner = await createAuthenticatedUser();
+    const member = await createAuthenticatedUser();
+
+    const createRes = await request(app)
+      .post("/api/workspace/create/new")
+      .set("Authorization", owner.authHeader)
+      .send({ name: "Leave Workspace" });
+    const workspaceId = createRes.body.workspace._id;
+
+    const memberRole = await RoleModel.findOne({ name: Roles.MEMBER });
+    await MemberModel.create({
+      userId: member.user._id,
+      workspaceId,
+      role: memberRole!._id,
+    });
+
+    const res = await request(app)
+      .post(`/api/workspace/${workspaceId}/leave`)
+      .set("Authorization", member.authHeader);
+
+    expect(res.status).toBe(200);
+
+    const persisted = await MemberModel.findOne({
+      userId: member.user._id,
+      workspaceId,
+    });
+    expect(persisted).toBeNull();
+  });
+
+  it("POST /api/workspace/:id/leave -> 400 when the workspace owner tries to leave", async () => {
+    const owner = await createAuthenticatedUser();
+
+    const createRes = await request(app)
+      .post("/api/workspace/create/new")
+      .set("Authorization", owner.authHeader)
+      .send({ name: "Owner Cannot Leave Workspace" });
+    const workspaceId = createRes.body.workspace._id;
+
+    const res = await request(app)
+      .post(`/api/workspace/${workspaceId}/leave`)
+      .set("Authorization", owner.authHeader);
+
+    expect(res.status).toBe(400);
+
+    const stillThere = await MemberModel.findOne({
+      userId: owner.user._id,
+      workspaceId,
+    });
+    expect(stillThere).not.toBeNull();
+  });
+
+  it("POST /api/workspace/:id/invite/reset -> 200 and changes the invite code", async () => {
+    const { authHeader } = await createAuthenticatedUser();
+
+    const createRes = await request(app)
+      .post("/api/workspace/create/new")
+      .set("Authorization", authHeader)
+      .send({ name: "Invite Reset Workspace" });
+    const workspaceId = createRes.body.workspace._id;
+    const originalInviteCode = createRes.body.workspace.inviteCode;
+
+    const res = await request(app)
+      .post(`/api/workspace/${workspaceId}/invite/reset`)
+      .set("Authorization", authHeader);
+
+    expect(res.status).toBe(200);
+    expect(res.body.workspace.inviteCode).toBeTruthy();
+    expect(res.body.workspace.inviteCode).not.toBe(originalInviteCode);
   });
 });

@@ -40,8 +40,10 @@ process.env.COOKIE_DOMAIN = "localhost";
 // because exchangeGoogleCodeForProfile is mocked wherever it's used) ---
 process.env.GOOGLE_CLIENT_ID = "test-google-client-id";
 process.env.GOOGLE_CLIENT_SECRET = "test-google-client-secret";
-process.env.GOOGLE_CALLBACK_URL = "http://localhost:3000/api/auth/google/callback";
-process.env.FRONTEND_GOOGLE_CALLBACK_URL = "http://localhost:3000/api/auth/google/callback";
+process.env.GOOGLE_CALLBACK_URL =
+  "http://localhost:3000/api/auth/google/callback";
+process.env.FRONTEND_GOOGLE_CALLBACK_URL =
+  "http://localhost:3000/api/auth/google/callback";
 
 // --- General ---
 process.env.NODE_ENV = "test";

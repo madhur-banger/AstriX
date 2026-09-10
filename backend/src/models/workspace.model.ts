@@ -8,6 +8,7 @@ export interface WorkspaceDocument extends Document {
   inviteCode: string;
   createdAt: string;
   updatedAt: string;
+  resetInviteCode(): void;
 }
 
 const workspaceSchema = new Schema<WorkspaceDocument>(

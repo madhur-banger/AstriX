@@ -79,6 +79,12 @@ const taskSchema = new Schema<TaskDocument>(
   }
 );
 
+// getAllTasksService filters by workspace+project, workspace+status, and
+// assignedTo on every list call - none of these were indexed before.
+taskSchema.index({ workspace: 1, project: 1 });
+taskSchema.index({ workspace: 1, status: 1 });
+taskSchema.index({ assignedTo: 1 });
+
 const TaskModel = mongoose.model<TaskDocument>("Task", taskSchema);
 
 export default TaskModel;

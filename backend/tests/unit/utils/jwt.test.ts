@@ -148,7 +148,10 @@ describe("signJwtToken + verifyJwtToken (round trip)", () => {
 describe("generateTokenPair + verifyAccessToken/verifyRefreshToken", () => {
   it("generates an access token verifiable by verifyAccessToken and a refresh token verifiable by verifyRefreshToken", () => {
     const userId = makeObjectId();
-    const { accessToken, refreshToken } = generateTokenPair(userId, "session-1");
+    const { accessToken, refreshToken } = generateTokenPair(
+      userId,
+      "session-1"
+    );
 
     const accessResult = verifyAccessToken(accessToken);
     const refreshResult = verifyRefreshToken(refreshToken);

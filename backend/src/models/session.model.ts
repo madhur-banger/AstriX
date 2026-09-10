@@ -5,7 +5,7 @@
 
 /**
  * WHY STORE REFRESH TOKENS IN DATABASE?
- * 
+ *
  * 1. REVOCATION: Can invalidate specific sessions (logout from one device)
  * 2. LOGOUT ALL: Can invalidate all user sessions (logout everywhere)
  * 3. SECURITY: If refresh token is compromised, can delete it
@@ -20,6 +20,12 @@ export interface SessionDocument extends Document {
   userAgent?: string;
   ipAddress?: string;
   isValid: boolean; // Can be set to false to revoke
+  // SHA-256 of the refresh token this session is CURRENTLY bound to. Rotated
+  // on every successful /auth/refresh, so a previously issued (already
+  // rotated away) refresh token can be recognised as a replay rather than
+  // silently accepted. Only the hash is stored - same discipline as the
+  // password-reset and email-verification tokens.
+  refreshTokenHash?: string;
   expiresAt: Date;
   createdAt: Date;
   updatedAt: Date;
@@ -45,6 +51,10 @@ const sessionSchema = new Schema<SessionDocument>(
       type: Boolean,
       default: true,
       index: true, // Index for fast filtering of valid sessions
+    },
+    refreshTokenHash: {
+      type: String,
+      default: null,
     },
     expiresAt: {
       type: Date,

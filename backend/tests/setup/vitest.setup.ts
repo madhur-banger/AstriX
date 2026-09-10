@@ -26,7 +26,9 @@ beforeAll(async () => {
 // transaction gets anywhere near it, so the transaction never hits the
 // implicit-creation-triggers-a-lock-wait path that was failing.
 beforeEach(async () => {
-  const pending = mongoose.modelNames().filter((name) => !initializedModels.has(name));
+  const pending = mongoose
+    .modelNames()
+    .filter((name) => !initializedModels.has(name));
   await Promise.all(
     pending.map(async (name) => {
       await mongoose.model(name).init();

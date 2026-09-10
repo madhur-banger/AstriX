@@ -1,8 +1,10 @@
 import swaggerJSDoc from "swagger-jsdoc";
 
+import { config } from "./app.config";
 import { authSchemas } from "../docs/schemas/auth.schemas";
-
-
+import { projectSchemas } from "../docs/schemas/project.schemas";
+import { taskSchemas } from "../docs/schemas/task.schemas";
+import { userSchemas } from "../docs/schemas/user.schemas";
 
 export const swaggerOptions: swaggerJSDoc.Options = {
   definition: {
@@ -14,14 +16,17 @@ export const swaggerOptions: swaggerJSDoc.Options = {
     },
     servers: [
       {
-        url: "http://localhost:8000/api",
-        description: "Local server",
+        url: config.API_PUBLIC_URL,
+        description: `${config.NODE_ENV} server`,
       },
     ],
 
     components: {
       schemas: {
         ...authSchemas,
+        ...projectSchemas,
+        ...taskSchemas,
+        ...userSchemas,
       },
     },
   },

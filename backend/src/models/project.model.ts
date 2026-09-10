@@ -40,5 +40,8 @@ const projectSchema = new Schema<ProjectDocument>(
   }
 );
 
+// getProjectsInWorkspaceService lists/paginates by workspace on every call.
+projectSchema.index({ workspace: 1 });
+
 const ProjectModel = mongoose.model<ProjectDocument>("Project", projectSchema);
 export default ProjectModel;

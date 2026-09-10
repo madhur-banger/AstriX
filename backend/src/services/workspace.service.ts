@@ -4,7 +4,11 @@ import MemberModel from "../models/member.model";
 import RoleModel from "../models/roles-permission.model";
 import UserModel from "../models/user.model";
 import WorkspaceModel from "../models/workspace.model";
-import { BadRequestException, NotFoundException } from "../utils/appError";
+import {
+  BadRequestException,
+  ForbiddenException,
+  NotFoundException,
+} from "../utils/appError";
 import TaskModel from "../models/task.model";
 import { TaskStatusEnum } from "../enums/task.enum";
 import ProjectModel from "../models/project.model";
@@ -21,41 +25,51 @@ export const createWorkspaceService = async (
 ) => {
   const { name, description } = body;
 
-  const user = await UserModel.findById(userId);
+  const session = await mongoose.startSession();
+  session.startTransaction();
 
-  if (!user) {
-    throw new NotFoundException("User not found");
+  try {
+    const user = await UserModel.findById(userId).session(session);
+    if (!user) {
+      throw new NotFoundException("User not found");
+    }
+
+    const ownerRole = await RoleModel.findOne({ name: Roles.OWNER }).session(
+      session
+    );
+    if (!ownerRole) {
+      throw new NotFoundException("Owner role not found");
+    }
+
+    const workspace = new WorkspaceModel({
+      name: name,
+      description: description,
+      owner: user._id,
+    });
+    await workspace.save({ session });
+
+    const member = new MemberModel({
+      userId: user._id,
+      workspaceId: workspace._id,
+      role: ownerRole._id,
+      joinedAt: new Date(),
+    });
+    await member.save({ session });
+
+    user.currentWorkspace = workspace._id as mongoose.Types.ObjectId;
+    await user.save({ session });
+
+    await session.commitTransaction();
+    session.endSession();
+
+    return {
+      workspace,
+    };
+  } catch (error) {
+    await session.abortTransaction();
+    session.endSession();
+    throw error;
   }
-
-  const ownerRole = await RoleModel.findOne({ name: Roles.OWNER });
-
-  if (!ownerRole) {
-    throw new NotFoundException("Owner role not found");
-  }
-
-  const workspace = new WorkspaceModel({
-    name: name,
-    description: description,
-    owner: user._id,
-  });
-
-  await workspace.save();
-
-  const member = new MemberModel({
-    userId: user._id,
-    workspaceId: workspace._id,
-    role: ownerRole._id,
-    joinedAt: new Date(),
-  });
-
-  await member.save();
-
-  user.currentWorkspace = workspace._id as mongoose.Types.ObjectId;
-  await user.save();
-
-  return {
-    workspace,
-  };
 };
 
 //********************************
@@ -64,7 +78,6 @@ export const createWorkspaceService = async (
 export const getAllWorkspacesUserIsMemberService = async (userId: string) => {
   const memberships = await MemberModel.find({ userId })
     .populate("workspaceId")
-    .select("-password")
     .exec();
 
   // Extract workspace details from memberships
@@ -143,12 +156,18 @@ export const getWorkspaceAnalyticsService = async (workspaceId: string) => {
 
 export const changeMemberRoleService = async (
   workspaceId: string,
-  memberId: string,
+  targetUserId: string,
   roleId: string
 ) => {
   const workspace = await WorkspaceModel.findById(workspaceId);
   if (!workspace) {
     throw new NotFoundException("Workspace not found");
+  }
+
+  if (workspace.owner.equals(new mongoose.Types.ObjectId(targetUserId))) {
+    throw new BadRequestException(
+      "Cannot change the role of the workspace owner. Transfer ownership first."
+    );
   }
 
   const role = await RoleModel.findById(roleId);
@@ -157,12 +176,12 @@ export const changeMemberRoleService = async (
   }
 
   const member = await MemberModel.findOne({
-    userId: memberId,
+    userId: targetUserId,
     workspaceId: workspaceId,
   });
 
   if (!member) {
-    throw new Error("Member not found in the workspace");
+    throw new NotFoundException("Member not found in the workspace");
   }
 
   member.role = role;
@@ -171,6 +190,73 @@ export const changeMemberRoleService = async (
   return {
     member,
   };
+};
+
+//********************************
+// REMOVE MEMBER / LEAVE WORKSPACE
+// Shared by both: an OWNER/ADMIN removing someone else (gated by the
+// REMOVE_MEMBER permission at the controller) and a member removing
+// themselves (leave-workspace, gated only by membership). Either way the
+// workspace owner can never be removed this way - that would leave the
+// workspace with nobody holding owner-level permissions. Ownership must be
+// transferred (not currently supported) before the owner can leave.
+//**************** **************/
+export const removeMemberFromWorkspaceService = async (
+  workspaceId: string,
+  targetUserId: string
+) => {
+  const workspace = await WorkspaceModel.findById(workspaceId);
+  if (!workspace) {
+    throw new NotFoundException("Workspace not found");
+  }
+
+  if (workspace.owner.equals(new mongoose.Types.ObjectId(targetUserId))) {
+    throw new BadRequestException(
+      "The workspace owner cannot be removed. Transfer ownership first."
+    );
+  }
+
+  const member = await MemberModel.findOneAndDelete({
+    userId: targetUserId,
+    workspaceId,
+  });
+
+  if (!member) {
+    throw new NotFoundException("Member not found in this workspace");
+  }
+
+  // Unassign (don't delete) any tasks the removed member was assigned -
+  // the tasks themselves are still valid workspace history.
+  await TaskModel.updateMany(
+    { workspace: workspaceId, assignedTo: targetUserId },
+    { assignedTo: null }
+  );
+
+  const user = await UserModel.findById(targetUserId);
+  if (user?.currentWorkspace?.equals(workspaceId)) {
+    const anotherMembership = await MemberModel.findOne({
+      userId: targetUserId,
+    });
+    user.currentWorkspace = anotherMembership
+      ? (anotherMembership.workspaceId as mongoose.Types.ObjectId)
+      : null;
+    await user.save();
+  }
+};
+
+//********************************
+// RESET WORKSPACE INVITE CODE
+//**************** **************/
+export const resetWorkspaceInviteCodeService = async (workspaceId: string) => {
+  const workspace = await WorkspaceModel.findById(workspaceId);
+  if (!workspace) {
+    throw new NotFoundException("Workspace not found");
+  }
+
+  workspace.resetInviteCode();
+  await workspace.save();
+
+  return { workspace };
 };
 
 //********************************
@@ -204,16 +290,15 @@ export const deleteWorkspaceService = async (
   session.startTransaction();
 
   try {
-    const workspace = await WorkspaceModel.findById(workspaceId).session(
-      session
-    );
+    const workspace =
+      await WorkspaceModel.findById(workspaceId).session(session);
     if (!workspace) {
       throw new NotFoundException("Workspace not found");
     }
 
     // Check if the user owns the workspace
-    if (!workspace.owner.equals(new mongoose.Types.ObjectId(userId))) { 
-      throw new BadRequestException(
+    if (!workspace.owner.equals(new mongoose.Types.ObjectId(userId))) {
+      throw new ForbiddenException(
         "You are not authorized to delete this workspace"
       );
     }

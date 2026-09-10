@@ -1,7 +1,4 @@
-export const getEnv = <T extends string>(
-  key: string,
-  defaultValue?: T
-): T => {
+export const getEnv = <T extends string>(key: string, defaultValue?: T): T => {
   const value = process.env[key];
 
   if (value === undefined) {

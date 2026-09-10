@@ -44,7 +44,10 @@ export function createMockReqRes(options: MockReqOptions = {}) {
     // Pass `user: null` explicitly (not just omitting it) to simulate an
     // UNauthenticated request - the default below assumes authenticated,
     // since most controllers you'll test expect req.user to exist.
-    user: options.user === null ? undefined : options.user ?? { _id: "mock-user-id" },
+    user:
+      options.user === null
+        ? undefined
+        : (options.user ?? { _id: "mock-user-id" }),
     cookies: options.cookies ?? {},
     headers: options.headers ?? { "user-agent": "vitest-test-agent" },
     ip: options.ip ?? "127.0.0.1",

@@ -1,4 +1,5 @@
-const httpConfig = () => ({
+const httpConfig = () =>
+  ({
     // Success Response
     OK: 200,
     CREATED: 201,
@@ -12,6 +13,7 @@ const httpConfig = () => ({
     NOT_FOUND: 404,
     METHOD_NOT_ALLOWED: 405,
     CONFLICT: 409,
+    PAYLOAD_TOO_LARGE: 413,
     UNPROCESSABLE_ENTITY: 422,
     TOO_MANY_REQUESTS: 429,
 
@@ -21,7 +23,7 @@ const httpConfig = () => ({
     BAD_GATEWAY: 502,
     SERVICE_UNAVAILABLE: 503,
     GATEWAY_TIMEOUT: 504,
-} as const);
+  }) as const;
 
 export const HTTPSTATUS = httpConfig();
 

@@ -41,7 +41,10 @@ import RoleModel from "../../src/models/roles-permission.model";
 import MemberModel from "../../src/models/member.model";
 import WorkspaceModel from "../../src/models/workspace.model";
 import { Roles } from "../../src/enums/role.enum";
-import { NotFoundException, BadRequestException } from "../../src/utils/appError";
+import {
+  NotFoundException,
+  ForbiddenException,
+} from "../../src/utils/appError";
 
 describe("workspace.service (integration - real in-memory MongoDB)", () => {
   let userId: string;
@@ -139,7 +142,7 @@ describe("workspace.service (integration - real in-memory MongoDB)", () => {
 
     await expect(
       deleteWorkspaceService(workspace._id.toString(), otherUser._id.toString())
-    ).rejects.toThrow(BadRequestException);
+    ).rejects.toThrow(ForbiddenException);
 
     // Confirm the workspace was NOT deleted despite the failed attempt -
     // this is exactly the kind of guarantee a real transaction should provide,

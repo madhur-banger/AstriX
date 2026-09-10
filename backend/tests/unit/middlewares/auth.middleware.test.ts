@@ -31,7 +31,11 @@ import SessionModel from "../../../src/models/session.model";
 import { UnauthorizedException } from "../../../src/utils/appError";
 import { generateTokenPair } from "../../../src/utils/jwt";
 import { createMockReqRes } from "../../setup/mockExpress";
-import { buildFakeUser, buildFakeSession, makeObjectId } from "../../setup/testFixtures";
+import {
+  buildFakeUser,
+  buildFakeSession,
+  makeObjectId,
+} from "../../setup/testFixtures";
 
 vi.mock("../../../src/models/user.model");
 vi.mock("../../../src/models/session.model");
@@ -44,7 +48,10 @@ function buildAuthedReq(userId: any, sessionId: string, overrides: any = {}) {
   const { accessToken } = generateTokenPair(userId, sessionId);
   return createMockReqRes({
     ...overrides,
-    headers: { authorization: `Bearer ${accessToken}`, ...(overrides.headers ?? {}) },
+    headers: {
+      authorization: `Bearer ${accessToken}`,
+      ...(overrides.headers ?? {}),
+    },
   });
 }
 
@@ -116,8 +123,14 @@ describe("authenticate middleware", () => {
 
   it("guard 6a: calls next(error) when the session has been explicitly revoked (isValid: false)", async () => {
     const fakeUser = buildFakeUser();
-    const fakeSession = buildFakeSession({ userId: fakeUser._id, isValid: false });
-    const { req, res, next } = buildAuthedReq(fakeUser._id, String(fakeSession._id));
+    const fakeSession = buildFakeSession({
+      userId: fakeUser._id,
+      isValid: false,
+    });
+    const { req, res, next } = buildAuthedReq(
+      fakeUser._id,
+      String(fakeSession._id)
+    );
     vi.mocked(UserModel.findById).mockResolvedValue(fakeUser as any);
     vi.mocked(SessionModel.findById).mockResolvedValue(fakeSession as any);
 
@@ -133,7 +146,10 @@ describe("authenticate middleware", () => {
       isValid: true,
       expiresAt: new Date(Date.now() - 60_000), // 1 minute ago
     });
-    const { req, res, next } = buildAuthedReq(fakeUser._id, String(fakeSession._id));
+    const { req, res, next } = buildAuthedReq(
+      fakeUser._id,
+      String(fakeSession._id)
+    );
     vi.mocked(UserModel.findById).mockResolvedValue(fakeUser as any);
     vi.mocked(SessionModel.findById).mockResolvedValue(fakeSession as any);
 
@@ -148,8 +164,14 @@ describe("authenticate middleware", () => {
     // session that actually belongs to user B.
     const tokenUser = buildFakeUser();
     const sessionOwner = buildFakeUser(); // a DIFFERENT user
-    const fakeSession = buildFakeSession({ userId: sessionOwner._id, isValid: true });
-    const { req, res, next } = buildAuthedReq(tokenUser._id, String(fakeSession._id));
+    const fakeSession = buildFakeSession({
+      userId: sessionOwner._id,
+      isValid: true,
+    });
+    const { req, res, next } = buildAuthedReq(
+      tokenUser._id,
+      String(fakeSession._id)
+    );
     vi.mocked(UserModel.findById).mockResolvedValue(tokenUser as any);
     vi.mocked(SessionModel.findById).mockResolvedValue(fakeSession as any);
 
@@ -160,8 +182,14 @@ describe("authenticate middleware", () => {
 
   it("success path: attaches req.user and req.session and calls next() with NO error", async () => {
     const fakeUser = buildFakeUser({ isActive: true });
-    const fakeSession = buildFakeSession({ userId: fakeUser._id, isValid: true });
-    const { req, res, next } = buildAuthedReq(fakeUser._id, String(fakeSession._id));
+    const fakeSession = buildFakeSession({
+      userId: fakeUser._id,
+      isValid: true,
+    });
+    const { req, res, next } = buildAuthedReq(
+      fakeUser._id,
+      String(fakeSession._id)
+    );
     vi.mocked(UserModel.findById).mockResolvedValue(fakeUser as any);
     vi.mocked(SessionModel.findById).mockResolvedValue(fakeSession as any);
 

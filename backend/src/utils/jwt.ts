@@ -70,15 +70,18 @@ export const verifyJwtToken = <T extends object>(
     }) as T;
 
     return { valid: true, payload };
-  } catch (error: any) {
+  } catch (error) {
+    const name = (error as { name?: string } | undefined)?.name;
     return {
       valid: false,
-      error: error.name === "TokenExpiredError" ? "Token expired" : "Invalid token",
+      error: name === "TokenExpiredError" ? "Token expired" : "Invalid token",
     };
   }
 };
 
-export const extractBearerToken = (authHeader: string | undefined): string | null => {
+export const extractBearerToken = (
+  authHeader: string | undefined
+): string | null => {
   if (!authHeader) return null;
 
   const [scheme, token] = authHeader.split(" ");
@@ -87,8 +90,13 @@ export const extractBearerToken = (authHeader: string | undefined): string | nul
   return token;
 };
 
-export const verifyAccessTokenAndGetPayload = (token: string): AccessTokenPayload => {
-  const result = verifyJwtToken<AccessTokenPayload>(token, accessTokenSignOptions.secret);
+export const verifyAccessTokenAndGetPayload = (
+  token: string
+): AccessTokenPayload => {
+  const result = verifyJwtToken<AccessTokenPayload>(
+    token,
+    accessTokenSignOptions.secret
+  );
   if (!result.valid) {
     throw new UnauthorizedException(result.error);
   }
@@ -96,11 +104,17 @@ export const verifyAccessTokenAndGetPayload = (token: string): AccessTokenPayloa
 };
 
 export const verifyAccessToken = (token: string) => {
-  return verifyJwtToken<AccessTokenPayload>(token, accessTokenSignOptions.secret);
+  return verifyJwtToken<AccessTokenPayload>(
+    token,
+    accessTokenSignOptions.secret
+  );
 };
 
 export const verifyRefreshToken = (token: string) => {
-  return verifyJwtToken<RefreshTokenPayload>(token, refreshTokenSignOptions.secret);
+  return verifyJwtToken<RefreshTokenPayload>(
+    token,
+    refreshTokenSignOptions.secret
+  );
 };
 
 export const calculateExpiryDate = (expiresIn: string): Date => {

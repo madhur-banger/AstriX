@@ -134,7 +134,9 @@ describe("getWorkspaceByIdController", () => {
       new Error("Not a member")
     );
 
-    const { req, res, next } = createMockReqRes({ params: { id: "ws-id" } });
+    const { req, res, next } = createMockReqRes({
+      params: { id: "64f1a2b3c4d5e6f7a8b9c0d1" },
+    });
 
     await getWorkspaceByIdController(req, res, next);
 
@@ -156,7 +158,7 @@ describe("updateWorkspaceByIdController", () => {
     } as any);
 
     const { req, res, next } = createMockReqRes({
-      params: { id: "ws-id" },
+      params: { id: "64f1a2b3c4d5e6f7a8b9c0d1" },
       body: { name: "Renamed", description: "d" },
     });
 
@@ -179,7 +181,7 @@ describe("updateWorkspaceByIdController", () => {
     });
 
     const { req, res, next } = createMockReqRes({
-      params: { id: "ws-id" },
+      params: { id: "64f1a2b3c4d5e6f7a8b9c0d1" },
       body: { name: "Renamed" },
     });
 
@@ -202,14 +204,14 @@ describe("deleteWorkspaceByIdController", () => {
     } as any);
 
     const { req, res, next } = createMockReqRes({
-      params: { id: "ws-id" },
+      params: { id: "64f1a2b3c4d5e6f7a8b9c0d1" },
       user: { _id: "user-1" },
     });
 
     await deleteWorkspaceByIdController(req, res, next);
 
     expect(workspaceService.deleteWorkspaceService).toHaveBeenCalledWith(
-      "ws-id",
+      "64f1a2b3c4d5e6f7a8b9c0d1",
       "user-1"
     );
     expect(res.status).toHaveBeenCalledWith(200);
@@ -219,5 +221,42 @@ describe("deleteWorkspaceByIdController", () => {
         currentWorkspace: null,
       })
     );
+  });
+
+  it("does not call the delete service if roleGuard throws (insufficient permission)", async () => {
+    vi.mocked(memberService.getMemberRoleInWorkspace).mockResolvedValue({
+      role: "VIEW_ONLY",
+    } as any);
+    vi.mocked(roleGuard).mockImplementation(() => {
+      throw new Error("Forbidden");
+    });
+
+    const { req, res, next } = createMockReqRes({
+      params: { id: "64f1a2b3c4d5e6f7a8b9c0d1" },
+      user: { _id: "user-1" },
+    });
+
+    await deleteWorkspaceByIdController(req, res, next);
+
+    expect(workspaceService.deleteWorkspaceService).not.toHaveBeenCalled();
+    expect(next).toHaveBeenCalledOnce();
+  });
+
+  it("propagates an error to next() when the service rejects (e.g. non-owner delete)", async () => {
+    vi.mocked(memberService.getMemberRoleInWorkspace).mockResolvedValue({
+      role: "OWNER",
+    } as any);
+    vi.mocked(workspaceService.deleteWorkspaceService).mockRejectedValue(
+      new Error("You are not authorized to delete this workspace")
+    );
+
+    const { req, res, next } = createMockReqRes({
+      params: { id: "64f1a2b3c4d5e6f7a8b9c0d1" },
+      user: { _id: "user-1" },
+    });
+
+    await deleteWorkspaceByIdController(req, res, next);
+
+    expect(next).toHaveBeenCalledOnce();
   });
 });

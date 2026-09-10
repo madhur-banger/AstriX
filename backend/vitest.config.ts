@@ -36,5 +36,29 @@ export default defineConfig({
     // so we give generous headroom.
     testTimeout: 20000,
     hookTimeout: 20000,
+
+    // Thresholds set once real coverage existed to compare against (see
+    // backend/PLAN.md) - full suite currently sits around 99% statements/
+    // lines, ~95% branches. Thresholds are set a bit below that so normal
+    // future work has headroom, while still failing the build if coverage
+    // regresses meaningfully.
+    coverage: {
+      provider: "v8",
+      include: ["src/**/*.ts"],
+      exclude: [
+        "src/@types/**",
+        "src/docs/**",
+        "src/seeders/**",
+        "src/index.ts",
+        "src/config/database.config.ts",
+        "src/config/swagger.config.ts",
+      ],
+      thresholds: {
+        statements: 90,
+        branches: 85,
+        functions: 90,
+        lines: 90,
+      },
+    },
   },
 });

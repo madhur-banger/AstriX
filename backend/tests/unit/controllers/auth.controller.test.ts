@@ -33,16 +33,20 @@ import {
 
 import * as authService from "../../../src/services/auth.service";
 import * as googleProvider from "../../../src/providers/google.provider";
-import * as jwtUtils from "../../../src/utils/jwt";
 import { verifyRefreshToken } from "../../../src/utils/jwt";
 import { createMockReqRes } from "../../setup/mockExpress";
-import { buildFakeUser, buildFakeSession, makeObjectId } from "../../setup/testFixtures";
+import {
+  buildFakeUser,
+  buildFakeSession,
+  makeObjectId,
+} from "../../setup/testFixtures";
 import { config } from "../../../src/config/app.config";
 
 vi.mock("../../../src/services/auth.service");
 vi.mock("../../../src/providers/google.provider");
 vi.mock("../../../src/utils/jwt", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("../../../src/utils/jwt")>();
+  const actual =
+    await importOriginal<typeof import("../../../src/utils/jwt")>();
   return {
     ...actual, // keep every other export (accessTokenSignOptions, calculateExpiryDate, etc.) real
     verifyRefreshToken: vi.fn(),
@@ -60,7 +64,11 @@ describe("registerUserController", () => {
     } as any);
 
     const { req, res, next } = createMockReqRes({
-      body: { email: "new@example.com", name: "New User", password: "Hunter@22" },
+      body: {
+        email: "new@example.com",
+        name: "New User",
+        password: "Hunter@22",
+      },
     });
 
     await registerUserController(req, res, next);
@@ -77,7 +85,9 @@ describe("registerUserController", () => {
   });
 
   it("sends validation errors to next() without calling the service", async () => {
-    const { req, res, next } = createMockReqRes({ body: { email: "not-even-an-email" } });
+    const { req, res, next } = createMockReqRes({
+      body: { email: "not-even-an-email" },
+    });
 
     await registerUserController(req, res, next);
 
@@ -119,12 +129,16 @@ describe("loginController", () => {
     expect(res.cookie).toHaveBeenCalledOnce();
     expect(res.status).toHaveBeenCalledWith(200);
     expect(res.json).toHaveBeenCalledWith(
-      expect.objectContaining({ access_token: "fake-access-token", user: fakeUser })
+      expect.objectContaining({
+        access_token: "fake-access-token",
+        user: fakeUser,
+      })
     );
   });
 
   it("propagates UnauthorizedException from verifyUserService to next() (wrong password case)", async () => {
-    const { UnauthorizedException } = await import("../../../src/utils/appError");
+    const { UnauthorizedException } =
+      await import("../../../src/utils/appError");
     vi.mocked(authService.verifyUserService).mockRejectedValue(
       new UnauthorizedException("Invalid email or password")
     );
@@ -193,7 +207,8 @@ describe("googleCallbackController", () => {
     expect(res.clearCookie).toHaveBeenCalledWith("google_oauth_state");
     expect(res.cookie).toHaveBeenCalledOnce(); // the refresh token cookie
     expect(res.redirect).toHaveBeenCalledOnce();
-    const redirectUrl = vi.mocked(res.redirect).mock.calls[0][0] as unknown as string;
+    const redirectUrl = vi.mocked(res.redirect).mock
+      .calls[0][0] as unknown as string;
     expect(redirectUrl).toContain(String(fakeUser.currentWorkspace));
     // CURRENT behavior: the access token is NOT included in the redirect URL
     // (an earlier version of this controller put it in the query string -
@@ -207,7 +222,8 @@ describe("googleCallbackController", () => {
   });
 
   it("propagates to next() when Google token exchange fails", async () => {
-    const { UnauthorizedException } = await import("../../../src/utils/appError");
+    const { UnauthorizedException } =
+      await import("../../../src/utils/appError");
     vi.mocked(googleProvider.exchangeGoogleCodeForProfile).mockRejectedValue(
       new UnauthorizedException("Failed to authenticate with Google")
     );
@@ -237,32 +253,30 @@ describe("refreshTokenController", () => {
     expect(authService.refreshAccessTokenService).not.toHaveBeenCalled();
   });
 
-  // LOOK A HIS CASE
+  it.skip(
+    "returns a new access token WITHOUT setting a cookie, even if the service returns a newRefreshToken " +
+      "(SKIPPED: refresh-token rotation is disabled - the `if (newRefreshToken) { setRefreshTokenCookie(...) }` " +
+      "block in refreshTokenController is commented out, so a returned newRefreshToken is silently ignored today. " +
+      "Un-skip this once rotation ships.)",
+    async () => {
+      vi.mocked(authService.refreshAccessTokenService).mockResolvedValue({
+        accessToken: "new-access-token",
+        newRefreshToken: "rotated-refresh-token",
+      } as any);
 
-  // it("returns a new access token WITHOUT setting a cookie, even if the service returns a newRefreshToken", async () => {
-  //   // CURRENT behavior: refresh-token rotation is commented out in the
-  //   // controller (`// if (newRefreshToken) { setRefreshTokenCookie(...) }`).
-  //   // So even though the service CAN return a `newRefreshToken`, the
-  //   // controller currently ignores it entirely - no cookie gets set here.
-  //   // This is worth knowing: it means refresh tokens are never rotated
-  //   // today, only re-verified. If that commented block gets re-enabled
-  //   // later, this test SHOULD start failing - that's your signal to update
-  //   // it deliberately alongside the feature change, not a false alarm.
-  //   vi.mocked(authService.refreshAccessTokenService).mockResolvedValue({
-  //     accessToken: "new-access-token",
-  //     newRefreshToken: "rotated-refresh-token",
-  //   });
+      const { req, res, next } = createMockReqRes({
+        cookies: { refreshToken: "old-refresh-token" },
+      });
 
-  //   const { req, res, next } = createMockReqRes({
-  //     cookies: { refreshToken: "old-refresh-token" },
-  //   });
+      await refreshTokenController(req, res, next);
 
-  //   await refreshTokenController(req, res, next);
-
-  //   expect(res.cookie).not.toHaveBeenCalled();
-  //   expect(res.status).toHaveBeenCalledWith(200);
-  //   expect(res.json).toHaveBeenCalledWith({ access_token: "new-access-token" });
-  // });
+      expect(res.cookie).not.toHaveBeenCalled();
+      expect(res.status).toHaveBeenCalledWith(200);
+      expect(res.json).toHaveBeenCalledWith({
+        access_token: "new-access-token",
+      });
+    }
+  );
 
   it("clears the cookie and returns 401 when the service throws (invalid/expired token) - caught internally, NOT sent to next()", async () => {
     vi.mocked(authService.refreshAccessTokenService).mockRejectedValue(
@@ -270,10 +284,10 @@ describe("refreshTokenController", () => {
     );
 
     const { req, res, next } = createMockReqRes({
-        cookies: {
-          [config.COOKIE.REFRESH_TOKEN_NAME]: "expired-token",
-        },
-      });
+      cookies: {
+        [config.COOKIE.REFRESH_TOKEN_NAME]: "expired-token",
+      },
+    });
 
     await refreshTokenController(req, res, next);
 
@@ -291,21 +305,27 @@ describe("refreshTokenController", () => {
 describe("logOutController", () => {
   beforeEach(() => vi.resetAllMocks());
 
-      it("invalidates the session when the refresh token cookie verifies successfully", async () => {
+  it("invalidates the session when the refresh token cookie verifies successfully", async () => {
     vi.mocked(verifyRefreshToken).mockReturnValue({
       valid: true,
       payload: { userId: "user-1", sessionId: "session-to-kill" },
     } as any);
 
-    vi.mocked(authService.invalidateSessionService).mockResolvedValue(undefined);
+    vi.mocked(authService.invalidateSessionService).mockResolvedValue(
+      undefined
+    );
 
     const { req, res, next } = createMockReqRes({
-      cookies: { [config.COOKIE.REFRESH_TOKEN_NAME]: "irrelevant-since-verify-is-mocked" },
+      cookies: {
+        [config.COOKIE.REFRESH_TOKEN_NAME]: "irrelevant-since-verify-is-mocked",
+      },
     });
 
     await logOutController(req, res, next);
 
-    expect(authService.invalidateSessionService).toHaveBeenCalledWith("session-to-kill");
+    expect(authService.invalidateSessionService).toHaveBeenCalledWith(
+      "session-to-kill"
+    );
     expect(res.clearCookie).toHaveBeenCalledOnce();
     expect(res.status).toHaveBeenCalledWith(200);
   });
@@ -339,13 +359,17 @@ describe("logOutAllController", () => {
 
   it("invalidates all sessions for the authenticated user and clears the cookie", async () => {
     const userId = makeObjectId();
-    vi.mocked(authService.invalidateAllSessionsService).mockResolvedValue(undefined);
+    vi.mocked(authService.invalidateAllSessionsService).mockResolvedValue(
+      undefined
+    );
 
     const { req, res, next } = createMockReqRes({ user: { _id: userId } });
 
     await logOutAllController(req, res, next);
 
-    expect(authService.invalidateAllSessionsService).toHaveBeenCalledWith(userId);
+    expect(authService.invalidateAllSessionsService).toHaveBeenCalledWith(
+      userId
+    );
     expect(res.clearCookie).toHaveBeenCalledOnce();
     expect(res.status).toHaveBeenCalledWith(200);
   });
@@ -365,9 +389,15 @@ describe("getSessionsController", () => {
 
   it("maps raw session documents to the trimmed public shape", async () => {
     const fakeSessions = [
-      buildFakeSession({ _id: "s1", userAgent: "Chrome", ipAddress: "1.1.1.1" }),
+      buildFakeSession({
+        _id: "s1",
+        userAgent: "Chrome",
+        ipAddress: "1.1.1.1",
+      }),
     ];
-    vi.mocked(authService.getUserSessionsService).mockResolvedValue(fakeSessions as any);
+    vi.mocked(authService.getUserSessionsService).mockResolvedValue(
+      fakeSessions as any
+    );
 
     const { req, res, next } = createMockReqRes({ user: { _id: "user-1" } });
 

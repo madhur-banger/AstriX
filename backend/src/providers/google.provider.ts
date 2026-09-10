@@ -9,6 +9,11 @@ export interface OAuthProfile {
   email: string;
   name: string;
   picture?: string;
+  // Whether Google itself has confirmed the user controls this email
+  // address. Used to gate auto-linking to a pre-existing account (see
+  // loginOrCreateAccountService) - never trust an unverified email for
+  // that decision.
+  emailVerified: boolean;
 }
 
 interface GoogleTokenResponse {
@@ -21,6 +26,7 @@ interface GoogleTokenResponse {
 interface GoogleProfileResponse {
   sub: string;
   email: string;
+  email_verified?: boolean;
   name: string;
   picture?: string;
 }
@@ -68,8 +74,11 @@ export const exchangeGoogleCodeForProfile = async (
       email: googleProfile.email,
       name: googleProfile.name,
       picture: googleProfile.picture,
+      // Conservative default: treat a missing field as NOT verified rather
+      // than assuming Google confirmed it.
+      emailVerified: googleProfile.email_verified === true,
     };
-  } catch (error) {
+  } catch {
     throw new UnauthorizedException("Failed to authenticate with Google");
   }
 };

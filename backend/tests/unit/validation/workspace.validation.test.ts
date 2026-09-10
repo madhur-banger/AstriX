@@ -65,7 +65,9 @@ describe("nameSchema", () => {
 
 describe("descriptionSchema", () => {
   it("accepts a normal string", () => {
-    expect(descriptionSchema.parse("Some description")).toBe("Some description");
+    expect(descriptionSchema.parse("Some description")).toBe(
+      "Some description"
+    );
   });
 
   it("accepts undefined, because the schema is .optional()", () => {
@@ -88,42 +90,58 @@ describe("workspaceIdSchema", () => {
     expect(() => workspaceIdSchema.parse("")).toThrow();
   });
 
-  // NOTE: this schema does NOT check that the string is a valid MongoDB
-  // ObjectId format (24 hex chars) - it only checks "is it a non-empty
-  // string". That means garbage like "not-a-real-id" currently PASSES this
-  // schema and would only fail later when Mongoose tries to cast it.
-  // This test documents that current (possibly surprising) behavior.
-  it("currently accepts strings that are NOT valid ObjectId format (documents existing gap)", () => {
-    expect(() => workspaceIdSchema.parse("definitely-not-an-object-id")).not.toThrow();
+  // A malformed id (not a valid ObjectId) reaching Mongoose triggers a
+  // CastError; validation catches it up front instead of letting a
+  // bad-shaped string reach a query.
+  it("rejects strings that are NOT valid ObjectId format", () => {
+    expect(() =>
+      workspaceIdSchema.parse("definitely-not-an-object-id")
+    ).toThrow();
   });
 });
 
 describe("changeRoleSchema", () => {
   it("accepts a valid roleId + memberId pair", () => {
-    const input = { roleId: "role-123", memberId: "member-456" };
+    const input = {
+      roleId: "64f1a2b3c4d5e6f7a8b9c0d1",
+      memberId: "64f1a2b3c4d5e6f7a8b9c0d2",
+    };
     const result = changeRoleSchema.parse(input);
     expect(result).toEqual(input);
   });
 
   it("rejects a payload missing roleId", () => {
-    expect(() => changeRoleSchema.parse({ memberId: "member-456" })).toThrow();
+    expect(() =>
+      changeRoleSchema.parse({ memberId: "64f1a2b3c4d5e6f7a8b9c0d2" })
+    ).toThrow();
   });
 
   it("rejects a payload missing memberId", () => {
-    expect(() => changeRoleSchema.parse({ roleId: "role-123" })).toThrow();
+    expect(() =>
+      changeRoleSchema.parse({ roleId: "64f1a2b3c4d5e6f7a8b9c0d1" })
+    ).toThrow();
   });
 
-  it("rejects extra unexpected fields being silently required as empty strings", () => {
+  it("rejects roleId/memberId that are not valid ObjectId format", () => {
+    expect(() =>
+      changeRoleSchema.parse({ roleId: "role-123", memberId: "member-456" })
+    ).toThrow();
+  });
+
+  it("rejects extra unexpected fields being silently accepted as empty strings", () => {
     // .object() by default in zod STRIPS unknown keys rather than rejecting them
     // (unless .strict() was used). This test documents that current behavior -
     // if you later add .strict() to the schema, this test should start failing,
     // which is a good signal to come update it deliberately.
     const result = changeRoleSchema.parse({
-      roleId: "r1",
-      memberId: "m1",
+      roleId: "64f1a2b3c4d5e6f7a8b9c0d1",
+      memberId: "64f1a2b3c4d5e6f7a8b9c0d2",
       hacker: "ignored",
     } as any);
-    expect(result).toEqual({ roleId: "r1", memberId: "m1" });
+    expect(result).toEqual({
+      roleId: "64f1a2b3c4d5e6f7a8b9c0d1",
+      memberId: "64f1a2b3c4d5e6f7a8b9c0d2",
+    });
   });
 });
 
@@ -143,13 +161,17 @@ describe("createWorkspaceSchema", () => {
   });
 
   it("rejects a payload with no name at all", () => {
-    expect(() => createWorkspaceSchema.parse({ description: "only desc" })).toThrow();
+    expect(() =>
+      createWorkspaceSchema.parse({ description: "only desc" })
+    ).toThrow();
   });
 });
 
 describe("updateWorkspaceSchema", () => {
   it("is structurally identical to createWorkspaceSchema (name required, description optional)", () => {
-    expect(() => updateWorkspaceSchema.parse({ name: "Renamed" })).not.toThrow();
+    expect(() =>
+      updateWorkspaceSchema.parse({ name: "Renamed" })
+    ).not.toThrow();
     expect(() => updateWorkspaceSchema.parse({})).toThrow();
   });
 });

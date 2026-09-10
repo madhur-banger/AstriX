@@ -35,5 +35,10 @@ const memberSchema = new Schema<MemberDocument>(
   }
 );
 
+// A user can only hold one membership per workspace. Without this, a race
+// between two concurrent "join workspace" requests (check-then-insert, no
+// natural atomicity) can create duplicate Member rows for the same pair.
+memberSchema.index({ userId: 1, workspaceId: 1 }, { unique: true });
+
 const MemberModel = mongoose.model<MemberDocument>("Member", memberSchema);
 export default MemberModel;

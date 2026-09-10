@@ -7,10 +7,11 @@ import { RolePermissions } from "../utils/role-permission";
 const seedRoles = async () => {
   console.log("Seeding roles started...");
 
-  try {
-    await connectDatabase();
+  await connectDatabase();
 
-    const session = await mongoose.startSession();
+  const session = await mongoose.startSession();
+
+  try {
     session.startTransaction();
 
     console.log("Clearing existing roles...");
@@ -38,16 +39,33 @@ const seedRoles = async () => {
 
     await session.commitTransaction();
     console.log("Transaction committed.");
-
-    session.endSession();
-    console.log("Session ended.");
-
     console.log("Seeding completed successfully.");
   } catch (error) {
-    console.error("Error during seeding:", error);
+    // Without this the transaction stayed open on failure, holding locks
+    // until the server timed it out. Same try/catch/finally shape as the
+    // transactional services (see auth.service.ts / workspace.service.ts).
+    await session.abortTransaction();
+    throw error;
+  } finally {
+    session.endSession();
   }
 };
 
-seedRoles().catch((error) =>
-  console.error("Error running seed script:", error)
-);
+// This is a one-shot script, not a server: it has to close its own Mongo
+// connection and exit, otherwise the open connection keeps the event loop
+// alive and `npm run seed` hangs forever instead of returning to the shell.
+const shutdown = async (exitCode: number) => {
+  try {
+    await mongoose.disconnect();
+  } catch (error) {
+    console.error("Error disconnecting from Mongo:", error);
+  }
+  process.exit(exitCode);
+};
+
+seedRoles()
+  .then(() => shutdown(0))
+  .catch((error) => {
+    console.error("Error running seed script:", error);
+    return shutdown(1);
+  });

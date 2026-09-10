@@ -1,7 +1,15 @@
 import { Request, Response } from "express";
 import { asyncHandler } from "../middlewares/asyncHandler.middleware";
 import { config } from "../config/app.config";
-import { registerSchema, loginSchema } from "../validation/auth.validation";
+import {
+  registerSchema,
+  loginSchema,
+  forgotPasswordSchema,
+  resetPasswordSchema,
+  verifyEmailSchema,
+  changePasswordSchema,
+  sessionIdSchema,
+} from "../validation/auth.validation";
 import { HTTPSTATUS } from "../config/http.config";
 import {
   registerUserService,
@@ -12,10 +20,17 @@ import {
   getUserSessionsService,
   verifyUserService,
   loginOrCreateAccountService,
+  requestPasswordResetService,
+  resetPasswordService,
+  requestEmailVerificationService,
+  verifyEmailService,
+  changePasswordService,
+  revokeSessionService,
 } from "../services/auth.service";
 import { BadRequestException, UnauthorizedException } from "../utils/appError";
 import { exchangeGoogleCodeForProfile } from "../providers/google.provider";
 import { verifyRefreshToken } from "../utils/jwt";
+import { logger } from "../utils/logger";
 
 const setRefreshTokenCookie = (res: Response, refreshToken: string): void => {
   res.cookie(config.COOKIE.REFRESH_TOKEN_NAME, refreshToken, {
@@ -105,9 +120,10 @@ export const googleCallbackController = asyncHandler(
       email: profile.email,
       displayName: profile.name,
       picture: profile.picture,
+      emailVerified: profile.emailVerified,
     });
 
-    const { accessToken, refreshToken } = await createSessionService({
+    const { refreshToken } = await createSessionService({
       userId: user._id,
       userAgent: req.headers["user-agent"],
       ipAddress: req.ip,
@@ -135,19 +151,20 @@ export const refreshTokenController = asyncHandler(
     }
 
     try {
-      const { accessToken} = await refreshAccessTokenService(
-        refreshToken
-      );
-      // New Refresh token for further security and hardening of app
-      // if (newRefreshToken) {
-      //   setRefreshTokenCookie(res, newRefreshToken);
-      // }
+      const { accessToken, refreshToken: rotatedRefreshToken } =
+        await refreshAccessTokenService(refreshToken);
+
+      // Rotation: the token just spent is now dead server-side, so the
+      // client must be handed its replacement in the same response or it
+      // would be locked out on its next refresh.
+      setRefreshTokenCookie(res, rotatedRefreshToken);
 
       return res.status(HTTPSTATUS.OK).json({ access_token: accessToken });
-    } catch (error: any) {
+    } catch (error) {
       clearRefreshTokenCookie(res);
       return res.status(HTTPSTATUS.UNAUTHORIZED).json({
-        message: error.message || "Invalid refresh token",
+        message:
+          error instanceof Error ? error.message : "Invalid refresh token",
       });
     }
   }
@@ -168,7 +185,7 @@ export const logOutController = asyncHandler(
           await invalidateSessionService(result.payload.sessionId);
         }
       } catch (error) {
-        console.error("Logout error:", error);
+        (req.log ?? logger).error({ err: error }, "Logout error");
       }
     }
 
@@ -221,6 +238,130 @@ export const getSessionsController = asyncHandler(
         ipAddress: s.ipAddress,
         createdAt: s.createdAt,
       })),
+    });
+  }
+);
+
+// ============================================
+// PASSWORD RESET
+// ============================================
+
+export const forgotPasswordController = asyncHandler(
+  async (req: Request, res: Response) => {
+    const { email } = forgotPasswordSchema.parse(req.body);
+
+    await requestPasswordResetService(email);
+
+    // Always the same response, whether or not the email belongs to an
+    // account - requestPasswordResetService already no-ops for an unknown
+    // email, so this line is reached (and this exact message returned)
+    // either way.
+    return res.status(HTTPSTATUS.OK).json({
+      message:
+        "If an account with that email exists, a password reset link has been sent.",
+    });
+  }
+);
+
+export const resetPasswordController = asyncHandler(
+  async (req: Request, res: Response) => {
+    const { token, password } = resetPasswordSchema.parse(req.body);
+
+    await resetPasswordService(token, password);
+
+    return res.status(HTTPSTATUS.OK).json({
+      message:
+        "Password reset successfully. Please log in with your new password.",
+    });
+  }
+);
+
+// ============================================
+// EMAIL VERIFICATION (advisory only - never blocks login)
+// ============================================
+
+export const verifyEmailController = asyncHandler(
+  async (req: Request, res: Response) => {
+    const { token } = verifyEmailSchema.parse(req.body);
+
+    await verifyEmailService(token);
+
+    return res.status(HTTPSTATUS.OK).json({
+      message: "Email verified successfully.",
+    });
+  }
+);
+
+export const resendVerificationEmailController = asyncHandler(
+  async (req: Request, res: Response) => {
+    const user = req.user;
+
+    if (!user) {
+      return res
+        .status(HTTPSTATUS.UNAUTHORIZED)
+        .json({ message: "Not authenticated" });
+    }
+
+    await requestEmailVerificationService(user._id.toString());
+
+    return res.status(HTTPSTATUS.OK).json({
+      message: "Verification email sent.",
+    });
+  }
+);
+
+// ============================================
+// CHANGE PASSWORD (authenticated)
+// ============================================
+
+export const changePasswordController = asyncHandler(
+  async (req: Request, res: Response) => {
+    const user = req.user;
+
+    if (!user) {
+      return res
+        .status(HTTPSTATUS.UNAUTHORIZED)
+        .json({ message: "Not authenticated" });
+    }
+
+    const { currentPassword, newPassword } = changePasswordSchema.parse(
+      req.body
+    );
+
+    await changePasswordService(
+      user._id.toString(),
+      req.session?._id?.toString(),
+      currentPassword,
+      newPassword
+    );
+
+    return res.status(HTTPSTATUS.OK).json({
+      message:
+        "Password changed successfully. You've been logged out of all other devices.",
+    });
+  }
+);
+
+// ============================================
+// SESSION REVOCATION (single device)
+// ============================================
+
+export const revokeSessionController = asyncHandler(
+  async (req: Request, res: Response) => {
+    const user = req.user;
+
+    if (!user) {
+      return res
+        .status(HTTPSTATUS.UNAUTHORIZED)
+        .json({ message: "Not authenticated" });
+    }
+
+    const sessionId = sessionIdSchema.parse(req.params.id);
+
+    await revokeSessionService(user._id.toString(), sessionId);
+
+    return res.status(HTTPSTATUS.OK).json({
+      message: "Session revoked successfully.",
     });
   }
 );

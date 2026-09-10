@@ -4,6 +4,7 @@ import { asyncHandler } from "../middlewares/asyncHandler.middleware";
 import {
   changeRoleSchema,
   createWorkspaceSchema,
+  userIdSchema,
   workspaceIdSchema,
 } from "../validation/workspace.validation";
 import { HTTPSTATUS } from "../config/http.config";
@@ -15,6 +16,8 @@ import {
   getWorkspaceAnalyticsService,
   getWorkspaceByIdService,
   getWorkspaceMembersService,
+  removeMemberFromWorkspaceService,
+  resetWorkspaceInviteCodeService,
   updateWorkspaceByIdService,
 } from "../services/workspace.service";
 import { getMemberRoleInWorkspace } from "../services/member.service";
@@ -26,7 +29,7 @@ export const createWorkspaceController = asyncHandler(
   async (req: Request, res: Response) => {
     const body = createWorkspaceSchema.parse(req.body);
 
-    const userId = req.user?._id;
+    const userId = req.user!._id.toString();
     const { workspace } = await createWorkspaceService(userId, body);
 
     return res.status(HTTPSTATUS.CREATED).json({
@@ -40,7 +43,7 @@ export const createWorkspaceController = asyncHandler(
 
 export const getAllWorkspacesUserIsMemberController = asyncHandler(
   async (req: Request, res: Response) => {
-    const userId = req.user?._id;
+    const userId = req.user!._id.toString();
 
     const { workspaces } = await getAllWorkspacesUserIsMemberService(userId);
 
@@ -54,7 +57,7 @@ export const getAllWorkspacesUserIsMemberController = asyncHandler(
 export const getWorkspaceByIdController = asyncHandler(
   async (req: Request, res: Response) => {
     const workspaceId = workspaceIdSchema.parse(req.params.id);
-    const userId = req.user?._id;
+    const userId = req.user!._id.toString();
 
     await getMemberRoleInWorkspace(userId, workspaceId);
 
@@ -70,7 +73,7 @@ export const getWorkspaceByIdController = asyncHandler(
 export const getWorkspaceMembersController = asyncHandler(
   async (req: Request, res: Response) => {
     const workspaceId = workspaceIdSchema.parse(req.params.id);
-    const userId = req.user?._id;
+    const userId = req.user!._id.toString();
 
     const { role } = await getMemberRoleInWorkspace(userId, workspaceId);
     roleGuard(role, [Permissions.VIEW_ONLY]);
@@ -88,7 +91,7 @@ export const getWorkspaceMembersController = asyncHandler(
 export const getWorkspaceAnalyticsController = asyncHandler(
   async (req: Request, res: Response) => {
     const workspaceId = workspaceIdSchema.parse(req.params.id);
-    const userId = req.user?._id;
+    const userId = req.user!._id.toString();
 
     const { role } = await getMemberRoleInWorkspace(userId, workspaceId);
     roleGuard(role, [Permissions.VIEW_ONLY]);
@@ -105,16 +108,18 @@ export const getWorkspaceAnalyticsController = asyncHandler(
 export const changeWorkspaceMemberRoleController = asyncHandler(
   async (req: Request, res: Response) => {
     const workspaceId = workspaceIdSchema.parse(req.params.id);
-    const { memberId, roleId } = changeRoleSchema.parse(req.body);
+    // `memberId` is the request-body key (see changeRoleSchema); the value
+    // it carries is the targeted user's id.
+    const { memberId: targetUserId, roleId } = changeRoleSchema.parse(req.body);
 
-    const userId = req.user?._id;
+    const userId = req.user!._id.toString();
 
     const { role } = await getMemberRoleInWorkspace(userId, workspaceId);
     roleGuard(role, [Permissions.CHANGE_MEMBER_ROLE]);
 
     const { member } = await changeMemberRoleService(
       workspaceId,
-      memberId,
+      targetUserId,
       roleId
     );
 
@@ -130,7 +135,7 @@ export const updateWorkspaceByIdController = asyncHandler(
     const workspaceId = workspaceIdSchema.parse(req.params.id);
     const { name, description } = updateWorkspaceSchema.parse(req.body);
 
-    const userId = req.user?._id;
+    const userId = req.user!._id.toString();
 
     const { role } = await getMemberRoleInWorkspace(userId, workspaceId);
     roleGuard(role, [Permissions.EDIT_WORKSPACE]);
@@ -152,7 +157,7 @@ export const deleteWorkspaceByIdController = asyncHandler(
   async (req: Request, res: Response) => {
     const workspaceId = workspaceIdSchema.parse(req.params.id);
 
-    const userId = req.user?._id;
+    const userId = req.user!._id.toString();
 
     const { role } = await getMemberRoleInWorkspace(userId, workspaceId);
     roleGuard(role, [Permissions.DELETE_WORKSPACE]);
@@ -165,6 +170,59 @@ export const deleteWorkspaceByIdController = asyncHandler(
     return res.status(HTTPSTATUS.OK).json({
       message: "Workspace deleted successfully",
       currentWorkspace,
+    });
+  }
+);
+
+export const removeWorkspaceMemberController = asyncHandler(
+  async (req: Request, res: Response) => {
+    const workspaceId = workspaceIdSchema.parse(req.params.id);
+    const targetUserId = userIdSchema.parse(req.params.userId);
+
+    const userId = req.user!._id.toString();
+
+    const { role } = await getMemberRoleInWorkspace(userId, workspaceId);
+    roleGuard(role, [Permissions.REMOVE_MEMBER]);
+
+    await removeMemberFromWorkspaceService(workspaceId, targetUserId);
+
+    return res.status(HTTPSTATUS.OK).json({
+      message: "Member removed successfully",
+    });
+  }
+);
+
+export const leaveWorkspaceController = asyncHandler(
+  async (req: Request, res: Response) => {
+    const workspaceId = workspaceIdSchema.parse(req.params.id);
+    const userId = req.user!._id.toString();
+
+    // Confirms the caller is actually a member (and gets their role, unused
+    // here) before letting them remove themselves - leaving isn't gated by
+    // a specific permission the way removing someone ELSE is.
+    await getMemberRoleInWorkspace(userId, workspaceId);
+
+    await removeMemberFromWorkspaceService(workspaceId, userId);
+
+    return res.status(HTTPSTATUS.OK).json({
+      message: "Left the workspace successfully",
+    });
+  }
+);
+
+export const resetWorkspaceInviteCodeController = asyncHandler(
+  async (req: Request, res: Response) => {
+    const workspaceId = workspaceIdSchema.parse(req.params.id);
+    const userId = req.user!._id.toString();
+
+    const { role } = await getMemberRoleInWorkspace(userId, workspaceId);
+    roleGuard(role, [Permissions.MANAGE_WORKSPACE_SETTINGS]);
+
+    const { workspace } = await resetWorkspaceInviteCodeService(workspaceId);
+
+    return res.status(HTTPSTATUS.OK).json({
+      message: "Invite code reset successfully",
+      workspace,
     });
   }
 );

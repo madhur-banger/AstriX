@@ -119,6 +119,11 @@ describe("auth.service (integration - real in-memory MongoDB)", () => {
     const account = await AccountModel.findOne({ userId });
     expect(account).not.toBeNull();
     expect(account!.provider).toBe("EMAIL"); // adjust to match your ProviderEnum.EMAIL value if different
+
+    // account.model.ts declares a toJSON.transform that strips refreshToken -
+    // this only fires through real Mongoose serialization, not a mocked doc,
+    // so it belongs here rather than in the mocked unit test file.
+    expect(account!.toJSON()).not.toHaveProperty("refreshToken");
   });
 
   it("OAuth: a returning Google identity logs in without creating a second workspace", async () => {
@@ -165,6 +170,7 @@ describe("auth.service (integration - real in-memory MongoDB)", () => {
       providerId: "hybrid-google-sub",
       displayName: "Hybrid User",
       email: "hybrid-login@example.com",
+      emailVerified: true,
     });
 
     const accountsForUser = await AccountModel.find({ userId });

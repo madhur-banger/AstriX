@@ -61,13 +61,29 @@ export const joinWorkspaceByInviteService = async (
     throw new NotFoundException("Role not found");
   }
 
-  // Add user to workspace as a member
-  const newMember = new MemberModel({
-    userId,
-    workspaceId: workspace._id,
-    role: role._id,
-  });
-  await newMember.save();
+  // Add user to workspace as a member. The pre-check above isn't atomic
+  // with this insert - two concurrent join requests for the same user can
+  // both pass it before either save() lands. The unique (userId, workspaceId)
+  // index on MemberModel is the real guard; if it fires here, it means we
+  // lost that race, and the outcome is the same one the pre-check above
+  // reports, so surface it identically rather than leaking a raw duplicate
+  // key error.
+  try {
+    const newMember = new MemberModel({
+      userId,
+      workspaceId: workspace._id,
+      role: role._id,
+    });
+    await newMember.save();
+  } catch (error) {
+    const code = (error as { code?: number } | undefined)?.code;
+    if (code === 11000) {
+      throw new BadRequestException(
+        "You are already a member of this workspace"
+      );
+    }
+    throw error;
+  }
 
   return { workspaceId: workspace._id, role: role.name };
 };

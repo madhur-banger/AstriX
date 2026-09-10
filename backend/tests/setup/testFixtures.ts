@@ -20,7 +20,6 @@
 
 import mongoose from "mongoose";
 
-
 /**
  * Wraps an arrow function so it becomes safe to use as a mock for a
  * Mongoose model CONSTRUCTOR (anything called with `new Model(...)`).
@@ -77,7 +76,9 @@ export function buildFakeUser(overrides: Partial<Record<string, any>> = {}) {
 // Fake WORKSPACE
 // Matches src/models/workspace.model.ts: name, description, owner, inviteCode.
 // ---------------------------------------------------------------------------
-export function buildFakeWorkspace(overrides: Partial<Record<string, any>> = {}) {
+export function buildFakeWorkspace(
+  overrides: Partial<Record<string, any>> = {}
+) {
   return {
     _id: makeObjectId(),
     name: "Test Workspace",
@@ -148,20 +149,41 @@ export function buildFakeSession(overrides: Partial<Record<string, any>> = {}) {
   };
 }
 
-/**
- * TEMPLATE FOR YOUR OWN FEATURES:
- * When you build out tasks/projects, add functions here like:
- *
- * export function buildFakeTask(overrides = {}) {
- *   return {
- *     _id: makeObjectId(),
- *     title: "Test Task",
- *     status: "TODO",
- *     workspace: makeObjectId(),
- *     project: makeObjectId(),
- *     assignedTo: makeObjectId(),
- *     dueDate: new Date(),
- *     ...overrides,
- *   };
- * }
- */
+// ---------------------------------------------------------------------------
+// Fake PROJECT (project.model.ts)
+// Matches src/models/project.model.ts: name, description, emoji, workspace, createdBy.
+// ---------------------------------------------------------------------------
+export function buildFakeProject(overrides: Partial<Record<string, any>> = {}) {
+  return {
+    _id: makeObjectId(),
+    name: "Test Project",
+    description: "A project created for testing",
+    emoji: "📊",
+    workspace: makeObjectId(),
+    createdBy: makeObjectId(),
+    ...overrides,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Fake TASK (task.model.ts)
+// Matches src/models/task.model.ts: taskCode, title, description, project,
+// workspace, status (default TODO), priority (default MEDIUM), assignedTo,
+// createdBy, dueDate.
+// ---------------------------------------------------------------------------
+export function buildFakeTask(overrides: Partial<Record<string, any>> = {}) {
+  return {
+    _id: makeObjectId(),
+    taskCode: `task-${Math.random().toString(36).slice(2, 5)}`,
+    title: "Test Task",
+    description: "A task created for testing",
+    status: "TODO",
+    priority: "MEDIUM",
+    workspace: makeObjectId(),
+    project: makeObjectId(),
+    assignedTo: null,
+    createdBy: makeObjectId(),
+    dueDate: null,
+    ...overrides,
+  };
+}

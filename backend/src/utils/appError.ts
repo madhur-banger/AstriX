@@ -1,4 +1,4 @@
- import { HTTPSTATUS, HttpStatusCodeType } from "../config/http.config";
+import { HTTPSTATUS, HttpStatusCodeType } from "../config/http.config";
 import { ErrorCodeEnum, ErrorCodeEnumType } from "../enums/error-code.enum";
 
 export class AppError extends Error {
@@ -65,6 +65,19 @@ export class UnauthorizedException extends AppError {
     super(
       message,
       HTTPSTATUS.UNAUTHORIZED,
+      errorCode || ErrorCodeEnum.ACCESS_UNAUTHORIZED
+    );
+  }
+}
+
+// Distinct from UnauthorizedException (401 - "who are you"): this is for a
+// caller who IS authenticated and known, but isn't allowed to perform the
+// specific action (403 - "I know who you are, you can't do this").
+export class ForbiddenException extends AppError {
+  constructor(message = "Forbidden", errorCode?: ErrorCodeEnumType) {
+    super(
+      message,
+      HTTPSTATUS.FORBIDDEN,
       errorCode || ErrorCodeEnum.ACCESS_UNAUTHORIZED
     );
   }
