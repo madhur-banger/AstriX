@@ -11,10 +11,10 @@ type PermissionsGuardProps = {
 const PermissionsGuard: React.FC<PermissionsGuardProps> = ({
   requiredPermission,
   showMessage = false,
-  children
+  children,
 }) => {
   const { hasPermission } = useAuthContext();
-  if(!hasPermission(requiredPermission)){
+  if (!hasPermission(requiredPermission)) {
     return (
       showMessage && (
         <div
@@ -22,9 +22,9 @@ const PermissionsGuard: React.FC<PermissionsGuardProps> = ({
           text-sm pt-3
           italic
           w-full
-          text-muted-foreground" 
-          >
-            You do not have the permission to view this.
+          text-muted-foreground"
+        >
+          You do not have the permission to view this.
         </div>
       )
     );
@@ -32,4 +32,4 @@ const PermissionsGuard: React.FC<PermissionsGuardProps> = ({
   return <>{children}</>;
 };
 
-export default PermissionsGuard; 
+export default PermissionsGuard;

@@ -1,11 +1,10 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
 import { useParams } from "react-router-dom";
 import CreateTaskDialog from "../task/create-task-dialog";
 import EditProjectDialog from "./edit-project-dialog";
 import useWorkspaceId from "@/hooks/use-workspace-id";
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { getProjectByIdQueryFn } from "@/lib/api";
-import PermissionsGuard from "@/components/resuable/permission-guard";
+import PermissionsGuard from "@/components/reusable/permission-guard";
 import { Permissions } from "@/constant";
 
 const ProjectHeader = () => {

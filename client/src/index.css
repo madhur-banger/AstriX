@@ -20,7 +20,9 @@ em-emoji-picker {
   overflow-y: auto;
   scrollbar-width: thin; /* Firefox */
   scrollbar-color: rgba(176, 174, 174, 0.7) #ddd; /* Firefox */
-  transition: scrollbar-color 0.3s ease, scrollbar-width 0.3s ease;
+  transition:
+    scrollbar-color 0.3s ease,
+    scrollbar-width 0.3s ease;
 }
 
 .scrollbar::-webkit-scrollbar {

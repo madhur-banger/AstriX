@@ -1,9 +1,8 @@
 // client/src/lib/axios-client.ts
 import { useStoreBase } from "@/store/store";
+import { baseURL } from "@/lib/base-url";
 import { CustomError } from "@/types/custom-error.type";
 import axios, { AxiosError, InternalAxiosRequestConfig } from "axios";
-
-const baseURL = import.meta.env.VITE_API_BASE_URL;
 
 const options = {
   baseURL,
@@ -20,10 +19,10 @@ const API = axios.create(options);
 let isRefreshing = false;
 let failedQueue: Array<{
   resolve: (token: string) => void;
-  reject: (error: any) => void;
+  reject: (error: unknown) => void;
 }> = [];
 
-const processQueue = (error: any, token: string | null = null) => {
+const processQueue = (error: unknown, token: string | null = null) => {
   failedQueue.forEach((promise) => {
     if (error) {
       promise.reject(error);
@@ -58,7 +57,7 @@ API.interceptors.response.use(
     };
 
     // Build custom error
-    const data = error.response?.data as any;
+    const data = error.response?.data as { errorCode?: string } | undefined;
     const customError: CustomError = {
       ...error,
       errorCode: data?.errorCode || "UNKNOWN_ERROR",
@@ -89,7 +88,7 @@ API.interceptors.response.use(
             originalRequest.headers.Authorization = `Bearer ${token}`;
             resolve(API(originalRequest));
           },
-          reject: (err: any) => reject(err),
+          reject: (err: unknown) => reject(err),
         });
       });
     }
@@ -122,7 +121,10 @@ API.interceptors.response.use(
 
       // Redirect to login (unless already on auth pages)
       const currentPath = window.location.pathname;
-      if (!currentPath.includes("/sign-in") && !currentPath.includes("/sign-up")) {
+      if (
+        !currentPath.includes("/sign-in") &&
+        !currentPath.includes("/sign-up")
+      ) {
         window.location.href = "/sign-in";
       }
 

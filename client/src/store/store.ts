@@ -10,14 +10,14 @@ import createSelectors from "./selector";
 
 /**
  * SECURITY NOTE: NO PERSISTENCE!
- * 
+ *
  * We deliberately DO NOT persist the access token to localStorage/sessionStorage.
- * 
+ *
  * Why?
  * 1. localStorage/sessionStorage can be accessed by JavaScript
  * 2. XSS attacks can steal tokens from storage
  * 3. Access tokens should be short-lived and refreshable
- * 
+ *
  * How does this work?
  * - Access token lives in memory (Zustand state)
  * - When user refreshes page, access token is gone
@@ -50,16 +50,16 @@ interface User {
 type AuthState = {
   // Access token - stored in memory only
   accessToken: string | null;
-  
+
   // User data - also in memory
   user: User | null;
-  
+
   // Loading state for initial auth check
   isAuthChecking: boolean;
-  
+
   // Whether we've done initial auth check
   isInitialized: boolean;
-  
+
   // Actions
   setAccessToken: (token: string) => void;
   setUser: (user: User) => void;

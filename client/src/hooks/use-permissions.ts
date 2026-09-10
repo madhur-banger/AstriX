@@ -1,25 +1,22 @@
 import { PermissionType } from "@/constant";
 import { UserType, WorkspaceWithMembersType } from "@/types/api.type";
-import { useEffect, useMemo, useState } from "react";
+import { useMemo } from "react";
 
+// Derived, never stored: switching workspaces recomputes this on the same
+// render as the new workspace arrives, so the previous workspace's
+// permissions can never leak into the new one.
 const usePermissions = (
-    user: UserType | undefined,
-    workspace: WorkspaceWithMembersType | undefined
-) => {
-    const [permissions, setPermissions] = useState<PermissionType[]>([]);
+  user: UserType | undefined,
+  workspace: WorkspaceWithMembersType | undefined
+): PermissionType[] =>
+  useMemo(() => {
+    if (!user || !workspace) return [];
 
-    useEffect(() => {
-        if(user && workspace){
-            const member = workspace.members.find(
-                (member) => member.userId === user._id
-            );
-            if(member){
-                setPermissions(member.role.permissions || [])
-            }
-        }
-    }, [user, workspace]);
+    const member = workspace.members?.find(
+      (member) => member.userId === user._id
+    );
 
-    return useMemo(() => permissions, [permissions]);
-};
+    return member?.role?.permissions ?? [];
+  }, [user, workspace]);
 
 export default usePermissions;

@@ -6,14 +6,24 @@ import {
   AllTaskPayloadType,
   AllTaskResponseType,
   AnalyticsResponseType,
+  ChangePasswordType,
   ChangeWorkspaceMemberRoleType,
   CreateProjectPayloadType,
   CreateTaskPayloadType,
   CreateWorkspaceResponseType,
+  DeleteAccountType,
   EditProjectPayloadType,
   EditTaskPayloadType,
+  ForgotPasswordType,
+  GetSessionsResponseType,
+  MessageResponseType,
   ProjectByIdPayloadType,
   ProjectResponseType,
+  RemoveWorkspaceMemberType,
+  ResetInviteCodeResponseType,
+  ResetPasswordType,
+  UpdateProfileType,
+  VerifyEmailType,
 } from "../types/api.type";
 import {
   AllWorkspaceResponseType,
@@ -36,14 +46,61 @@ export const loginMutationFn = async (
 export const registerMutationFn = async (data: registerType) =>
   await API.post("/auth/register", data);
 
-export const refreshTokenFn = async (): Promise<{ access_token: string }> => {
-  const response = await API.post("/auth/refresh");
-  return response.data;
-};
-
 // Update logout to return proper type
 export const logoutMutationFn = async (): Promise<{ message: string }> => {
   const response = await API.post("/auth/logout");
+  return response.data;
+};
+
+export const logoutAllMutationFn = async (): Promise<MessageResponseType> => {
+  const response = await API.post("/auth/logout-all");
+  return response.data;
+};
+
+export const forgotPasswordMutationFn = async (
+  data: ForgotPasswordType
+): Promise<MessageResponseType> => {
+  const response = await API.post("/auth/forgot-password", data);
+  return response.data;
+};
+
+export const resetPasswordMutationFn = async (
+  data: ResetPasswordType
+): Promise<MessageResponseType> => {
+  const response = await API.post("/auth/reset-password", data);
+  return response.data;
+};
+
+export const verifyEmailMutationFn = async (
+  data: VerifyEmailType
+): Promise<MessageResponseType> => {
+  const response = await API.post("/auth/verify-email", data);
+  return response.data;
+};
+
+export const resendVerificationEmailMutationFn =
+  async (): Promise<MessageResponseType> => {
+    const response = await API.post("/auth/resend-verification");
+    return response.data;
+  };
+
+export const changePasswordMutationFn = async (
+  data: ChangePasswordType
+): Promise<MessageResponseType> => {
+  const response = await API.post("/auth/change-password", data);
+  return response.data;
+};
+
+export const getSessionsQueryFn =
+  async (): Promise<GetSessionsResponseType> => {
+    const response = await API.get("/auth/sessions");
+    return response.data;
+  };
+
+export const revokeSessionMutationFn = async (
+  sessionId: string
+): Promise<MessageResponseType> => {
+  const response = await API.delete(`/auth/sessions/${sessionId}`);
   return response.data;
 };
 
@@ -53,7 +110,19 @@ export const getCurrentUserQueryFn =
     return response.data;
   };
 
+export const updateProfileMutationFn = async (
+  data: UpdateProfileType
+): Promise<CurrentUserResponseType> => {
+  const response = await API.patch("/user/current", data);
+  return response.data;
+};
 
+export const deleteAccountMutationFn = async (
+  data: DeleteAccountType
+): Promise<MessageResponseType> => {
+  const response = await API.delete("/user/current", { data });
+  return response.data;
+};
 
 //********* WORKSPACE ****************
 //************* */
@@ -118,6 +187,30 @@ export const deleteWorkspaceMutationFn = async (
   currentWorkspace: string;
 }> => {
   const response = await API.delete(`/workspace/delete/${workspaceId}`);
+  return response.data;
+};
+
+export const removeWorkspaceMemberMutationFn = async ({
+  workspaceId,
+  memberId,
+}: RemoveWorkspaceMemberType): Promise<MessageResponseType> => {
+  const response = await API.delete(
+    `/workspace/${workspaceId}/member/${memberId}`
+  );
+  return response.data;
+};
+
+export const leaveWorkspaceMutationFn = async (
+  workspaceId: string
+): Promise<MessageResponseType> => {
+  const response = await API.post(`/workspace/${workspaceId}/leave`);
+  return response.data;
+};
+
+export const resetInviteCodeMutationFn = async (
+  workspaceId: string
+): Promise<ResetInviteCodeResponseType> => {
+  const response = await API.post(`/workspace/${workspaceId}/invite/reset`);
   return response.data;
 };
 
@@ -207,7 +300,7 @@ export const deleteProjectMutationFn = async ({
 export const createTaskMutationFn = async ({
   workspaceId,
   projectId,
-  data
+  data,
 }: CreateTaskPayloadType) => {
   const response = await API.post(
     `/task/project/${projectId}/workspace/${workspaceId}/create`,
@@ -216,19 +309,18 @@ export const createTaskMutationFn = async ({
   return response.data;
 };
 
-
 export const editTaskMutationFn = async ({
   taskId,
   workspaceId,
   projectId,
-  data
+  data,
 }: EditTaskPayloadType) => {
   const response = await API.put(
     `/task/${taskId}/project/${projectId}/workspace/${workspaceId}/update/`,
     data
   );
   return response.data;
-}
+};
 
 export const getAllTasksQueryFn = async ({
   workspaceId,
@@ -239,7 +331,7 @@ export const getAllTasksQueryFn = async ({
   status,
   dueDate,
   pageNumber,
-  pageSize
+  pageSize,
 }: AllTaskPayloadType): Promise<AllTaskResponseType> => {
   const baseUrl = `/task/workspace/${workspaceId}/all`;
 
@@ -260,15 +352,15 @@ export const getAllTasksQueryFn = async ({
 
 export const deleteTaskMutationFn = async ({
   workspaceId,
-  taskId
+  taskId,
 }: {
   workspaceId: string;
   taskId: string;
 }): Promise<{
-  message: string
+  message: string;
 }> => {
   const response = await API.delete(
-    `task/${taskId}/workspace/${workspaceId}/delete`
+    `/task/${taskId}/workspace/${workspaceId}/delete`
   );
   return response.data;
 };

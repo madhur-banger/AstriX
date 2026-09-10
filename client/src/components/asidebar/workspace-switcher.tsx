@@ -37,29 +37,26 @@ export function WorkspaceSwitcher() {
 
   const [activeWorkspace, setActiveWorkspace] = React.useState<WorkspaceType>();
 
-  
-
   const { data, isPending } = useQuery({
     queryKey: ["userWorkspaces"],
     queryFn: getAllWorkspacesUserIsMemberQueryFn,
     staleTime: 1,
-    refetchOnMount: true
+    refetchOnMount: true,
   });
 
   const workspaces = data?.workspaces;
 
   React.useEffect(() => {
-    if(workspaces?.length) {
+    if (workspaces?.length) {
       const workspace = workspaceId
-       ? workspaces.find((ws) => ws._id === workspaceId)
-      : workspaces[0];
+        ? workspaces.find((ws) => ws._id === workspaceId)
+        : workspaces[0];
 
-      if(workspace){
+      if (workspace) {
         setActiveWorkspace(workspace);
-        if(!workspaceId) navigate(`/workspace/${workspace._id}`);
+        if (!workspaceId) navigate(`/workspace/${workspace._id}`);
       }
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [workspaceId, workspaces, navigate]);
 
   const onSelect = (workspace: WorkspaceType) => {
@@ -88,17 +85,17 @@ export function WorkspaceSwitcher() {
               >
                 {activeWorkspace ? (
                   <>
-                   <div className="flex aspect-square size-8 items-center font-semibold justify-center rounded-lg bg-sidebar-primary text-sidebar-primary-foreground">
-                    {activeWorkspace?.name?.split(" ")?.[0]?.charAt(0)}
-                  </div>
-                  <div className="grid flex-1 text-left text-sm leading-tight">
-                    <span className="truncate font-semibold">
-                      {activeWorkspace?.name}
-                    </span>
-                    <span className="truncate text-xs">Free</span>
-                  </div>
+                    <div className="flex aspect-square size-8 items-center font-semibold justify-center rounded-lg bg-sidebar-primary text-sidebar-primary-foreground">
+                      {activeWorkspace?.name?.split(" ")?.[0]?.charAt(0)}
+                    </div>
+                    <div className="grid flex-1 text-left text-sm leading-tight">
+                      <span className="truncate font-semibold">
+                        {activeWorkspace?.name}
+                      </span>
+                      <span className="truncate text-xs">Free</span>
+                    </div>
                   </>
-                ): (
+                ) : (
                   <div className="grid flex-1 text-left text-sm leading-tight">
                     <span className="truncate font-semibold">
                       No Workspace selected
@@ -117,7 +114,7 @@ export function WorkspaceSwitcher() {
               <DropdownMenuLabel className="text-xs text-muted-foreground">
                 Workspaces
               </DropdownMenuLabel>
-              {isPending ? <Loader className="w-5 h-5 animate-spin"/>: null}
+              {isPending ? <Loader className="w-5 h-5 animate-spin" /> : null}
               {workspaces?.map((workspace) => (
                 <DropdownMenuItem
                   key={workspace._id}

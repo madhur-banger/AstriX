@@ -1,7 +1,8 @@
-import { ChevronDown, Loader } from "lucide-react";
+import { ChevronDown, Loader, UserX } from "lucide-react";
 
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Button } from "@/components/ui/button";
+import { ConfirmDialog } from "@/components/reusable/confirm-dialog";
 
 import {
   Command,
@@ -16,18 +17,31 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from "@/components/ui/popover";
-import { getAvatarColor, getAvatarFallbackText } from "@/lib/helper";
+import {
+  getAvatarColor,
+  getAvatarFallbackText,
+  getErrorMessage,
+} from "@/lib/helper";
 import { useAuthContext } from "@/context/auth-provider";
 import useWorkspaceId from "@/hooks/use-workspace-id";
+import useConfirmDialog from "@/hooks/use-confirm-dialog";
 import useGetWorkspaceMembers from "@/hooks/api/use-get-workspace-members";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { changeWorkspaceMemberRoleMutationFn } from "@/lib/api";
+import {
+  changeWorkspaceMemberRoleMutationFn,
+  removeWorkspaceMemberMutationFn,
+} from "@/lib/api";
 import { toast } from "@/hooks/use-toast";
 import { Permissions } from "@/constant";
+import { AllMembersInWorkspaceResponseType } from "@/types/api.type";
+
+type MemberRow = AllMembersInWorkspaceResponseType["members"][number];
+
 const AllMembers = () => {
-  const { user, hasPermission } = useAuthContext();
+  const { user, workspace, hasPermission } = useAuthContext();
 
   const canChangeMemberRole = hasPermission(Permissions.CHANGE_MEMBER_ROLE);
+  const canRemoveMember = hasPermission(Permissions.REMOVE_MEMBER);
 
   const queryClient = useQueryClient();
   const workspaceId = useWorkspaceId();
@@ -38,6 +52,12 @@ const AllMembers = () => {
 
   const { mutate, isPending: isLoading } = useMutation({
     mutationFn: changeWorkspaceMemberRoleMutationFn,
+  });
+
+  const { open, context, onOpenDialog, onCloseDialog } =
+    useConfirmDialog<MemberRow>();
+  const removeMutation = useMutation({
+    mutationFn: removeWorkspaceMemberMutationFn,
   });
 
   const handleSelect = (roleId: string, memberId: string) => {
@@ -70,6 +90,29 @@ const AllMembers = () => {
     });
   };
 
+  const handleRemove = () => {
+    if (!context) return;
+    removeMutation.mutate(
+      { workspaceId, memberId: context._id },
+      {
+        onSuccess: () => {
+          queryClient.invalidateQueries({
+            queryKey: ["members", workspaceId],
+          });
+          toast({ title: "Member removed" });
+          onCloseDialog();
+        },
+        onError: (error) => {
+          toast({
+            title: "Error",
+            description: getErrorMessage(error),
+            variant: "destructive",
+          });
+        },
+      }
+    );
+  };
+
   return (
     <div className="grid gap-6 pt-2">
       {isPending ? (
@@ -80,8 +123,13 @@ const AllMembers = () => {
         const name = member.userId?.name;
         const initials = getAvatarFallbackText(name);
         const avatarColor = getAvatarColor(name);
+        const isOwner = member.userId._id === workspace?.owner;
+        const isSelf = member.userId._id === user?._id;
         return (
-          <div className="flex items-center justify-between space-x-4">
+          <div
+            key={member._id}
+            className="flex items-center justify-between space-x-4"
+          >
             <div className="flex items-center space-x-4">
               <Avatar className="h-8 w-8">
                 <AvatarImage
@@ -168,10 +216,34 @@ const AllMembers = () => {
                   </PopoverContent>
                 )}
               </Popover>
+              {canRemoveMember && !isOwner && !isSelf && (
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="text-destructive hover:text-destructive"
+                  aria-label={`Remove ${name}`}
+                  onClick={() => onOpenDialog(member)}
+                >
+                  <UserX className="h-4 w-4" />
+                </Button>
+              )}
             </div>
           </div>
         );
       })}
+
+      <ConfirmDialog
+        isOpen={open}
+        isLoading={removeMutation.isPending}
+        onClose={onCloseDialog}
+        onConfirm={handleRemove}
+        title="Remove member"
+        description={`Remove ${
+          context?.userId?.name || "this member"
+        } from the workspace? They will lose access immediately.`}
+        confirmText="Remove"
+        cancelText="Cancel"
+      />
     </div>
   );
 };

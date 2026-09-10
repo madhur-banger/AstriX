@@ -1,17 +1,50 @@
 import { useState } from "react";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
+import { ConfirmDialog } from "@/components/reusable/confirm-dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useAuthContext } from "@/context/auth-provider";
+import useConfirmDialog from "@/hooks/use-confirm-dialog";
+import useWorkspaceId from "@/hooks/use-workspace-id";
 import { toast } from "@/hooks/use-toast";
-import { CheckIcon, CopyIcon, Loader } from "lucide-react";
+import { getErrorMessage } from "@/lib/helper";
+import { resetInviteCodeMutationFn } from "@/lib/api";
+import { CheckIcon, CopyIcon, Loader, RefreshCw } from "lucide-react";
 import { BASE_ROUTE } from "@/routes/common/routePaths";
-import PermissionsGuard from "@/components/resuable/permission-guard";
+import PermissionsGuard from "@/components/reusable/permission-guard";
 import { Permissions } from "@/constant";
 
 const InviteMember = () => {
-  const { workspace, workspaceLoading } = useAuthContext();
+  const { workspace, workspaceLoading, hasPermission } = useAuthContext();
   const [copied, setCopied] = useState(false);
+  const workspaceId = useWorkspaceId();
+  const queryClient = useQueryClient();
+  const canResetInviteCode = hasPermission(
+    Permissions.MANAGE_WORKSPACE_SETTINGS
+  );
+
+  const { open, onOpenDialog, onCloseDialog } = useConfirmDialog();
+  const { mutate, isPending: isResetting } = useMutation({
+    mutationFn: resetInviteCodeMutationFn,
+  });
+
+  const handleReset = () => {
+    mutate(workspaceId, {
+      onSuccess: () => {
+        queryClient.invalidateQueries({ queryKey: ["workspace", workspaceId] });
+        toast({ title: "Invite link regenerated" });
+        onCloseDialog();
+      },
+      onError: (error) => {
+        toast({
+          title: "Error",
+          description: getErrorMessage(error),
+          variant: "destructive",
+        });
+      },
+    });
+  };
 
   const inviteUrl = workspace
     ? `${window.location.origin}${BASE_ROUTE.INVITE_URL.replace(
@@ -71,9 +104,31 @@ const InviteMember = () => {
             >
               {copied ? <CheckIcon /> : <CopyIcon />}
             </Button>
+            {canResetInviteCode && (
+              <Button
+                variant="outline"
+                className="shrink-0"
+                size="icon"
+                aria-label="Regenerate invite link"
+                onClick={() => onOpenDialog()}
+              >
+                <RefreshCw className="h-4 w-4" />
+              </Button>
+            )}
           </div>
         )}
       </PermissionsGuard>
+
+      <ConfirmDialog
+        isOpen={open}
+        isLoading={isResetting}
+        onClose={onCloseDialog}
+        onConfirm={handleReset}
+        title="Regenerate invite link"
+        description="The current invite link will stop working immediately. Anyone who hasn't joined yet will need the new link."
+        confirmText="Regenerate"
+        cancelText="Cancel"
+      />
     </div>
   );
 };

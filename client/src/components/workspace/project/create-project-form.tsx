@@ -73,7 +73,7 @@ export default function CreateProjectForm({
       onSuccess: (data) => {
         const project = data.project;
         queryClient.invalidateQueries({
-          queryKey: ["allprojects", workspaceId],
+          queryKey: ["allProjects", workspaceId],
         });
 
         toast({
@@ -119,6 +119,7 @@ export default function CreateProjectForm({
                 <PopoverTrigger asChild>
                   <Button
                     variant="outline"
+                    aria-label="Choose project emoji"
                     className="font-normal size-[60px] !p-2 !shadow-none mt-2 items-center rounded-full "
                   >
                     <span className="text-4xl">{emoji}</span>

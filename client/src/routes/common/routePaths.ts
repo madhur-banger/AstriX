@@ -5,7 +5,8 @@ export const isAuthRoute = (pathname: string): boolean => {
 export const AUTH_ROUTES = {
   SIGN_IN: "/sign-in",
   SIGN_UP: "/sign-up",
-  GOOGLE_OAUTH_CALLBACK: "/google/callback",
+  FORGOT_PASSWORD: "/forgot-password",
+  RESET_PASSWORD: "/reset-password",
 };
 
 export const PROTECTED_ROUTES = {
@@ -14,9 +15,14 @@ export const PROTECTED_ROUTES = {
   MEMBERS: "/workspace/:workspaceId/members",
   SETTINGS: "/workspace/:workspaceId/settings",
   PROJECT_DETAILS: "/workspace/:workspaceId/project/:projectId",
+  ACCOUNT_SETTINGS: "/workspace/:workspaceId/account/settings",
 };
 
 export const BASE_ROUTE = {
   INVITE_URL: "/invite/workspace/:inviteCode/join",
   HOME: "/",
+  UNAUTHORIZED: "/unauthorized",
+  VERIFY_EMAIL: "/verify-email",
+  TERMS: "/terms",
+  PRIVACY: "/privacy",
 };

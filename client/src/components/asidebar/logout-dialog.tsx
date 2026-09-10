@@ -75,8 +75,8 @@ const LogoutDialog = (props: {
         <DialogHeader>
           <DialogTitle>Are you sure you want to log out?</DialogTitle>
           <DialogDescription>
-            This will end your current session and you will need to log in
-            again to access your account.
+            This will end your current session and you will need to log in again
+            to access your account.
           </DialogDescription>
         </DialogHeader>
         <DialogFooter className="gap-2 sm:gap-0">

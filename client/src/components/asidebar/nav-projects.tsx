@@ -25,14 +25,14 @@ import {
 } from "@/components/ui/sidebar";
 import useWorkspaceId from "@/hooks/use-workspace-id";
 import useCreateProjectDialog from "@/hooks/use-create-project-dialog";
-import { ConfirmDialog } from "../resuable/confirm-dialog";
+import { ConfirmDialog } from "../reusable/confirm-dialog";
 import useConfirmDialog from "@/hooks/use-confirm-dialog";
 import { Button } from "../ui/button";
 import { Permissions } from "@/constant";
-import PermissionsGuard from "../resuable/permission-guard";
+import PermissionsGuard from "../reusable/permission-guard";
 import { useState } from "react";
 import useGetProjectsInWorkspaceQuery from "@/hooks/api/use-get-projects";
-import { PaginationType } from "@/types/api.type";
+import { PaginationType, ProjectType } from "@/types/api.type";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { deleteProjectMutationFn } from "@/lib/api";
 import { toast } from "@/hooks/use-toast";
@@ -47,7 +47,8 @@ export function NavProjects() {
 
   const { isMobile } = useSidebar();
   const { onOpen } = useCreateProjectDialog();
-  const { context, open, onOpenDialog, onCloseDialog } = useConfirmDialog();
+  const { context, open, onOpenDialog, onCloseDialog } =
+    useConfirmDialog<ProjectType>();
 
   const [pageNumber] = useState(1);
   const [pageSize, setPageSize] = useState(5);
@@ -82,7 +83,7 @@ export function NavProjects() {
       {
         onSuccess: (data) => {
           queryClient.invalidateQueries({
-            queryKey: ["allprojects", workspaceId],
+            queryKey: ["allProjects", workspaceId],
           });
           toast({
             title: "Success",

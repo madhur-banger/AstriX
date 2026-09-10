@@ -25,18 +25,17 @@ type ItemType = {
 };
 
 export function NavMain() {
-
   const { hasPermission } = useAuthContext();
 
   const canManageSettings = hasPermission(
     Permissions.MANAGE_WORKSPACE_SETTINGS
   );
-   
+
   const workspaceId = useWorkspaceId();
   const location = useLocation();
 
   const pathname = location.pathname;
- 
+
   const items: ItemType[] = [
     {
       title: "Dashboard",
@@ -56,13 +55,13 @@ export function NavMain() {
 
     ...(canManageSettings
       ? [
-        {
-          title: "Settings",
-          url: `/workspace/${workspaceId}/settings`,
-          icon: Settings,
-        }
-      ]
-    : []),
+          {
+            title: "Settings",
+            url: `/workspace/${workspaceId}/settings`,
+            icon: Settings,
+          },
+        ]
+      : []),
   ];
   return (
     <SidebarGroup>

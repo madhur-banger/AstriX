@@ -29,8 +29,14 @@ const InviteUser = () => {
     mutationFn: invitedUserJoinWorkspaceMutationFn,
   });
 
+  // The invite code comes straight off the URL, so it is encoded into the
+  // path before the whole relative path is encoded as a returnUrl - a code
+  // carrying path separators can't be used to build a different destination.
   const returnUrl = encodeURIComponent(
-    `${BASE_ROUTE.INVITE_URL.replace(":inviteCode", inviteCode)}`
+    BASE_ROUTE.INVITE_URL.replace(
+      ":inviteCode",
+      encodeURIComponent(inviteCode ?? "")
+    )
   );
 
   const handleSubmit = (e: { preventDefault: () => void }) => {
@@ -60,7 +66,7 @@ const InviteUser = () => {
           className="flex items-center gap-2 self-center font-medium"
         >
           <Logo />
-           AstriX
+          AstriX
         </Link>
         <div className="flex flex-col gap-6">
           <Card>

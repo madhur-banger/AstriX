@@ -29,20 +29,12 @@ import GoogleOauthButton from "@/components/auth/google-oauth-button";
 import { useMutation } from "@tanstack/react-query";
 import { registerMutationFn } from "@/lib/api";
 import { toast } from "@/hooks/use-toast";
-import { Loader, Check, X } from "lucide-react";
+import { Loader } from "lucide-react";
 import { useState } from "react";
-
-// ============================================
-// PASSWORD REQUIREMENTS
-// ============================================
-
-const passwordRequirements = [
-  { regex: /.{8,}/, label: "At least 8 characters" },
-  { regex: /[A-Z]/, label: "One uppercase letter" },
-  { regex: /[a-z]/, label: "One lowercase letter" },
-  { regex: /[0-9]/, label: "One number" },
-  { regex: /[^A-Za-z0-9]/, label: "One special character (!@#$%^&*)" },
-];
+import { getErrorMessage } from "@/lib/helper";
+import { passwordSchema } from "@/lib/password";
+import PasswordStrengthIndicator from "@/components/auth/password-strength-indicator";
+import { BASE_ROUTE } from "@/routes/common/routePaths";
 
 // ============================================
 // VALIDATION SCHEMA
@@ -59,50 +51,10 @@ const formSchema = z.object({
     .trim()
     .email("Invalid email address")
     .min(1, "Email is required"),
-  password: z
-    .string()
-    .min(8, "Password must be at least 8 characters")
-    .regex(/[A-Z]/, "Password must contain at least one uppercase letter")
-    .regex(/[a-z]/, "Password must contain at least one lowercase letter")
-    .regex(/[0-9]/, "Password must contain at least one number")
-    .regex(
-      /[^A-Za-z0-9]/,
-      "Password must contain at least one special character"
-    ),
+  password: passwordSchema,
 });
 
 type FormValues = z.infer<typeof formSchema>;
-
-// ============================================
-// PASSWORD STRENGTH INDICATOR
-// ============================================
-
-const PasswordStrengthIndicator = ({ password }: { password: string }) => {
-  if (!password) return null;
-
-  return (
-    <div className="mt-2 space-y-1">
-      {passwordRequirements.map((req, index) => {
-        const isMet = req.regex.test(password);
-        return (
-          <div
-            key={index}
-            className={`flex items-center gap-2 text-xs ${
-              isMet ? "text-green-600" : "text-muted-foreground"
-            }`}
-          >
-            {isMet ? (
-              <Check className="w-3 h-3" />
-            ) : (
-              <X className="w-3 h-3" />
-            )}
-            {req.label}
-          </div>
-        );
-      })}
-    </div>
-  );
-};
 
 // ============================================
 // COMPONENT
@@ -139,10 +91,10 @@ const SignUp = () => {
         });
         navigate("/sign-in");
       },
-      onError: (error: any) => {
+      onError: (error) => {
         toast({
           title: "Error",
-          description: error.response?.data?.message || error.message,
+          description: getErrorMessage(error),
           variant: "destructive",
         });
       },
@@ -157,7 +109,7 @@ const SignUp = () => {
           className="flex items-center gap-2 self-center font-medium"
         >
           <Logo />
-          Team Sync.
+          AstriX
         </Link>
         <div className="flex flex-col gap-6">
           <Card>
@@ -233,7 +185,9 @@ const SignUp = () => {
                                 type="password"
                                 className="!h-[48px]"
                                 autoComplete="new-password"
-                                onFocus={() => setShowPasswordRequirements(true)}
+                                onFocus={() =>
+                                  setShowPasswordRequirements(true)
+                                }
                                 {...field}
                               />
                             </FormControl>
@@ -246,7 +200,11 @@ const SignUp = () => {
                           </FormItem>
                         )}
                       />
-                      <Button disabled={isPending} type="submit" className="w-full">
+                      <Button
+                        disabled={isPending}
+                        type="submit"
+                        className="w-full"
+                      >
                         {isPending && <Loader className="animate-spin mr-2" />}
                         Sign up
                       </Button>
@@ -267,7 +225,8 @@ const SignUp = () => {
           </Card>
           <div className="text-balance text-center text-xs text-muted-foreground [&_a]:underline [&_a]:underline-offset-4 [&_a]:hover:text-primary">
             By clicking continue, you agree to our{" "}
-            <a href="#">Terms of Service</a> and <a href="#">Privacy Policy</a>.
+            <Link to={BASE_ROUTE.TERMS}>Terms of Service</Link> and{" "}
+            <Link to={BASE_ROUTE.PRIVACY}>Privacy Policy</Link>.
           </div>
         </div>
       </div>

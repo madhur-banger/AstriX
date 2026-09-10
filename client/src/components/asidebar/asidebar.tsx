@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { Link } from "react-router-dom";
-import { EllipsisIcon, Loader, LogOut } from "lucide-react";
+import { EllipsisIcon, Loader, LogOut, Settings } from "lucide-react";
 import {
   Sidebar,
   SidebarHeader,
@@ -32,6 +32,7 @@ import { Separator } from "../ui/separator";
 import useWorkspaceId from "@/hooks/use-workspace-id";
 import { useAuthContext } from "@/context/auth-provider";
 import { AvatarImage } from "@radix-ui/react-avatar";
+import { getAvatarFallbackText } from "@/lib/helper";
 
 const Asidebar = () => {
   const { isLoading, user } = useAuthContext();
@@ -39,7 +40,6 @@ const Asidebar = () => {
   const workspaceId = useWorkspaceId();
 
   const [isOpen, setIsOpen] = useState(false);
-
 
   return (
     <>
@@ -86,17 +86,14 @@ const Asidebar = () => {
                       <Avatar className="h-8 w-8 rounded-full">
                         <AvatarImage src={user?.profilePicture || ""} />
                         <AvatarFallback className="rounded-full border border-gray-500">
-                        {user?.name?.split(" ")?.[0]?.charAt(0)}
-                        {user?.name?.split(" ")?.[1]?.charAt(0)}
+                          {getAvatarFallbackText(user?.name || "")}
                         </AvatarFallback>
                       </Avatar>
                       <div className="grid flex-1 text-left text-sm leading-tight">
                         <span className="truncate font-semibold">
                           {user?.name}
                         </span>
-                        <span className="truncate text-xs">
-                          {user?.email}
-                        </span>
+                        <span className="truncate text-xs">{user?.email}</span>
                       </div>
                       <EllipsisIcon className="ml-auto size-4" />
                     </SidebarMenuButton>
@@ -107,7 +104,14 @@ const Asidebar = () => {
                     align="start"
                     sideOffset={4}
                   >
-                    <DropdownMenuGroup></DropdownMenuGroup>
+                    <DropdownMenuGroup>
+                      <DropdownMenuItem asChild>
+                        <Link to={`/workspace/${workspaceId}/account/settings`}>
+                          <Settings />
+                          Account settings
+                        </Link>
+                      </DropdownMenuItem>
+                    </DropdownMenuGroup>
                     <DropdownMenuSeparator />
                     <DropdownMenuItem onClick={() => setIsOpen(true)}>
                       <LogOut />

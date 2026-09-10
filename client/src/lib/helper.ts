@@ -1,3 +1,46 @@
+import { isAxiosError } from "axios";
+
+// Narrows an unknown mutation/query error down to a user-facing message,
+// preferring the backend's own `{ message }` response body (set by
+// errorHandles.middleware.ts) over axios's generic "Request failed with
+// status code N" text.
+export const getErrorMessage = (
+  error: unknown,
+  fallback = "Something went wrong"
+): string => {
+  if (isAxiosError<{ message?: string }>(error)) {
+    return error.response?.data?.message || error.message || fallback;
+  }
+  if (error instanceof Error) {
+    return error.message || fallback;
+  }
+  return fallback;
+};
+
+// A `returnUrl` arrives from the query string, so it is attacker-controlled.
+// Only same-origin relative paths are safe to hand to navigate(): anything
+// else ("//evil.com", "https://evil.com", "javascript:...") would turn the
+// sign-in page into an open redirect.
+const SAFE_RELATIVE_PATH = /^\/(?!\/)/;
+
+export const getSafeReturnUrl = (returnUrl: string | null): string | null => {
+  if (!returnUrl) return null;
+
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(returnUrl);
+  } catch {
+    return null;
+  }
+
+  // "/\evil.com" is normalised to "//evil.com" by some browsers.
+  if (!SAFE_RELATIVE_PATH.test(decoded) || decoded.startsWith("/\\")) {
+    return null;
+  }
+
+  return decoded;
+};
+
 //THE UPDATED ONE BECAUSE OF THE FILTERS ->  Take Note ->
 export const transformOptions = (
   options: string[],

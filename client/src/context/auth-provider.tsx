@@ -1,5 +1,11 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
-import { createContext, useContext, useEffect } from "react";
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+} from "react";
 import useWorkspaceId from "@/hooks/use-workspace-id";
 import useAuth from "@/hooks/api/use-auth";
 import { UserType, WorkspaceType } from "@/types/api.type";
@@ -50,34 +56,46 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
   useEffect(() => {
     if (workspaceError) {
       if (workspaceError?.errorCode === "ACCESS_UNAUTHORIZED") {
-        navigate("/"); // Redirect if the user is not a member of the workspace
+        navigate("/unauthorized"); // Redirect if the user is not a member of the workspace
       }
     }
   }, [navigate, workspaceError]);
 
   const permissions = usePermissions(user, workspace);
 
-  const hasPermission = (permission: PermissionType): boolean => {
-    return permissions.includes(permission);
-  };
-
-  return (
-    <AuthContext.Provider
-      value={{
-        user,
-        workspace,
-        hasPermission,
-        error: authError || workspaceError,
-        isLoading,
-        isFetching,
-        workspaceLoading,
-        refetchAuth,
-        refetchWorkspace,
-      }}
-    >
-      {children}
-    </AuthContext.Provider>
+  const hasPermission = useCallback(
+    (permission: PermissionType): boolean => permissions.includes(permission),
+    [permissions]
   );
+
+  const error = authError || workspaceError;
+
+  const value = useMemo(
+    () => ({
+      user,
+      workspace,
+      hasPermission,
+      error,
+      isLoading,
+      isFetching,
+      workspaceLoading,
+      refetchAuth,
+      refetchWorkspace,
+    }),
+    [
+      user,
+      workspace,
+      hasPermission,
+      error,
+      isLoading,
+      isFetching,
+      workspaceLoading,
+      refetchAuth,
+      refetchWorkspace,
+    ]
+  );
+
+  return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 };
 
 // eslint-disable-next-line react-refresh/only-export-components

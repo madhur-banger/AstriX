@@ -31,6 +31,8 @@ import { loginMutationFn } from "@/lib/api";
 import { toast } from "@/hooks/use-toast";
 import { Loader } from "lucide-react";
 import { useStoreBase } from "@/store/store";
+import { BASE_ROUTE } from "@/routes/common/routePaths";
+import { getErrorMessage, getSafeReturnUrl } from "@/lib/helper";
 
 // ============================================
 // VALIDATION SCHEMA
@@ -84,13 +86,15 @@ const SignIn = () => {
         });
 
         // Navigate to return URL or workspace
-        const decodedUrl = returnUrl ? decodeURIComponent(returnUrl) : null;
-        navigate(decodedUrl || `/workspace/${data.user.currentWorkspace}`);
+        const safeReturnUrl = getSafeReturnUrl(returnUrl);
+        navigate(
+          safeReturnUrl || `/workspace/${data.user.currentWorkspace?._id}`
+        );
       },
-      onError: (error: any) => {
+      onError: (error) => {
         toast({
           title: "Error",
-          description: error.response?.data?.message || error.message,
+          description: getErrorMessage(error),
           variant: "destructive",
         });
       },
@@ -176,7 +180,11 @@ const SignIn = () => {
                           </FormItem>
                         )}
                       />
-                      <Button disabled={isPending} type="submit" className="w-full">
+                      <Button
+                        disabled={isPending}
+                        type="submit"
+                        className="w-full"
+                      >
                         {isPending && <Loader className="animate-spin mr-2" />}
                         Login
                       </Button>
@@ -197,7 +205,8 @@ const SignIn = () => {
           </Card>
           <div className="text-balance text-center text-xs text-muted-foreground [&_a]:underline [&_a]:underline-offset-4 [&_a]:hover:text-primary">
             By clicking continue, you agree to our{" "}
-            <a href="#">Terms of Service</a> and <a href="#">Privacy Policy</a>.
+            <Link to={BASE_ROUTE.TERMS}>Terms of Service</Link> and{" "}
+            <Link to={BASE_ROUTE.PRIVACY}>Privacy Policy</Link>.
           </div>
         </div>
       </div>

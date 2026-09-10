@@ -6,7 +6,9 @@ const useAuth = () => {
     queryKey: ["authUser"],
     queryFn: getCurrentUserQueryFn,
     staleTime: 0,
-    retry: 2,
+    // Retries are left to QueryProvider's global predicate, which only retries
+    // network errors. A 401 here means "logged out", not a transient failure,
+    // so retrying it just multiplies refresh round trips on every page load.
   });
   return query;
 };

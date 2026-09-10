@@ -53,7 +53,7 @@ export default function CreateWorkspaceForm({
     mutate(values, {
       onSuccess: (data) => {
         queryClient.resetQueries({
-          queryKey: ["userWorkspaces"]
+          queryKey: ["userWorkspaces"],
         });
 
         const workspace = data.workspace;
@@ -64,7 +64,7 @@ export default function CreateWorkspaceForm({
         toast({
           title: "Error",
           description: error.message,
-          variant: "destructive"
+          variant: "destructive",
         });
       },
     });
@@ -145,7 +145,7 @@ export default function CreateWorkspaceForm({
               className="w-full h-[40px] text-white font-semibold"
               type="submit"
             >
-              {isPending && <Loader className="animate-spin"/>}
+              {isPending && <Loader className="animate-spin" />}
               Create Workspace
             </Button>
           </form>

@@ -1,3 +1,3 @@
-export interface CustomError extends Error{
-    errorCode?: string;
+export interface CustomError extends Error {
+  errorCode?: string;
 }

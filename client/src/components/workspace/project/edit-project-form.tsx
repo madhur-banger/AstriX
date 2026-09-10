@@ -24,6 +24,7 @@ import useWorkspaceId from "@/hooks/use-workspace-id";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { editProjectMutationFn } from "@/lib/api";
 import { toast } from "@/hooks/use-toast";
+import { Loader } from "lucide-react";
 
 export default function EditProjectForm(props: {
   project?: ProjectType;
@@ -82,7 +83,7 @@ export default function EditProjectForm(props: {
         });
 
         queryClient.invalidateQueries({
-          queryKey: ["allprojects", workspaceId],
+          queryKey: ["allProjects", workspaceId],
         });
 
         toast({
@@ -127,6 +128,7 @@ export default function EditProjectForm(props: {
                 <PopoverTrigger asChild>
                   <Button
                     variant="outline"
+                    aria-label="Choose project emoji"
                     className="font-normal size-[60px] !p-2 !shadow-none mt-2 items-center rounded-full "
                   >
                     <span className="text-4xl">{emoji}</span>
@@ -180,10 +182,12 @@ export default function EditProjectForm(props: {
             </div>
 
             <Button
+              disabled={isPending}
               className="flex place-self-end  h-[40px] text-white font-semibold"
               type="submit"
             >
-              Create
+              {isPending && <Loader className="animate-spin" />}
+              Save Changes
             </Button>
           </form>
         </Form>

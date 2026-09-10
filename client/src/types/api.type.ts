@@ -17,6 +17,45 @@ export type registerType = {
   password: string;
 };
 
+export type ForgotPasswordType = { email: string };
+
+export type ResetPasswordType = {
+  token: string;
+  password: string;
+  confirmPassword: string;
+};
+
+export type VerifyEmailType = { token: string };
+
+export type ChangePasswordType = {
+  currentPassword: string;
+  newPassword: string;
+  confirmNewPassword: string;
+};
+
+export type MessageResponseType = { message: string };
+
+export type UpdateProfileType = {
+  name?: string;
+  profilePicture?: string;
+};
+
+export type DeleteAccountType = {
+  password?: string;
+};
+
+export type SessionType = {
+  id: string;
+  userAgent: string | null;
+  ipAddress: string | null;
+  createdAt: string;
+};
+
+export type GetSessionsResponseType = {
+  message: string;
+  sessions: SessionType[];
+};
+
 // USER TYPE
 export type UserType = {
   _id: string;
@@ -24,6 +63,7 @@ export type UserType = {
   email: string;
   profilePicture: string | null;
   isActive: true;
+  isEmailVerified: boolean;
   lastLogin: null;
   createdAt: Date;
   updatedAt: Date;
@@ -99,6 +139,16 @@ export type ChangeWorkspaceMemberRoleType = {
     roleId: string;
     memberId: string;
   };
+};
+
+export type RemoveWorkspaceMemberType = {
+  workspaceId: string;
+  memberId: string;
+};
+
+export type ResetInviteCodeResponseType = {
+  message: string;
+  workspace: WorkspaceType;
 };
 
 export type AllMembersInWorkspaceResponseType = {
@@ -235,8 +285,8 @@ export type EditTaskPayloadType = {
     status: TaskStatusEnumType;
     assignedTo: string;
     dueDate: string;
-  }>
-}
+  }>;
+};
 
 export type TaskType = {
   _id: string;
