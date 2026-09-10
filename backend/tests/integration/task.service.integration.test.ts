@@ -124,6 +124,30 @@ describe("task.service (integration - real in-memory MongoDB)", () => {
     expect(String(task.assignedTo)).toBe(assignee._id.toString());
   });
 
+  it("rejects an update when assignedTo is not a member of the workspace (H1: the update path must enforce this exactly like create does)", async () => {
+    const { task } = await createTaskService(workspaceId, projectId, userId, {
+      title: "Needs reassignment",
+      priority: "MEDIUM",
+      status: "TODO",
+    });
+    const outsider = await UserModel.create({
+      name: "Outsider",
+      email: `outsider-update-${Date.now()}@example.com`,
+    });
+
+    await expect(
+      updateTaskService(workspaceId, projectId, String(task._id), {
+        title: "Needs reassignment",
+        priority: "MEDIUM",
+        status: "TODO",
+        assignedTo: outsider._id.toString(),
+      })
+    ).rejects.toThrow("Assigned user is not a member of this workspace");
+
+    const refetched = await TaskModel.findById(task._id);
+    expect(refetched!.assignedTo).toBeNull();
+  });
+
   it("update persists changes and a re-fetch reflects them", async () => {
     const { task } = await createTaskService(workspaceId, projectId, userId, {
       title: "Before Update",

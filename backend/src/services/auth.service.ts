@@ -26,6 +26,7 @@ import {
   sendVerificationEmail,
 } from "../providers/email.provider";
 import { logger } from "../utils/logger";
+import { compareValue } from "../utils/bcrypt";
 
 interface CreateSessionParams {
   userId: mongoose.Types.ObjectId;
@@ -168,6 +169,15 @@ export const registerUserService = async (body: {
 // LOGIN (email/password)
 // ============================================
 
+// A precomputed bcrypt hash with no corresponding real password - compared
+// against on the "no such account" branch below purely to burn the same
+// ~bcrypt-cost-10 wall-clock time that a real wrong-password comparison
+// would, so the two branches aren't distinguishable by response latency.
+// Never rotate this per-request (that would defeat the point); it only
+// needs to be *a* valid bcrypt hash, not a secret.
+const DUMMY_PASSWORD_HASH =
+  "$2b$10$uoY4NVy6Uns2Luc7jnt9P.hOJUVlz40gP0G0Aunbvk.3vZ3w642ei";
+
 export const verifyUserService = async ({
   email,
   password,
@@ -184,7 +194,15 @@ export const verifyUserService = async ({
   // distinguishable response. Same discipline as
   // requestPasswordResetService, which is deliberately indistinguishable
   // for a known vs unknown email.
+  //
+  // Status code and message alone aren't enough, though: a real
+  // comparePassword() call below runs a deliberately slow bcrypt compare,
+  // so skipping straight to the throw here would still leak "no such
+  // account" via response latency. Burn the same bcrypt cost against a
+  // dummy hash first so both branches take statistically indistinguishable
+  // time.
   if (!account) {
+    await compareValue(password, DUMMY_PASSWORD_HASH);
     throw new UnauthorizedException("Invalid email or password");
   }
 

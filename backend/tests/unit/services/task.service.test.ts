@@ -228,6 +228,31 @@ describe("updateTaskService", () => {
       })
     ).rejects.toThrow("Failed to update task");
   });
+
+  it("throws when assignedTo is not a member of the workspace (H1: the update path must enforce this exactly like create does)", async () => {
+    const fakeProject = buildFakeProject({ workspace: "ws-1" });
+    vi.mocked(ProjectModel.findById).mockResolvedValue(fakeProject as any);
+    vi.mocked(TaskModel.findById).mockResolvedValue({
+      project: fakeProject._id,
+    } as any);
+    vi.mocked(MemberModel.exists).mockResolvedValue(null as any);
+
+    await expect(
+      updateTaskService("ws-1", String(fakeProject._id), "task-1", {
+        title: "T",
+        priority: "LOW",
+        status: "TODO",
+        assignedTo: "not-a-member",
+      })
+    ).rejects.toThrow("Assigned user is not a member of this workspace");
+
+    expect(MemberModel.exists).toHaveBeenCalledWith({
+      userId: "not-a-member",
+      workspaceId: "ws-1",
+    });
+    // The rejected assignment must never reach the database.
+    expect(TaskModel.findByIdAndUpdate).not.toHaveBeenCalled();
+  });
 });
 
 function mockFindChain(resolvedValue: any) {
