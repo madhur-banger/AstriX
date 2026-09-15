@@ -55,7 +55,7 @@ jobs:
           ref: ${{ inputs.commit_sha }}
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v5
         with:
           role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/astrix-dev-github-actions-role
           aws-region: ${{ env.AWS_REGION }}
@@ -127,7 +127,7 @@ jobs:
           ref: ${{ inputs.commit_sha }}
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v5
         with:
           role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/astrix-dev-github-actions-role
           aws-region: ${{ env.AWS_REGION }}
