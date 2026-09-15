@@ -50,7 +50,7 @@ jobs:
       ECS_CLUSTER: astrix-dev-cluster
       ECS_SERVICE: astrix-dev-backend-service
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.commit_sha }}
 
@@ -122,7 +122,7 @@ jobs:
     env:
       S3_BUCKET: astrix-dev-frontend
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.commit_sha }}
 
