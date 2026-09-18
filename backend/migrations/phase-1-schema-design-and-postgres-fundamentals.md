@@ -360,10 +360,9 @@ CREATE INDEX accounts_user_id_idx ON accounts (user_id);
 Note the Mongoose `toJSON.transform` that strips `refreshToken` from
 serialized output (`account.model.ts:33-37`) has **no schema-level
 equivalent in Postgres** — that was purely an application-layer
-serialization concern, and stays one: your Drizzle/NestJS DTO/response
-mapper is where you omit `refresh_token`, same as before, just relocated
-to a different layer (see phase-4, the NestJS repository/DTO split covers
-exactly this).
+serialization concern, and stays one: your repository's domain-mapping
+function (the `toDomain(...)` boundary from phase-4) is where you omit
+`refresh_token`, same as before, just relocated to a different layer.
 
 ### `projects` ← `models/project.model.ts`
 
@@ -518,7 +517,126 @@ actually choosing to use it, rather than assuming it will.
 
 ---
 
-## 1.7 What to read next
+## 1.7 Actually done — status: ✅ complete, schema applied and verified against real Postgres
+
+All seven tables from §1.4 are committed as runnable DDL at
+`backend/migrations/sql/phase-1-schema.sql` (not just markdown code blocks —
+an actual `.sql` file this repo can apply again, e.g. in CI or a fresh dev
+box) and applied against the Phase 0 Postgres container with `psql -U astrix
+-d astrix -f phase-1-schema.sql`. Every `CREATE TABLE`/`CREATE
+TYPE`/`CREATE INDEX`/`CREATE TRIGGER`/`ALTER TABLE` succeeded on the first
+run, in the order §1.3's circular-FK resolution requires (users → workspaces
+→ the deferred `users_current_workspace_fk` → workspace_members → accounts →
+projects → tasks).
+
+```
+$ docker compose exec postgres psql -U astrix -d astrix -c "\dt"
+ public | accounts          | table | astrix
+ public | projects          | table | astrix
+ public | roles             | table | astrix
+ public | tasks             | table | astrix
+ public | users             | table | astrix
+ public | workspace_members | table | astrix
+ public | workspaces        | table | astrix
+```
+
+`\d users` and `\d tasks` confirm every FK, index, and trigger landed
+exactly as designed — including the `Referenced by:` list on `users`
+showing all six inbound foreign keys, and `tasks`'s three indexes
+(`tasks_workspace_project_idx`, `tasks_workspace_status_idx`,
+`tasks_assigned_to_idx`) all present.
+
+### §1.6's integrity chain — actually run, not just described
+
+Ran the full insert/delete chain end to end against real Postgres (see
+`git log`-free scratch run, reproduced here since it's the actual proof):
+
+```
+INSERT 0 1   -- user
+INSERT 0 1   -- role
+INSERT 0 1   -- workspace
+UPDATE 1     -- users.current_workspace_id backfilled
+INSERT 0 1   -- workspace_members row 1
+
+--> expecting duplicate-key error next:
+ERROR:  duplicate key value violates unique constraint "workspace_members_user_workspace_unique"
+DETAIL:  Key (user_id, workspace_id)=(...) already exists.
+
+INSERT 0 1   -- project
+INSERT 0 1   -- task
+
+--> expecting FK-restrict error next (user still owns a workspace):
+ERROR:  update or delete on table "users" violates foreign key constraint "workspaces_owner_id_fkey" on table "workspaces"
+DETAIL:  Key (id)=(...) is still referenced from table "workspaces".
+
+--> now deleting the workspace, expecting cascade to members/projects/tasks:
+DELETE 1
+ members_left  = 0
+ projects_left = 0
+ tasks_left    = 0
+
+--> now the user deletes cleanly (no workspace owned anymore):
+DELETE 1
+```
+
+Every one of PLAN.md §1b's integrity rules fired exactly as the schema
+promises: the unique constraint rejected a duplicate membership, `RESTRICT`
+blocked deleting a user who still owns a workspace, and `CASCADE` wiped
+members/projects/tasks atomically the moment the workspace itself was
+deleted — none of this required application-code enforcement, unlike the
+equivalent Mongo `deleteMany({...})` cleanup calls this replaces.
+
+One real bug caught in the process, worth recording: the first draft of the
+verification script's `INSERT INTO workspaces` omitted `invite_code`,
+which is `NOT NULL` — Postgres correctly rejected it
+(`null value in column "invite_code" violates not-null constraint`). This
+is exactly the kind of mistake Mongoose would have silently allowed (no
+`required: true` violation only because the field wasn't in the payload at
+all isn't the same failure mode, but the general point holds: Postgres's
+`NOT NULL` catches an incomplete insert immediately, at the database layer,
+regardless of which code path produced it).
+
+### `EXPLAIN ANALYZE` — a genuinely non-obvious result worth keeping
+
+Running the doc's own suggested query — a **direct equality filter**,
+`workspace_id = :id AND status = 'TODO'` — did use the compound index, as
+predicted:
+
+```
+Index Scan using tasks_workspace_status_idx on tasks
+  (cost=0.15..8.17 rows=1 width=208) (actual time=0.016..0.017 rows=1 loops=1)
+  Index Cond: ((workspace_id = '...'::uuid) AND (status = 'TODO'::task_status))
+```
+
+But an equivalent-looking query written as a **join** (`tasks t JOIN
+workspaces w ON w.name = 'Bench' WHERE t.workspace_id = w.id AND t.status =
+'TODO'`) made the planner choose `Seq Scan` on both tables instead:
+
+```
+Nested Loop
+  ->  Seq Scan on tasks t  (Filter: status = 'TODO')
+  ->  Materialize -> Seq Scan on workspaces w  (Filter: name = 'Bench')
+```
+
+This is the real, concrete version of §1.1's "verify, don't assume" advice
+— on a table with only 1-2 rows (true here, and will be true again for any
+fresh dev database), the planner correctly decides a sequential scan is
+*cheaper* than an index scan, because index scans have fixed overhead that
+only pays off once there's enough data to skip. **The same index existing
+doesn't guarantee it gets used** — row count and the exact query shape both
+matter, which is precisely why `EXPLAIN ANALYZE` on the actual query (not a
+paraphrase of it) is the only reliable way to know. This becomes more
+visible once Phase 2 seeds realistic data volumes; on this near-empty table
+it's still the right lesson, just with a smaller table than the index
+"needs" to win.
+
+Both benchmark rows used to produce this were deleted immediately after —
+the schema is verified empty and ready for Phase 2, per this phase's
+rollback contract.
+
+---
+
+## 1.8 What to read next
 
 - [phase-2-orm-setup-and-service-migration.md](./phase-2-orm-setup-and-service-migration.md)
   — wiring Drizzle into the app, porting services table by table, rewriting

@@ -1,13 +1,40 @@
 # Phase 5 — Testing Strategy: Mongo-Suite Parity, Postgres/Redis Integration, and DI-Driven Unit Testing
 
+> **Revision note:** this file was written against an earlier draft of
+> Phase 4 that introduced repository interfaces, a composition root, and
+> dependency injection. That design was cut — Phase 4 as actually built
+> keeps the plain `routes → controllers → services` shape the Mongo app
+> already uses, with no interfaces or DI (see
+> [phase-4-clean-architecture-express.md](./phase-4-clean-architecture-express.md)
+> §4.5 for why). Read everything below about `DrizzleTaskRepository`,
+> `composition-root.ts`, and "fake repository" unit tests as describing a
+> design that doesn't exist in this codebase. The integration tests
+> (`testcontainers`-backed, exercising real Postgres/Redis) and E2E tests
+> (`supertest` against the app) still apply directly — just target
+> `services/pg/*.ts` / `services/redis/*.ts` functions and the
+> `pg-app.ts` Express app instead of repository classes. The note above was
+> scoped to keep this file honest about what Phase 4 actually produced, not
+> a rewrite of the testing plan itself.
+>
+> **Implemented** (`vitest.pg.config.ts`, `tests/pg/**`, `npm run test:pg`):
+> real-Postgres integration tests for every `services/pg/*.ts` file,
+> real-Redis integration tests for every `services/redis/*.ts` file
+> (including §5.4's two named regression tests, verbatim), E2E tests for
+> every `routes/pg/*.ts` route group against the real `pg-app.ts`, and unit
+> tests for every `validation/pg/*.ts` schema — 255 tests across 21 files,
+> same 90/85/90/90 coverage gate as the Mongo suite (§5.7). Two real bugs
+> surfaced by writing these tests were fixed in the source: an `sql\`ANY(...)\``
+> array-filter bug in `task.service.ts` (Drizzle doesn't serialize a JS array
+> into that raw SQL slot), and a missing `currentWorkspaceId` update on the
+> returned user object in `auth.service.ts`'s OAuth signup path. §5.1's
+> DI/fake-repository unit-testing section still doesn't apply, per the note
+> above — there is no repository interface to fake.
+
 > Part of the [migrations/](./PLAN.md) series. Assumes
-> [Phase 4](./phase-4-nestjs-clean-architecture.md) is done — the Nest app
-> exists with repository interfaces cleanly separating application logic
-> from Drizzle/ioredis. This file: how each of the current suite's three
-> tiers (`tests/unit`, `tests/integration`, `tests/e2e`) maps to the new
-> architecture, why DI fundamentally changes what a "unit test" even means
-> here, and how to prove behavioral parity with the existing Mongo suite
-> before cutover.
+> [Phase 4](./phase-4-clean-architecture-express.md) is done. This file: how
+> each of the current suite's three tiers (`tests/unit`, `tests/integration`,
+> `tests/e2e`) maps to the new stack, and how to prove behavioral parity
+> with the existing Mongo suite before cutover.
 
 ---
 
@@ -80,7 +107,7 @@ imports zero database drivers).
 |---|---|---|---|
 | **Unit** | Config/providers/middleware/utils only — services excluded (see §5.1) | Same, **plus** every `application/*/task.service.ts` use case, tested against fake repositories per §5.1 | Services are now unit-testable for the first time in this codebase's history |
 | **Integration** | `mongodb-memory-server`-backed, exercises real Mongoose queries end-to-end per service | Real Postgres (via `testcontainers`) exercising real Drizzle repository implementations; real Redis (via `testcontainers` or a Docker Compose test instance) exercising real ioredis repository implementations | Tests the repository *implementations* — the part unit tests deliberately fake out |
-| **E2E** | `supertest` against the running Express app + real routes | `supertest` (or Nest's own `@nestjs/testing` `TestingModule` + `app.getHttpServer()`) against the running Nest app + real routes, backed by the same `testcontainers` Postgres/Redis as integration tests | Same intent, same tool family (supertest), different app under test |
+| **E2E** | `supertest` against the running Express app + real routes | `supertest` against the same Express app, now built from `composition-root.ts` with real Postgres/Redis repository implementations, backed by the same `testcontainers` Postgres/Redis as integration tests | Same tool, same app framework — only what's behind the composition root changed |
 
 ---
 
@@ -187,27 +214,23 @@ building.
 
 ---
 
-## 5.5 E2E tests: proving the full stack, Nest-native
+## 5.5 E2E tests: proving the full stack, still Express
 
 ```ts
 // tests/e2e/task.routes.e2e.test.ts
 describe("POST /workspaces/:id/projects/:id/tasks (e2e)", () => {
-  let app: INestApplication;
+  let app: Express;
 
   beforeAll(async () => {
     const { db } = await setupTestPostgres();
     const redis = await setupTestRedis();
-    const moduleRef = await Test.createTestingModule({ imports: [AppModule] })
-      .overrideProvider(DRIZZLE_CLIENT).useValue(db)
-      .overrideProvider(REDIS_CLIENT).useValue(redis)
-      .compile();
-    app = moduleRef.createNestApplication();
-    await app.init();
+    const container = buildContainer(db, redis); // same composition root as production, real Postgres/Redis instead of dev ones
+    app = buildApp(container); // the existing Express app factory, now taking the container instead of importing services directly
   });
 
   it("rejects task creation for a non-member assignee with 400", async () => {
     const token = await loginAndGetToken(app, /* seeded test user */);
-    await request(app.getHttpServer())
+    await request(app)
       .post(`/workspaces/${wsId}/projects/${projId}/tasks`)
       .set("Authorization", `Bearer ${token}`)
       .send({ title: "T", assignedTo: "not-a-member-id", priority: "LOW", status: "TODO" })
@@ -216,20 +239,21 @@ describe("POST /workspaces/:id/projects/:id/tasks (e2e)", () => {
 });
 ```
 
-`.overrideProvider(...).useValue(...)` is Nest's `@nestjs/testing` module
-doing, at the *application/DI* level, exactly what §5.1's `FakeTaskRepository`
-did at the *unit* level — swap what a token resolves to. This is worth
-noticing explicitly: **the same dependency-inversion mechanism that made
-unit testing possible (§5.1) is what makes E2E test setup clean here too** —
-one architectural decision (Phase 4) pays off at every test tier, not just
-one.
+Passing `buildContainer(db, redis)` real `testcontainers`-backed clients here
+is doing, at the *composition-root* level, exactly what §5.1's
+`FakeTaskRepository` did at the *unit* level — swap what gets threaded into
+the services. This is worth noticing explicitly: **the same
+dependency-inversion mechanism that made unit testing possible (§5.1) is
+what makes E2E test setup clean here too** — one architectural decision
+(Phase 4) pays off at every test tier, not just one, with no framework
+required to get that benefit.
 
 ---
 
 ## 5.6 Proving parity with the existing Mongo suite before cutover
 
 Before Phase 6, for every existing `tests/integration/*.integration.test.ts`
-and `tests/e2e/*.e2e.test.ts` file, its Postgres/Redis+Nest counterpart
+and `tests/e2e/*.e2e.test.ts` file, its Postgres/Redis counterpart
 should assert **the same observable behavior**, not necessarily the same
 test code. Build a simple checklist per feature:
 

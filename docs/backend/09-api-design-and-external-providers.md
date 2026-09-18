@@ -76,7 +76,7 @@ AstriX's own API surface is **mostly REST, with a real, checkable minority of RP
 All six route files are short enough to read in full, and reading them side by side is the fastest way to see AstriX's REST/RPC split as it actually exists, rather than as a generalization.
 
 ```ts
-// backend/src/routes/auth.route.ts:75-127
+// backend/src/routes/auth.route.ts:62-114
 authRoutes.post("/register", authLimiter, registerUserController);
 authRoutes.post("/login", authLimiter, loginController);
 authRoutes.post("/refresh", refreshLimiter, refreshTokenController);
@@ -320,7 +320,7 @@ export const swaggerOptions: swaggerJSDoc.Options = {
 export const swaggerSpec = swaggerJSDoc(swaggerOptions);
 ```
 
-Two things about this file matter more than they look at first glance. First, `components.schemas` is populated by spreading four plain TypeScript objects imported from `backend/src/docs/schemas/` — these are **hand-written OpenAPI schema fragments**, not generated from Zod or Mongoose, which means they can drift from the real request/response shapes if a validation schema or model changes and nobody remembers to update the matching fragment (each file carries a comment saying exactly this — e.g. `user.schemas.ts`'s top comment: "Shapes derived from src/models/user.model.ts... keep them in step with those two files"). One representative fragment:
+Two things about this file matter more than they look at first glance. First, `components.schemas` is populated by spreading four plain TypeScript objects imported from `backend/src/docs/schemas/` — these are **hand-written OpenAPI schema fragments**, not generated from Zod or Drizzle, which means they can drift from the real request/response shapes if a validation schema or the database schema changes and nobody remembers to update the matching fragment. That drift isn't hypothetical — it's the actual, current state of this exact directory: `user.schemas.ts`'s own top comment still reads "Shapes derived from src/models/user.model.ts... keep them in step with those two files," and its `User` schema still documents a Mongo-shaped `_id` field and a `currentWorkspace` example formatted like a Mongo `ObjectId` (`"64f1a2b3c4d5e6f7a8b9c0d1"`), even though the real `users` table (per [`07-database-schema-design.md`](./07-database-schema-design.md)) has had a plain `id: uuid` primary key and a `currentWorkspaceId` column since the migration, with no `src/models/` directory left to derive anything from at all. This is a known, acknowledged gap, not something silently papered over here: `user.schemas.ts`, `project.schemas.ts`, and `task.schemas.ts` all carry the same Mongo-shaped `_id`/`ObjectId`-example staleness (checked directly against each file) — `auth.schemas.ts` is the one exception, since its two fragments (`RegisterUserInput`, `LoginUserInput`) are pure request-body shapes with no id field to have gone stale in the first place. Fixing the three stale files is explicitly out of this chapter's scope — they're hand-maintained OpenAPI fragments, not something a docs chapter can correct without editing application source, so the honest thing to do here is name the gap precisely rather than either fixing it in place or ignoring it. One representative fragment, exactly as it reads in the source today:
 
 ```ts
 // backend/src/docs/schemas/user.schemas.ts:1-29
@@ -364,7 +364,7 @@ Second, and more important: `apis: ["./src/routes/**/*.ts"]` tells `swagger-jsdo
 Already shown in full in the master file ([`00-master-backend-architecture.md`](./00-master-backend-architecture.md)) — reused here with its citation because it's the exact gate that determines whether the schema-only spec above is even reachable:
 
 ```ts
-// backend/src/index.ts:101-125
+// backend/src/app.ts (excerpt)
 const apiLimiter = createRateLimiter("api", {
   max: 300,
   // Health checks (e.g. an ALB target-group check) can legitimately fire
@@ -386,22 +386,28 @@ if (config.NODE_ENV !== "production") {
 }
 ```
 
-The `/health` endpoint referenced by the rate limiter's `skip` above is likewise already shown in full in the master file:
+The `/health` endpoint referenced by the rate limiter's `skip` above actually round-trips to both backing stores, rather than reading an in-memory connection flag:
 
 ```ts
-// backend/src/index.ts:127-156 (excerpt)
-app.get("/health", (req: Request, res: Response) => {
-  const isDbConnected = mongoose.connection.readyState === 1;
+// backend/src/app.ts (excerpt)
+app.get("/health", async (req: Request, res: Response) => {
+  const [pgOk, redisOk] = await Promise.all([
+    db.execute(sql`SELECT 1`).then(() => true).catch(() => false),
+    redis.ping().then(() => true).catch(() => false),
+  ]);
 
-  res
-    .status(isDbConnected ? HTTPSTATUS.OK : HTTPSTATUS.SERVICE_UNAVAILABLE)
-    .json({
-      status: isDbConnected ? "OK" : "DEGRADED",
-      db: isDbConnected ? "connected" : "disconnected",
-      timestamp: new Date().toISOString(),
-    });
+  const healthy = pgOk && redisOk;
+
+  res.status(healthy ? HTTPSTATUS.OK : HTTPSTATUS.SERVICE_UNAVAILABLE).json({
+    status: healthy ? "OK" : "DEGRADED",
+    postgres: pgOk ? "connected" : "disconnected",
+    redis: redisOk ? "connected" : "disconnected",
+    timestamp: new Date().toISOString(),
+  });
 });
 ```
+
+Both checks run concurrently via `Promise.all`, and each is wrapped in its own `.catch(() => false)` so a Postgres outage doesn't throw before the Redis check gets a chance to run (or vice versa) — the endpoint always returns a real status for both dependencies rather than failing closed on whichever one happens to be checked first. `src/index.ts` performs an additional, stricter check before ever binding to a port: a failed `SELECT 1` there calls `process.exit(1)`, so a task that can't reach Postgres never reports itself as listening in the first place. Redis connectivity is deliberately NOT part of that startup gate — `src/redis/client.ts`'s own `"error"` listener treats a transient Redis blip as recoverable rather than fatal, so only Postgres blocks startup.
 
 `/health` is mounted unconditionally (any environment), with no `authenticate` middleware and exempted from the general rate limiter — it has to be reachable, cheaply, by an ALB target-group check regardless of environment or load. `/api/docs` is the opposite: gated entirely on `NODE_ENV !== "production"`, precisely because — even in its current schema-only state — it's still a live `swagger-ui-express` instance that would otherwise sit on a publicly reachable path in production with no auth in front of it.
 
@@ -604,11 +610,9 @@ Reading this purely as "an integration with an external HTTP API" (the CSRF/`sta
 Tracing `requestPasswordResetService` all the way through to the actual Resend API call, because it's the one place in this codebase where an external-provider failure has a real, user-facing security/UX consequence — the answer isn't obvious from reading `email.provider.ts` alone.
 
 ```ts
-// backend/src/services/auth.service.ts:427-453
-export const requestPasswordResetService = async (
-  email: string
-): Promise<void> => {
-  const user = await UserModel.findOne({ email });
+// backend/src/services/auth.service.ts:357-377
+export const requestPasswordResetService = async (email: string): Promise<void> => {
+  const [user] = await db.select().from(users).where(eq(users.email, email));
 
   // Deliberately the same outcome (no error, no distinguishing response)
   // whether or not the account exists - an unauthenticated "does this email
@@ -617,25 +621,23 @@ export const requestPasswordResetService = async (
     return;
   }
 
-  // Only the newest reset link should work - drop any previously issued,
-  // still-valid ones for this user.
-  await PasswordResetTokenModel.deleteMany({ userId: user._id });
-
   const rawToken = crypto.randomBytes(32).toString("hex");
-
-  await PasswordResetTokenModel.create({
-    userId: user._id,
-    tokenHash: hashToken(rawToken),
-    expiresAt: calculateExpiryDate(config.PASSWORD_RESET_TOKEN_EXPIRES_IN),
-  });
+  await storeToken(
+    "pwreset",
+    hashToken(rawToken),
+    user.id,
+    ttlSecondsUntil(config.PASSWORD_RESET_TOKEN_EXPIRES_IN)
+  );
 
   const resetUrl = `${config.FRONTEND_PASSWORD_RESET_URL}?token=${rawToken}`;
   await sendPasswordResetEmail(user.email, resetUrl);
 };
 ```
 
+`storeToken("pwreset", hashToken(rawToken), user.id, ttlSecondsUntil(...))` is `services/redis/token.service.ts`'s single-use-token store — a Redis `SET` with an expiry equal to the token's own lifetime, keyed by the token's hash. This is a direct, deliberate simplification over what a Postgres-table-backed reset token would need: there's no separate "delete any previously issued token for this user first" step the way a `PasswordResetTokenModel.deleteMany({ userId })`-style table-backed version would need, because a *new* call to `requestPasswordResetService` simply writes a new Redis key under a new token's hash — the old token isn't explicitly revoked, but Redis's own TTL expires it on the same schedule it always would have, and `resetPasswordService`'s `consumeToken(...)` call makes any token single-use via an atomic get-and-delete regardless of how many were ever issued. Full Redis TTL/token-store mechanics are [`03-middleware-and-request-pipeline.md`](./03-middleware-and-request-pipeline.md)'s territory, not re-derived here.
+
 ```ts
-// backend/src/controllers/auth.controller.ts:249-263
+// backend/src/controllers/auth.controller.ts:238-253
 export const forgotPasswordController = asyncHandler(
   async (req: Request, res: Response) => {
     const { email } = forgotPasswordSchema.parse(req.body);
@@ -654,7 +656,7 @@ export const forgotPasswordController = asyncHandler(
 );
 ```
 
-The full call chain for an existing account: `POST /auth/forgot-password` → `forgotPasswordController` parses the body with Zod → `requestPasswordResetService` looks the user up, deletes any stale reset tokens, generates a fresh 32-byte random token, persists only its SHA-256 hash (never the raw token — the same discipline covered for refresh tokens in [file 02](./02-authentication-and-authorization.md#33-the-session-model)), builds a reset URL embedding the *raw* token, and calls `sendPasswordResetEmail(user.email, resetUrl)` — which is `email.provider.ts`'s `sendEmail` under the hood, `await`ed all the way up.
+The full call chain for an existing account: `POST /auth/forgot-password` → `forgotPasswordController` parses the body with Zod → `requestPasswordResetService` looks the user up, generates a fresh 32-byte random token, stores only its SHA-256 hash in Redis under a TTL equal to the token's own lifetime (never the raw token — the same discipline covered for refresh tokens in [file 02](./02-authentication-and-authorization.md#33-the-session-model)), builds a reset URL embedding the *raw* token, and calls `sendPasswordResetEmail(user.email, resetUrl)` — which is `email.provider.ts`'s `sendEmail` under the hood, `await`ed all the way up. As §4.1's code above already shows, there's no separate "delete any previously issued token" step here — a Postgres-table-backed version of this would need one, but a fresh `storeToken(...)` call simply writes a new Redis key under the new token's own hash, and Redis's TTL retires whatever was issued before on its own schedule.
 
 **Now the concrete question: what happens if Resend is unreachable, or `RESEND_API_KEY` is unset or invalid — does the password-reset request still return success even though no email was sent?**
 
@@ -695,7 +697,7 @@ Briefly, since the CSRF/`state`/session mechanics are [file 02](./02-authenticat
 **Outbound API key/secret handling in logs — asymmetric between the two providers, by construction.** `google.provider.ts` wraps both outbound calls in one `try`/`catch` that discards the original error entirely and throws a fresh, generic `UnauthorizedException("Failed to authenticate with Google")` (§3.5) — so whatever an axios error object might have carried (potentially including request config, which for the token-exchange call includes `client_secret` in its POST body) never reaches `errorHandler`'s logging call or any other log line; it's discarded in the `catch` before anything downstream ever sees it. `email.provider.ts` takes a different path: a Resend API-level failure is logged directly (`logger.error({ to, err: error, ...logContext }, "Resend failed to send email")`), but `err: error` here is Resend's own returned error object from `client.emails.send`, not a raw HTTP client error — it does not include the request itself (the API key is sent as a bearer credential by the SDK, not echoed back in its own error shape). Cross-checked against [`04-error-handling-patterns.md`](./04-error-handling-patterns.md)'s coverage of `errorHandler`'s production behavior: any error that *does* reach that shared middleware uncaught falls through to its final, catch-all branch —
 
 ```ts
-// backend/src/middlewares/errorHandles.middleware.ts:141-147
+// backend/src/middlewares/errorHandles.middleware.ts:67-72
 return res.status(HTTPSTATUS.INTERNAL_SERVER_ERROR).json({
   message: "Internal Server Error",
   error:

@@ -1,157 +1,282 @@
-import mongoose from "mongoose";
-import { Roles } from "../enums/role.enum";
-import MemberModel from "../models/member.model";
-import RoleModel from "../models/roles-permission.model";
-import UserModel from "../models/user.model";
-import WorkspaceModel from "../models/workspace.model";
+import { eq, and } from "drizzle-orm";
+import { db } from "../db/client";
+import {
+  users,
+  workspaces,
+  roles,
+  workspaceMembers,
+} from "../db/schema";
+import { generateInviteCode } from "../utils/uuid";
 import {
   BadRequestException,
   ForbiddenException,
   NotFoundException,
 } from "../utils/appError";
-import TaskModel from "../models/task.model";
-import { TaskStatusEnum } from "../enums/task.enum";
-import ProjectModel from "../models/project.model";
 
-//********************************
-// CREATE NEW WORKSPACE
-//**************** **************/
+// Ports workspace.service.ts's createWorkspaceService (find user -> find
+// OWNER role -> create workspace -> create membership -> set user's
+// currentWorkspace) into one Postgres transaction. See Phase 2 §2.5 for why
+// `tx`, not `db`, must be threaded into every nested call here.
 export const createWorkspaceService = async (
   userId: string,
-  body: {
-    name: string;
-    description?: string | undefined;
-  }
+  body: { name: string; description?: string }
 ) => {
-  const { name, description } = body;
+  return db.transaction(async (tx) => {
+    const [user] = await tx.select().from(users).where(eq(users.id, userId));
+    if (!user) throw new NotFoundException("User not found");
 
-  const session = await mongoose.startSession();
-  session.startTransaction();
+    const [ownerRole] = await tx
+      .select()
+      .from(roles)
+      .where(eq(roles.name, "OWNER"));
+    if (!ownerRole) throw new NotFoundException("Owner role not found");
 
-  try {
-    const user = await UserModel.findById(userId).session(session);
-    if (!user) {
-      throw new NotFoundException("User not found");
-    }
+    const [workspace] = await tx
+      .insert(workspaces)
+      .values({
+        name: body.name,
+        description: body.description,
+        ownerId: user.id,
+        inviteCode: generateInviteCode(),
+      })
+      .returning();
 
-    const ownerRole = await RoleModel.findOne({ name: Roles.OWNER }).session(
-      session
-    );
-    if (!ownerRole) {
-      throw new NotFoundException("Owner role not found");
-    }
-
-    const workspace = new WorkspaceModel({
-      name: name,
-      description: description,
-      owner: user._id,
+    await tx.insert(workspaceMembers).values({
+      userId: user.id,
+      workspaceId: workspace.id,
+      roleId: ownerRole.id,
     });
-    await workspace.save({ session });
 
-    const member = new MemberModel({
-      userId: user._id,
-      workspaceId: workspace._id,
-      role: ownerRole._id,
-      joinedAt: new Date(),
-    });
-    await member.save({ session });
+    await tx
+      .update(users)
+      .set({ currentWorkspaceId: workspace.id })
+      .where(eq(users.id, user.id));
 
-    user.currentWorkspace = workspace._id as mongoose.Types.ObjectId;
-    await user.save({ session });
-
-    await session.commitTransaction();
-    session.endSession();
-
-    return {
-      workspace,
-    };
-  } catch (error) {
-    await session.abortTransaction();
-    session.endSession();
-    throw error;
-  }
+    return { workspace };
+  });
 };
 
-//********************************
-// GET WORKSPACES USER IS A MEMBER
-//**************** **************/
+// Ports workspace.service.ts's getAllWorkspacesUserIsMemberService. The
+// Mongo version populates workspaceId on each membership; this is the same
+// join, pushed into one query instead of N+1 populate round trips.
 export const getAllWorkspacesUserIsMemberService = async (userId: string) => {
-  const memberships = await MemberModel.find({ userId })
-    .populate("workspaceId")
-    .exec();
+  const rows = await db
+    .select({ workspace: workspaces })
+    .from(workspaceMembers)
+    .innerJoin(workspaces, eq(workspaceMembers.workspaceId, workspaces.id))
+    .where(eq(workspaceMembers.userId, userId));
 
-  // Extract workspace details from memberships
-  const workspaces = memberships.map((membership) => membership.workspaceId);
-
-  return { workspaces };
+  return { workspaces: rows.map((r) => r.workspace) };
 };
 
+// Ports workspace.service.ts's getWorkspaceByIdService - fetches the
+// workspace plus its members (each with role populated), merged into one
+// response object exactly like the Mongo version's
+// `{ ...workspace.toObject(), members }`.
 export const getWorkspaceByIdService = async (workspaceId: string) => {
-  const workspace = await WorkspaceModel.findById(workspaceId);
+  const [workspace] = await db
+    .select()
+    .from(workspaces)
+    .where(eq(workspaces.id, workspaceId));
 
   if (!workspace) {
     throw new NotFoundException("Workspace not found");
   }
 
-  const members = await MemberModel.find({
-    workspaceId,
-  }).populate("role");
+  const { members } = await getWorkspaceMembersService(workspaceId);
 
-  const workspaceWithMembers = {
-    ...workspace.toObject(),
-    members,
-  };
-
-  return {
-    workspace: workspaceWithMembers,
-  };
+  return { workspace: { ...workspace, members } };
 };
 
-//********************************
-// GET ALL MEMEBERS IN WORKSPACE
-//**************** **************/
+// Ports workspace.service.ts's updateWorkspaceByIdService.
+export const updateWorkspaceByIdService = async (
+  workspaceId: string,
+  name: string,
+  description?: string
+) => {
+  const [workspace] = await db
+    .update(workspaces)
+    .set({
+      ...(name ? { name } : {}),
+      ...(description !== undefined ? { description } : {}),
+      updatedAt: new Date(),
+    })
+    .where(eq(workspaces.id, workspaceId))
+    .returning();
 
+  if (!workspace) {
+    throw new NotFoundException("Workspace not found");
+  }
+
+  return { workspace };
+};
+
+// Ports workspace.service.ts's resetWorkspaceInviteCodeService.
+export const resetWorkspaceInviteCodeService = async (workspaceId: string) => {
+  const [workspace] = await db
+    .update(workspaces)
+    .set({ inviteCode: generateInviteCode(), updatedAt: new Date() })
+    .where(eq(workspaces.id, workspaceId))
+    .returning();
+
+  if (!workspace) {
+    throw new NotFoundException("Workspace not found");
+  }
+
+  return { workspace };
+};
+
+// Ports workspace.service.ts's removeMemberFromWorkspaceService - shared by
+// an OWNER/ADMIN removing someone else and a member removing themselves
+// (leave-workspace). The workspace owner can never be removed this way.
+export const removeMemberFromWorkspaceService = async (
+  workspaceId: string,
+  targetUserId: string
+) => {
+  const [workspace] = await db
+    .select()
+    .from(workspaces)
+    .where(eq(workspaces.id, workspaceId));
+  if (!workspace) throw new NotFoundException("Workspace not found");
+
+  if (workspace.ownerId === targetUserId) {
+    throw new BadRequestException(
+      "The workspace owner cannot be removed. Transfer ownership first."
+    );
+  }
+
+  const { tasks } = await import("../db/schema");
+
+  const [deleted] = await db
+    .delete(workspaceMembers)
+    .where(
+      and(
+        eq(workspaceMembers.userId, targetUserId),
+        eq(workspaceMembers.workspaceId, workspaceId)
+      )
+    )
+    .returning();
+
+  if (!deleted) {
+    throw new NotFoundException("Member not found in this workspace");
+  }
+
+  // Unassign (don't delete) any tasks the removed member was assigned -
+  // the tasks themselves are still valid workspace history.
+  await db
+    .update(tasks)
+    .set({ assignedTo: null })
+    .where(and(eq(tasks.workspaceId, workspaceId), eq(tasks.assignedTo, targetUserId)));
+
+  const [user] = await db
+    .select({ currentWorkspaceId: users.currentWorkspaceId })
+    .from(users)
+    .where(eq(users.id, targetUserId));
+
+  if (user?.currentWorkspaceId === workspaceId) {
+    const [anotherMembership] = await db
+      .select({ workspaceId: workspaceMembers.workspaceId })
+      .from(workspaceMembers)
+      .where(eq(workspaceMembers.userId, targetUserId))
+      .limit(1);
+
+    await db
+      .update(users)
+      .set({ currentWorkspaceId: anotherMembership?.workspaceId ?? null })
+      .where(eq(users.id, targetUserId));
+  }
+};
+
+// Ports workspace.service.ts's getWorkspaceMembersService - a genuine
+// 3-table join (workspace_members -> users -> roles), replacing two
+// separate `.populate()` calls with one query (Phase 2 §2.8 item 4).
 export const getWorkspaceMembersService = async (workspaceId: string) => {
-  // Fetch all members of the workspace
+  const members = await db
+    .select({
+      id: workspaceMembers.id,
+      joinedAt: workspaceMembers.joinedAt,
+      user: {
+        id: users.id,
+        name: users.name,
+        email: users.email,
+        profilePicture: users.profilePicture,
+      },
+      role: { id: roles.id, name: roles.name },
+    })
+    .from(workspaceMembers)
+    .innerJoin(users, eq(workspaceMembers.userId, users.id))
+    .innerJoin(roles, eq(workspaceMembers.roleId, roles.id))
+    .where(eq(workspaceMembers.workspaceId, workspaceId));
 
-  const members = await MemberModel.find({
-    workspaceId,
-  })
-    .populate("userId", "name email profilePicture -password")
-    .populate("role", "name");
+  return { members };
+};
 
-  const roles = await RoleModel.find({}, { name: 1, _id: 1 })
-    .select("-permission")
-    .lean();
+// Ports workspace.service.ts's deleteWorkspaceService. The Mongo version
+// manually deletes projects/tasks/members inside a transaction before
+// deleting the workspace itself (workspace.service.ts:311-333); here that
+// collapses to one DELETE because ON DELETE CASCADE (Phase 1 §1.4) does it
+// atomically. The one piece of logic that ISN'T a pure cascade side effect -
+// reassigning the deleting user's currentWorkspace to another membership if
+// one exists, rather than leaving it at Postgres's automatic NULL - is kept
+// explicit here, same as the Mongo original.
+export const deleteWorkspaceService = async (
+  workspaceId: string,
+  userId: string
+) => {
+  return db.transaction(async (tx) => {
+    const [workspace] = await tx
+      .select()
+      .from(workspaces)
+      .where(eq(workspaces.id, workspaceId));
+    if (!workspace) throw new NotFoundException("Workspace not found");
 
-  return { members, roles };
+    if (workspace.ownerId !== userId) {
+      throw new ForbiddenException(
+        "You are not authorized to delete this workspace"
+      );
+    }
+
+    await tx.delete(workspaces).where(eq(workspaces.id, workspaceId));
+    // ON DELETE CASCADE already removed workspace_members/projects/tasks
+    // rows for this workspace, and set users.current_workspace_id to NULL
+    // for every user whose current workspace was this one.
+
+    const [anotherMembership] = await tx
+      .select({ workspaceId: workspaceMembers.workspaceId })
+      .from(workspaceMembers)
+      .where(eq(workspaceMembers.userId, userId))
+      .limit(1);
+
+    if (anotherMembership) {
+      await tx
+        .update(users)
+        .set({ currentWorkspaceId: anotherMembership.workspaceId })
+        .where(eq(users.id, userId));
+    }
+
+    const [updatedUser] = await tx
+      .select({ currentWorkspaceId: users.currentWorkspaceId })
+      .from(users)
+      .where(eq(users.id, userId));
+
+    return { currentWorkspaceId: updatedUser?.currentWorkspaceId ?? null };
+  });
 };
 
 export const getWorkspaceAnalyticsService = async (workspaceId: string) => {
-  const currentDate = new Date();
+  const { tasks } = await import("../db/schema");
+  const { sql } = await import("drizzle-orm");
 
-  const totalTasks = await TaskModel.countDocuments({
-    workspace: workspaceId,
-  });
+  const [row] = await db
+    .select({
+      totalTasks: sql<number>`count(*)::int`,
+      overdueTasks: sql<number>`count(*) filter (where ${tasks.dueDate} < now() and ${tasks.status} != 'DONE')::int`,
+      completedTasks: sql<number>`count(*) filter (where ${tasks.status} = 'DONE')::int`,
+    })
+    .from(tasks)
+    .where(eq(tasks.workspaceId, workspaceId));
 
-  const overdueTasks = await TaskModel.countDocuments({
-    workspace: workspaceId,
-    dueDate: { $lt: currentDate },
-    status: { $ne: TaskStatusEnum.DONE },
-  });
-
-  const completedTasks = await TaskModel.countDocuments({
-    workspace: workspaceId,
-    status: TaskStatusEnum.DONE,
-  });
-
-  const analytics = {
-    totalTasks,
-    overdueTasks,
-    completedTasks,
-  };
-
-  return { analytics };
+  return { analytics: row };
 };
 
 export const changeMemberRoleService = async (
@@ -159,189 +284,32 @@ export const changeMemberRoleService = async (
   targetUserId: string,
   roleId: string
 ) => {
-  const workspace = await WorkspaceModel.findById(workspaceId);
-  if (!workspace) {
-    throw new NotFoundException("Workspace not found");
-  }
+  const [workspace] = await db
+    .select()
+    .from(workspaces)
+    .where(eq(workspaces.id, workspaceId));
+  if (!workspace) throw new NotFoundException("Workspace not found");
 
-  if (workspace.owner.equals(new mongoose.Types.ObjectId(targetUserId))) {
+  if (workspace.ownerId === targetUserId) {
     throw new BadRequestException(
       "Cannot change the role of the workspace owner. Transfer ownership first."
     );
   }
 
-  const role = await RoleModel.findById(roleId);
-  if (!role) {
-    throw new NotFoundException("Role not found");
-  }
+  const [role] = await db.select().from(roles).where(eq(roles.id, roleId));
+  if (!role) throw new NotFoundException("Role not found");
 
-  const member = await MemberModel.findOne({
-    userId: targetUserId,
-    workspaceId: workspaceId,
-  });
+  const [member] = await db
+    .update(workspaceMembers)
+    .set({ roleId })
+    .where(
+      and(
+        eq(workspaceMembers.userId, targetUserId),
+        eq(workspaceMembers.workspaceId, workspaceId)
+      )
+    )
+    .returning();
 
-  if (!member) {
-    throw new NotFoundException("Member not found in the workspace");
-  }
-
-  member.role = role;
-  await member.save();
-
-  return {
-    member,
-  };
-};
-
-//********************************
-// REMOVE MEMBER / LEAVE WORKSPACE
-// Shared by both: an OWNER/ADMIN removing someone else (gated by the
-// REMOVE_MEMBER permission at the controller) and a member removing
-// themselves (leave-workspace, gated only by membership). Either way the
-// workspace owner can never be removed this way - that would leave the
-// workspace with nobody holding owner-level permissions. Ownership must be
-// transferred (not currently supported) before the owner can leave.
-//**************** **************/
-export const removeMemberFromWorkspaceService = async (
-  workspaceId: string,
-  targetUserId: string
-) => {
-  const workspace = await WorkspaceModel.findById(workspaceId);
-  if (!workspace) {
-    throw new NotFoundException("Workspace not found");
-  }
-
-  if (workspace.owner.equals(new mongoose.Types.ObjectId(targetUserId))) {
-    throw new BadRequestException(
-      "The workspace owner cannot be removed. Transfer ownership first."
-    );
-  }
-
-  const member = await MemberModel.findOneAndDelete({
-    userId: targetUserId,
-    workspaceId,
-  });
-
-  if (!member) {
-    throw new NotFoundException("Member not found in this workspace");
-  }
-
-  // Unassign (don't delete) any tasks the removed member was assigned -
-  // the tasks themselves are still valid workspace history.
-  await TaskModel.updateMany(
-    { workspace: workspaceId, assignedTo: targetUserId },
-    { assignedTo: null }
-  );
-
-  const user = await UserModel.findById(targetUserId);
-  if (user?.currentWorkspace?.equals(workspaceId)) {
-    const anotherMembership = await MemberModel.findOne({
-      userId: targetUserId,
-    });
-    user.currentWorkspace = anotherMembership
-      ? (anotherMembership.workspaceId as mongoose.Types.ObjectId)
-      : null;
-    await user.save();
-  }
-};
-
-//********************************
-// RESET WORKSPACE INVITE CODE
-//**************** **************/
-export const resetWorkspaceInviteCodeService = async (workspaceId: string) => {
-  const workspace = await WorkspaceModel.findById(workspaceId);
-  if (!workspace) {
-    throw new NotFoundException("Workspace not found");
-  }
-
-  workspace.resetInviteCode();
-  await workspace.save();
-
-  return { workspace };
-};
-
-//********************************
-// UPDATE WORKSPACE
-//**************** **************/
-export const updateWorkspaceByIdService = async (
-  workspaceId: string,
-  name: string,
-  description?: string
-) => {
-  const workspace = await WorkspaceModel.findById(workspaceId);
-  if (!workspace) {
-    throw new NotFoundException("Workspace not found");
-  }
-
-  // Update the workspace details
-  workspace.name = name || workspace.name;
-  workspace.description = description || workspace.description;
-  await workspace.save();
-
-  return {
-    workspace,
-  };
-};
-
-export const deleteWorkspaceService = async (
-  workspaceId: string,
-  userId: string
-) => {
-  const session = await mongoose.startSession();
-  session.startTransaction();
-
-  try {
-    const workspace =
-      await WorkspaceModel.findById(workspaceId).session(session);
-    if (!workspace) {
-      throw new NotFoundException("Workspace not found");
-    }
-
-    // Check if the user owns the workspace
-    if (!workspace.owner.equals(new mongoose.Types.ObjectId(userId))) {
-      throw new ForbiddenException(
-        "You are not authorized to delete this workspace"
-      );
-    }
-
-    const user = await UserModel.findById(userId).session(session);
-    if (!user) {
-      throw new NotFoundException("User not found");
-    }
-
-    await ProjectModel.deleteMany({ workspace: workspace._id }).session(
-      session
-    );
-    await TaskModel.deleteMany({ workspace: workspace._id }).session(session);
-
-    await MemberModel.deleteMany({
-      workspaceId: workspace._id,
-    }).session(session);
-
-    // Update the user's currentWorkspace if it matches the deleted workspace
-    if (user?.currentWorkspace?.equals(workspaceId)) {
-      const memberWorkspace = await MemberModel.findOne({ userId }).session(
-        session
-      );
-      // Update the user's currentWorkspace
-      user.currentWorkspace = memberWorkspace
-        ? memberWorkspace.workspaceId
-        : null;
-
-      await user.save({ session });
-    }
-
-    await workspace.deleteOne({ session });
-
-    await session.commitTransaction();
-
-    session.endSession();
-
-    return {
-      currentWorkspace: user.currentWorkspace,
-    };
-  } catch (error) {
-    await session.abortTransaction();
-    session.endSession();
-    throw error;
-  }
+  if (!member) throw new NotFoundException("Member not found in the workspace");
+  return { member };
 };

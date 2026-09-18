@@ -233,26 +233,89 @@ docker compose exec postgres psql -U astrix -d astrix -c "SELECT version();"
 docker compose exec redis redis-cli PING
 ```
 
-### Test before moving to Phase 1
+---
 
-- `psql` prints a Postgres 16.x version string.
-- `redis-cli PING` returns `PONG`.
-- `docker compose down` and `docker compose up -d` again — confirm Postgres
-  data persists (create a throwaway table, restart, confirm it's still
-  there) — this is your first hands-on proof that the named volume + WAL
-  durability model (§0.2) actually works, not just theory.
-- **`npm run dev` in `backend/` still boots against Mongo, unaffected** —
-  confirm this explicitly; this phase must leave the running app untouched.
+## 0.5 Actually done — status: ✅ complete
+
+`docker-compose.yml` is committed at the repo root exactly as specified in
+§0.4, unmodified. Executed on this machine (Docker Desktop 29.0.1, Compose
+v2.40.3) — one real-world wrinkle worth recording: **Docker Desktop was not
+running when `docker compose up -d` was first tried** and failed with
+`Cannot connect to the Docker daemon`. This is a normal papercut, not a
+config problem — Docker Desktop has to actually be launched (`open -a
+Docker` on macOS) before `docker compose` can talk to its daemon over the
+Unix socket. Worth knowing for next time, not something the compose file
+can fix.
+
+```
+$ docker compose ps
+NAME              IMAGE         SERVICE    STATUS
+astrix-postgres   postgres:16   postgres   Up (healthy)
+astrix-redis      redis:7       redis      Up (healthy)
+
+$ docker compose exec postgres psql -U astrix -d astrix -c "SELECT version();"
+PostgreSQL 16.15 (Debian 16.15-1.pgdg13+2) on aarch64-unknown-linux-gnu, ...
+
+$ docker compose exec redis redis-cli PING
+PONG
+```
+
+Postgres 16.15 (the current patch release on the `postgres:16` tag as of
+this run) — confirms the "pin the major version, not `latest`" reasoning in
+§0.4: a fixed `16` tag still floats across patch releases (which is fine —
+patch releases don't break anything relevant here) while never silently
+jumping to Postgres 17.
+
+### Persistence test — actually run, not just described
+
+```
+$ docker compose exec postgres psql -U astrix -d astrix -c \
+    "CREATE TABLE persistence_check (id serial primary key, note text); \
+     INSERT INTO persistence_check (note) VALUES ('phase-0 durability proof');"
+CREATE TABLE
+INSERT 0 1
+
+$ docker compose down && docker compose up -d
+ Container astrix-postgres  Removed   # container removed...
+ Container astrix-postgres  Created   # ...and recreated from scratch
+ Container astrix-postgres  Started
+
+$ docker compose exec postgres psql -U astrix -d astrix -c "SELECT * FROM persistence_check;"
+ id |           note
+----+---------------------------
+  1 | phase-0 durability proof
+(1 row)
+```
+
+This is the concrete proof behind §0.2's durability claim: `docker compose
+down` (without `-v`) destroys the *container* but not the named `pgdata`
+volume, and the row survived a full container teardown/recreate — not a
+mere process restart. The `persistence_check` table was dropped immediately
+after, so the schema stays clean for Phase 1.
+
+### Mongo app unaffected — actually verified
+
+```
+$ npm run dev   # in backend/
+[INFO] ts-node-dev ver. 2.0.0 (using ts-node ver. 10.9.2, typescript ver. 5.9.3)
+{"level":30,...,"msg":"Connected to Mongo Database"}
+{"level":30,...,"msg":"Server listening on port 8000 in development environment"}
+```
+
+Booted clean against the existing `MONGO_URI`, with Postgres/Redis
+containers running alongside it the whole time — confirms Phase 0 added new
+infrastructure without touching anything `src/` depends on.
 
 ### Rollback
 
 `docker compose down -v` (the `-v` also drops the named volume — fine here,
-nothing real is stored yet). Nothing in `src/` was touched, so there is
-nothing else to undo.
+nothing real is stored yet, and the one throwaway table made during
+verification has already been dropped). Nothing in `src/` was touched, so
+there is nothing else to undo.
 
 ---
 
-## 0.5 What to read next
+## 0.6 What to read next
 
 Continue to
 [phase-1-schema-design-and-postgres-fundamentals.md](./phase-1-schema-design-and-postgres-fundamentals.md)

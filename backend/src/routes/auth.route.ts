@@ -25,7 +25,7 @@ import {
 const authRoutes = Router();
 
 const authLimiter = createRateLimiter("auth", {
-  max: 5,
+  max: config.AUTH_RATE_LIMIT_MAX,
   message: {
     error: "Too many login attempts. Please try again in 15 minutes.",
   },
@@ -37,10 +37,6 @@ const refreshLimiter = createRateLimiter("refresh", {
   message: { error: "Too many refresh attempts. Please try again later." },
 });
 
-// Tight limit - forgot-password is an unauthenticated endpoint that both
-// sends real email (cost + abuse vector) and could otherwise be used to
-// probe which emails have accounts (mitigated by the identical response
-// either way, but rate limiting is still the right belt-and-suspenders).
 const passwordResetLimiter = createRateLimiter("password-reset", {
   max: 5,
   message: {
@@ -48,25 +44,16 @@ const passwordResetLimiter = createRateLimiter("password-reset", {
   },
 });
 
-// Covers both the OAuth kickoff (cheap, but still worth bounding) and the
-// callback (hits Google's token/userinfo endpoints and writes to the DB per
-// request - the more expensive of the two, and previously completely
-// unlimited).
 const oauthLimiter = createRateLimiter("oauth", {
   max: 20,
   message: { error: "Too many attempts. Please try again later." },
 });
 
-// Own budget, separate from passwordResetLimiter - both send real email,
-// but a burst of one shouldn't eat into the other's allowance.
 const emailVerificationLimiter = createRateLimiter("email-verification", {
   max: 5,
   message: { error: "Too many attempts. Please try again later." },
 });
 
-// Sensitive, authenticated action - still worth bounding against a
-// compromised access token being used to lock a real user out via repeated
-// failed attempts (and against a token-guessing loop against the endpoint).
 const changePasswordLimiter = createRateLimiter("change-password", {
   max: 10,
   message: { error: "Too many attempts. Please try again later." },

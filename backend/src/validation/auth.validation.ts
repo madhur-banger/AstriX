@@ -39,10 +39,6 @@ export const loginSchema = z.object({
 
 export type LoginInput = z.infer<typeof loginSchema>;
 
-// ============================================
-// PASSWORD RESET SCHEMA (for future use)
-// ============================================
-
 export const forgotPasswordSchema = z.object({
   email: emailSchema,
 });
@@ -58,17 +54,9 @@ export const resetPasswordSchema = z
     path: ["confirmPassword"],
   });
 
-// ============================================
-// EMAIL VERIFICATION
-// ============================================
-
 export const verifyEmailSchema = z.object({
   token: z.string().min(1, "Verification token is required"),
 });
-
-// ============================================
-// CHANGE PASSWORD (authenticated)
-// ============================================
 
 export const changePasswordSchema = z
   .object({
@@ -81,11 +69,6 @@ export const changePasswordSchema = z
     path: ["confirmNewPassword"],
   });
 
-// ============================================
-// SESSION REVOCATION
-// ============================================
-
-export const sessionIdSchema = z
-  .string()
-  .trim()
-  .regex(/^[0-9a-fA-F]{24}$/, { message: "Invalid session ID" });
+// Postgres primary keys are UUIDs (Phase 1 §1.4), not Mongo ObjectIds - the
+// only difference from the Mongo version of this file.
+export const sessionIdSchema = z.string().trim().uuid({ message: "Invalid session ID" });

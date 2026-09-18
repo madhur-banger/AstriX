@@ -2,7 +2,7 @@ import { Request, Response } from "express";
 import { asyncHandler } from "../middlewares/asyncHandler.middleware";
 import { HTTPSTATUS } from "../config/http.config";
 import {
-  getCurrentUserService,
+  getUserByIdService,
   updateProfileService,
   deleteAccountService,
 } from "../services/user.service";
@@ -13,9 +13,9 @@ import {
 
 export const getCurrentUserController = asyncHandler(
   async (req: Request, res: Response) => {
-    const userId = req.user!._id.toString();
+    const userId = req.user!.id;
 
-    const { user } = await getCurrentUserService(userId);
+    const user = await getUserByIdService(userId);
 
     return res.status(HTTPSTATUS.OK).json({
       message: "User fetch successfully",
@@ -26,7 +26,7 @@ export const getCurrentUserController = asyncHandler(
 
 export const updateProfileController = asyncHandler(
   async (req: Request, res: Response) => {
-    const userId = req.user!._id.toString();
+    const userId = req.user!.id;
     const body = updateProfileSchema.parse(req.body);
 
     const { user } = await updateProfileService(userId, body);
@@ -40,7 +40,7 @@ export const updateProfileController = asyncHandler(
 
 export const deleteAccountController = asyncHandler(
   async (req: Request, res: Response) => {
-    const userId = req.user!._id.toString();
+    const userId = req.user!.id;
     const { password } = deleteAccountSchema.parse(req.body);
 
     await deleteAccountService(userId, password);

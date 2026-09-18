@@ -3,7 +3,7 @@
  * ---------------------------
  * These functions are almost pure: given the SAME secret and payload, they
  * produce deterministic, verifiable output. No database, no Express, no
- * mocking required - `tests/setup/testEnv.setup.ts` already gave us fixed
+ * mocking required - `tests/setup/test-env.setup.ts` already gave us fixed
  * fake secrets to sign/verify against, so real jsonwebtoken code runs here.
  *
  * THE CLEVER TRICK FOR TESTING "TOKEN EXPIRED" WITHOUT ACTUALLY WAITING:
@@ -17,20 +17,16 @@
 
 import { describe, it, expect } from "vitest";
 import jwt from "jsonwebtoken";
+import { randomUUID } from "crypto";
 
 import {
   signJwtToken,
-  generateTokenPair,
   verifyJwtToken,
-  verifyAccessToken,
-  verifyRefreshToken,
   extractBearerToken,
-  verifyAccessTokenAndGetPayload,
   accessTokenSignOptions,
+  refreshTokenSignOptions,
   calculateExpiryDate,
 } from "../../../src/utils/jwt";
-import { UnauthorizedException } from "../../../src/utils/appError";
-import { makeObjectId } from "../../setup/testFixtures";
 
 describe("calculateExpiryDate", () => {
   it("adds seconds correctly for an 's' suffix", () => {
@@ -94,7 +90,7 @@ describe("extractBearerToken", () => {
 
 describe("signJwtToken + verifyJwtToken (round trip)", () => {
   it("signs a payload and verifies it back to the same values", () => {
-    const userId = makeObjectId();
+    const userId = randomUUID();
     const payload = { userId, sessionId: "session-abc" };
 
     const token = signJwtToken(payload, accessTokenSignOptions);
@@ -105,8 +101,7 @@ describe("signJwtToken + verifyJwtToken (round trip)", () => {
 
     expect(result.valid).toBe(true);
     if (result.valid) {
-      // jwt encodes ObjectId as its string form, so compare as strings.
-      expect(String(result.payload.userId)).toBe(String(userId));
+      expect(result.payload.userId).toBe(userId);
       expect(result.payload.sessionId).toBe("session-abc");
     }
   });
@@ -143,50 +138,15 @@ describe("signJwtToken + verifyJwtToken (round trip)", () => {
       expect(result.error).toBe("Token expired");
     }
   });
-});
 
-describe("generateTokenPair + verifyAccessToken/verifyRefreshToken", () => {
-  it("generates an access token verifiable by verifyAccessToken and a refresh token verifiable by verifyRefreshToken", () => {
-    const userId = makeObjectId();
-    const { accessToken, refreshToken } = generateTokenPair(
-      userId,
-      "session-1"
-    );
+  it("a token signed with the access secret cannot be verified with the refresh secret", () => {
+    // Confirms the two secrets are actually different values in config - a
+    // common setup mistake is copy-pasting the same secret for both, which
+    // would make this test fail.
+    const token = signJwtToken({ userId: "u1", sessionId: "s1" }, accessTokenSignOptions);
 
-    const accessResult = verifyAccessToken(accessToken);
-    const refreshResult = verifyRefreshToken(refreshToken);
-
-    expect(accessResult.valid).toBe(true);
-    expect(refreshResult.valid).toBe(true);
-  });
-
-  it("an access token CANNOT be verified as a refresh token, because they use different secrets", () => {
-    // This confirms your two secrets are actually different values in
-    // config (a common setup mistake is copy-pasting the same secret for
-    // both, which would make this test fail).
-    const userId = makeObjectId();
-    const { accessToken } = generateTokenPair(userId, "session-1");
-
-    const result = verifyRefreshToken(accessToken);
+    const result = verifyJwtToken(token, refreshTokenSignOptions.secret);
 
     expect(result.valid).toBe(false);
-  });
-});
-
-describe("verifyAccessTokenAndGetPayload", () => {
-  it("returns the payload for a valid token", () => {
-    const userId = makeObjectId();
-    const { accessToken } = generateTokenPair(userId, "session-1");
-
-    const payload = verifyAccessTokenAndGetPayload(accessToken);
-
-    expect(String(payload.userId)).toBe(String(userId));
-    expect(payload.sessionId).toBe("session-1");
-  });
-
-  it("throws UnauthorizedException for a garbage/invalid token string", () => {
-    expect(() => verifyAccessTokenAndGetPayload("not-a-real-jwt")).toThrow(
-      UnauthorizedException
-    );
   });
 });

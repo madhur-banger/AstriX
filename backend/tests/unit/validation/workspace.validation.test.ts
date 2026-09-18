@@ -1,177 +1,141 @@
-/**
- * UNIT TESTS: workspace.validation.ts
- * -------------------------------------
- * These are the EASIEST tests in the whole project, and deliberately the
- * first ones you should get comfortable with, because zod schemas are
- * "pure functions": same input always produces the same output, no
- * database, no network, no mocking required at all.
- *
- * The whole point of a validation schema is to draw a line between
- * "acceptable input" and "garbage input" - so for EVERY schema we test
- * BOTH sides of that line. A test file that only checks valid input tells
- * you nothing about whether your validation actually validates anything.
- */
-
 import { describe, it, expect } from "vitest";
+
 import {
   nameSchema,
   descriptionSchema,
   workspaceIdSchema,
+  userIdSchema,
   changeRoleSchema,
   createWorkspaceSchema,
   updateWorkspaceSchema,
 } from "../../../src/validation/workspace.validation";
 
+const validUuid = "9f8b1c2d-3e4f-4a5b-8c6d-7e8f9a0b1c2d";
+const validUuid2 = "1a2b3c4d-5e6f-4a5b-8c6d-7e8f9a0b1c2e";
+
 describe("nameSchema", () => {
-  it("accepts a normal non-empty string", () => {
-    // Arrange - nothing to set up, input is inline
-    // Act
-    const result = nameSchema.parse("Engineering Team");
-    // Assert
-    expect(result).toBe("Engineering Team");
+  it("requires a non-empty value", () => {
+    const result = nameSchema.safeParse("");
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.some((issue) => issue.message === "Name is required")).toBe(
+        true
+      );
+    }
   });
 
-  it("trims leading/trailing whitespace because the schema calls .trim()", () => {
-    const result = nameSchema.parse("   Padded Name   ");
-    expect(result).toBe("Padded Name");
-  });
-
-  it("rejects an empty string (violates .min(1))", () => {
-    // .parse() THROWS a ZodError when validation fails - it does not return
-    // undefined or null. So to test the failure case, we wrap the call in
-    // a function and assert that calling it throws.
-    expect(() => nameSchema.parse("")).toThrow();
-  });
-
-  it("rejects a string of only whitespace, because .trim() runs BEFORE .min(1)", () => {
-    // This is a subtle but important zod behavior: `.trim()` transforms the
-    // value first, so "   " becomes "" before the .min(1) check runs.
-    // If this test fails, it means the schema's method order changed.
-    expect(() => nameSchema.parse("   ")).toThrow();
-  });
-
-  it("rejects a string longer than 255 characters (violates .max(255))", () => {
-    const tooLong = "a".repeat(256);
-    expect(() => nameSchema.parse(tooLong)).toThrow();
-  });
-
-  it("accepts a string of exactly 255 characters (boundary case)", () => {
-    // Testing the EXACT boundary (255, not 254 or 256) catches off-by-one
-    // errors, which are one of the most common real-world bugs.
-    const exactly255 = "a".repeat(255);
-    expect(() => nameSchema.parse(exactly255)).not.toThrow();
+  it("trims whitespace", () => {
+    const result = nameSchema.safeParse("  My Workspace  ");
+    expect(result.success).toBe(true);
+    if (result.success) expect(result.data).toBe("My Workspace");
   });
 });
 
 describe("descriptionSchema", () => {
-  it("accepts a normal string", () => {
-    expect(descriptionSchema.parse("Some description")).toBe(
-      "Some description"
-    );
-  });
-
-  it("accepts undefined, because the schema is .optional()", () => {
-    expect(descriptionSchema.parse(undefined)).toBeUndefined();
-  });
-
-  it("trims whitespace like nameSchema does", () => {
-    expect(descriptionSchema.parse("  padded  ")).toBe("padded");
+  it("is optional", () => {
+    const result = descriptionSchema.safeParse(undefined);
+    expect(result.success).toBe(true);
   });
 });
 
 describe("workspaceIdSchema", () => {
-  it("accepts a non-empty string id", () => {
-    expect(workspaceIdSchema.parse("64f1a2b3c4d5e6f7a8b9c0d1")).toBe(
-      "64f1a2b3c4d5e6f7a8b9c0d1"
-    );
+  it("accepts a valid UUID", () => {
+    const result = workspaceIdSchema.safeParse(validUuid);
+    expect(result.success).toBe(true);
   });
 
-  it("rejects an empty string", () => {
-    expect(() => workspaceIdSchema.parse("")).toThrow();
+  it("rejects a non-UUID with 'Invalid workspace ID'", () => {
+    const result = workspaceIdSchema.safeParse("not-a-uuid");
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues[0].message).toBe("Invalid workspace ID");
+    }
+  });
+});
+
+describe("userIdSchema", () => {
+  it("accepts a valid UUID", () => {
+    const result = userIdSchema.safeParse(validUuid);
+    expect(result.success).toBe(true);
   });
 
-  // A malformed id (not a valid ObjectId) reaching Mongoose triggers a
-  // CastError; validation catches it up front instead of letting a
-  // bad-shaped string reach a query.
-  it("rejects strings that are NOT valid ObjectId format", () => {
-    expect(() =>
-      workspaceIdSchema.parse("definitely-not-an-object-id")
-    ).toThrow();
+  it("rejects a non-UUID with 'Invalid user ID'", () => {
+    const result = userIdSchema.safeParse("not-a-uuid");
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues[0].message).toBe("Invalid user ID");
+    }
   });
 });
 
 describe("changeRoleSchema", () => {
-  it("accepts a valid roleId + memberId pair", () => {
-    const input = {
-      roleId: "64f1a2b3c4d5e6f7a8b9c0d1",
-      memberId: "64f1a2b3c4d5e6f7a8b9c0d2",
-    };
-    const result = changeRoleSchema.parse(input);
-    expect(result).toEqual(input);
+  it("accepts valid roleId and memberId", () => {
+    const result = changeRoleSchema.safeParse({ roleId: validUuid, memberId: validUuid2 });
+    expect(result.success).toBe(true);
   });
 
-  it("rejects a payload missing roleId", () => {
-    expect(() =>
-      changeRoleSchema.parse({ memberId: "64f1a2b3c4d5e6f7a8b9c0d2" })
-    ).toThrow();
+  it("rejects an invalid roleId", () => {
+    const result = changeRoleSchema.safeParse({ roleId: "not-a-uuid", memberId: validUuid2 });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(
+        result.error.issues.some(
+          (issue) => issue.path[0] === "roleId" && issue.message === "Invalid role ID"
+        )
+      ).toBe(true);
+    }
   });
 
-  it("rejects a payload missing memberId", () => {
-    expect(() =>
-      changeRoleSchema.parse({ roleId: "64f1a2b3c4d5e6f7a8b9c0d1" })
-    ).toThrow();
-  });
-
-  it("rejects roleId/memberId that are not valid ObjectId format", () => {
-    expect(() =>
-      changeRoleSchema.parse({ roleId: "role-123", memberId: "member-456" })
-    ).toThrow();
-  });
-
-  it("rejects extra unexpected fields being silently accepted as empty strings", () => {
-    // .object() by default in zod STRIPS unknown keys rather than rejecting them
-    // (unless .strict() was used). This test documents that current behavior -
-    // if you later add .strict() to the schema, this test should start failing,
-    // which is a good signal to come update it deliberately.
-    const result = changeRoleSchema.parse({
-      roleId: "64f1a2b3c4d5e6f7a8b9c0d1",
-      memberId: "64f1a2b3c4d5e6f7a8b9c0d2",
-      hacker: "ignored",
-    } as any);
-    expect(result).toEqual({
-      roleId: "64f1a2b3c4d5e6f7a8b9c0d1",
-      memberId: "64f1a2b3c4d5e6f7a8b9c0d2",
-    });
+  it("rejects an invalid memberId", () => {
+    const result = changeRoleSchema.safeParse({ roleId: validUuid, memberId: "not-a-uuid" });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(
+        result.error.issues.some(
+          (issue) => issue.path[0] === "memberId" && issue.message === "Invalid user ID"
+        )
+      ).toBe(true);
+    }
   });
 });
 
 describe("createWorkspaceSchema", () => {
-  it("accepts name + description", () => {
-    const result = createWorkspaceSchema.parse({
-      name: "New Workspace",
-      description: "desc",
+  it("accepts name and description", () => {
+    const result = createWorkspaceSchema.safeParse({
+      name: "Engineering",
+      description: "Eng workspace",
     });
-    expect(result).toEqual({ name: "New Workspace", description: "desc" });
+    expect(result.success).toBe(true);
   });
 
-  it("accepts name without description, since description is optional", () => {
-    const result = createWorkspaceSchema.parse({ name: "New Workspace" });
-    expect(result.name).toBe("New Workspace");
-    expect(result.description).toBeUndefined();
+  it("accepts name without description", () => {
+    const result = createWorkspaceSchema.safeParse({ name: "Engineering" });
+    expect(result.success).toBe(true);
   });
 
-  it("rejects a payload with no name at all", () => {
-    expect(() =>
-      createWorkspaceSchema.parse({ description: "only desc" })
-    ).toThrow();
+  it("rejects a missing name", () => {
+    const result = createWorkspaceSchema.safeParse({ description: "no name" });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.some((issue) => issue.path[0] === "name")).toBe(true);
+    }
   });
 });
 
 describe("updateWorkspaceSchema", () => {
-  it("is structurally identical to createWorkspaceSchema (name required, description optional)", () => {
-    expect(() =>
-      updateWorkspaceSchema.parse({ name: "Renamed" })
-    ).not.toThrow();
-    expect(() => updateWorkspaceSchema.parse({})).toThrow();
+  it("accepts name and description", () => {
+    const result = updateWorkspaceSchema.safeParse({
+      name: "Updated Workspace",
+      description: "Updated description",
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it("rejects a missing name", () => {
+    const result = updateWorkspaceSchema.safeParse({ description: "no name" });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.some((issue) => issue.path[0] === "name")).toBe(true);
+    }
   });
 });

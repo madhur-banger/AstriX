@@ -18,12 +18,13 @@ import {
   getTaskByIdService,
   updateTaskService,
 } from "../services/task.service";
+import { generateTaskCode } from "../utils/uuid";
 import { HTTPSTATUS } from "../config/http.config";
 import { Permissions } from "../enums/role.enum";
 
 export const createTaskController = asyncHandler(
   async (req: Request, res: Response) => {
-    const userId = req.user!._id.toString();
+    const userId = req.user!.id;
 
     const body = createTaskSchema.parse(req.body);
     const projectId = projectIdSchema.parse(req.params.projectId);
@@ -32,12 +33,10 @@ export const createTaskController = asyncHandler(
     const { role } = await getMemberRoleInWorkspace(userId, workspaceId);
     roleGuard(role, [Permissions.CREATE_TASK]);
 
-    const { task } = await createTaskService(
-      workspaceId,
-      projectId,
-      userId,
-      body
-    );
+    const { task } = await createTaskService(workspaceId, projectId, userId, {
+      ...body,
+      taskCode: generateTaskCode(),
+    });
 
     return res.status(HTTPSTATUS.OK).json({
       message: "Task created successfully",
@@ -48,7 +47,7 @@ export const createTaskController = asyncHandler(
 
 export const updateTaskController = asyncHandler(
   async (req: Request, res: Response) => {
-    const userId = req.user!._id.toString();
+    const userId = req.user!.id;
 
     const body = updateTaskSchema.parse(req.body);
 
@@ -75,7 +74,7 @@ export const updateTaskController = asyncHandler(
 
 export const getAllTasksController = asyncHandler(
   async (req: Request, res: Response) => {
-    const userId = req.user!._id.toString();
+    const userId = req.user!.id;
 
     const workspaceId = workspaceIdSchema.parse(req.params.workspaceId);
 
@@ -96,7 +95,7 @@ export const getAllTasksController = asyncHandler(
 
 export const getTaskByIdController = asyncHandler(
   async (req: Request, res: Response) => {
-    const userId = req.user!._id.toString();
+    const userId = req.user!.id;
 
     const taskId = taskIdSchema.parse(req.params.id);
     const projectId = projectIdSchema.parse(req.params.projectId);
@@ -116,7 +115,7 @@ export const getTaskByIdController = asyncHandler(
 
 export const deleteTaskController = asyncHandler(
   async (req: Request, res: Response) => {
-    const userId = req.user!._id.toString();
+    const userId = req.user!.id;
 
     const taskId = taskIdSchema.parse(req.params.id);
     const workspaceId = workspaceIdSchema.parse(req.params.workspaceId);

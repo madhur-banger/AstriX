@@ -1,114 +1,157 @@
 /**
- * INTEGRATION TESTS: project.service.ts
- * ---------------------------------------
- * Complements the mocked unit tests with the REAL Mongo aggregation
- * pipeline (`$facet`) behind getProjectAnalyticsService - a mocked
- * `TaskModel.aggregate` return value only proves the service maps whatever
- * shape you hand it correctly, not that the actual pipeline produces that
- * shape against real data.
+ * INTEGRATION TESTS: services/project.service.ts
+ * -------------------------------------------------
+ * Real Postgres (testcontainers, see tests/setup/global-setup.ts) via
+ * the real Drizzle client (src/db/client.ts) - no mocks.
  */
-
-import { describe, it, expect, beforeEach } from "vitest";
-
+import { describe, it, expect } from "vitest";
+import { eq } from "drizzle-orm";
 import {
   createProjectService,
+  getProjectsInWorkspaceService,
+  getProjectByIdAndWorkspaceIdService,
   getProjectAnalyticsService,
+  updateProjectService,
   deleteProjectService,
 } from "../../src/services/project.service";
+import { db } from "../../src/db/client";
+import { tasks } from "../../src/db/schema";
+import { NotFoundException } from "../../src/utils/appError";
+import { generateTaskCode } from "../../src/utils/uuid";
+import { createTestUser, createTestWorkspace, createTestProject } from "../setup/fixtures";
 
-import UserModel from "../../src/models/user.model";
-import WorkspaceModel from "../../src/models/workspace.model";
-import ProjectModel from "../../src/models/project.model";
-import TaskModel from "../../src/models/task.model";
-import { TaskStatusEnum } from "../../src/enums/task.enum";
+describe("project.service (integration - real Postgres via testcontainers)", () => {
+  const seed = async () => {
+    const user = await createTestUser();
+    const workspace = await createTestWorkspace(user.id);
+    return { user, workspace };
+  };
 
-describe("project.service (integration - real in-memory MongoDB)", () => {
-  let userId: string;
-  let workspaceId: string;
+  it("createProjectService defaults emoji when not given", async () => {
+    const { user, workspace } = await seed();
 
-  beforeEach(async () => {
-    const user = await UserModel.create({
-      name: "Project Integration User",
-      email: `project-integration-${Date.now()}@example.com`,
-    });
-    userId = user._id.toString();
+    const { project } = await createProjectService(user.id, workspace.id, { name: "No Emoji" });
 
-    const workspace = await WorkspaceModel.create({
-      name: "Project Integration Workspace",
-      owner: user._id,
-    });
-    workspaceId = workspace._id.toString();
+    expect(project.emoji).toBe("📊");
   });
 
-  it("analytics aggregation returns correct counts against real seeded tasks", async () => {
-    const { project } = await createProjectService(userId, workspaceId, {
-      name: "Analytics Project",
-    });
-    const projectId = project._id.toString();
+  it("createProjectService keeps a given emoji", async () => {
+    const { user, workspace } = await seed();
+
+    const { project } = await createProjectService(user.id, workspace.id, { name: "Custom", emoji: "🚀" });
+
+    expect(project.emoji).toBe("🚀");
+  });
+
+  it("getProjectsInWorkspaceService pagination math matches pageSize/pageNumber/totalCount/totalPages/skip", async () => {
+    const { user, workspace } = await seed();
+    for (let i = 0; i < 5; i++) {
+      await createTestProject(user.id, workspace.id, { name: `Project ${i}` });
+    }
+
+    const result = await getProjectsInWorkspaceService(workspace.id, 2, 2);
+
+    expect(result.projects).toHaveLength(2);
+    expect(result.totalCount).toBe(5);
+    expect(result.totalPages).toBe(3);
+    expect(result.skip).toBe(2);
+  });
+
+  it("getProjectByIdAndWorkspaceIdService 404s when the project belongs to a different workspace", async () => {
+    const { user, workspace } = await seed();
+    const project = await createTestProject(user.id, workspace.id);
+    const otherWorkspace = await createTestWorkspace(user.id, { name: "Other" });
+
+    await expect(
+      getProjectByIdAndWorkspaceIdService(otherWorkspace.id, project.id)
+    ).rejects.toThrow(NotFoundException);
+  });
+
+  it("getProjectAnalyticsService counts via FILTER matching Phase 2 §2.7's hand-verified numbers", async () => {
+    const { user, workspace } = await seed();
+    const project = await createTestProject(user.id, workspace.id);
 
     const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000);
     const tomorrow = new Date(Date.now() + 24 * 60 * 60 * 1000);
 
-    await TaskModel.create([
+    await db.insert(tasks).values([
       {
-        title: "Overdue, not done",
-        project: project._id,
-        workspace: workspaceId,
-        status: TaskStatusEnum.TODO,
+        taskCode: generateTaskCode(),
+        title: "Overdue",
+        projectId: project.id,
+        workspaceId: workspace.id,
+        status: "TODO",
         dueDate: yesterday,
-        createdBy: userId,
+        createdBy: user.id,
       },
       {
-        title: "Overdue but done (should NOT count as overdue)",
-        project: project._id,
-        workspace: workspaceId,
-        status: TaskStatusEnum.DONE,
-        dueDate: yesterday,
-        createdBy: userId,
+        taskCode: generateTaskCode(),
+        title: "Done",
+        projectId: project.id,
+        workspaceId: workspace.id,
+        status: "DONE",
+        createdBy: user.id,
       },
       {
-        title: "Due in the future",
-        project: project._id,
-        workspace: workspaceId,
-        status: TaskStatusEnum.IN_PROGRESS,
+        taskCode: generateTaskCode(),
+        title: "Future",
+        projectId: project.id,
+        workspaceId: workspace.id,
+        status: "TODO",
         dueDate: tomorrow,
-        createdBy: userId,
+        createdBy: user.id,
       },
     ]);
 
-    const { analytics } = await getProjectAnalyticsService(
-      workspaceId,
-      projectId
-    );
+    const { analytics } = await getProjectAnalyticsService(workspace.id, project.id);
 
-    expect(analytics).toEqual({
-      totalTasks: 3,
-      overdueTasks: 1,
-      completedTasks: 1,
-    });
+    expect(analytics.totalTasks).toBe(3);
+    expect(analytics.overdueTasks).toBe(1);
+    expect(analytics.completedTasks).toBe(1);
   });
 
-  it("deleting a project really removes its tasks (cascade check)", async () => {
-    const { project } = await createProjectService(userId, workspaceId, {
-      name: "Cascade Project",
+  it("updateProjectService applies a partial update, leaving other fields untouched", async () => {
+    const { user, workspace } = await seed();
+    const project = await createTestProject(user.id, workspace.id, {
+      name: "Original",
+      description: "Original description",
+      emoji: "🎯",
     });
 
-    await TaskModel.create({
-      title: "Will be cascade-deleted",
-      project: project._id,
-      workspace: workspaceId,
-      createdBy: userId,
-    });
+    const { project: updated } = await updateProjectService(workspace.id, project.id, { name: "Renamed" });
 
-    const beforeDelete = await TaskModel.find({ project: project._id });
-    expect(beforeDelete).toHaveLength(1);
+    expect(updated.name).toBe("Renamed");
+    expect(updated.description).toBe("Original description");
+    expect(updated.emoji).toBe("🎯");
+  });
 
-    await deleteProjectService(workspaceId, project._id.toString());
+  it("updateProjectService 404s for the wrong workspace", async () => {
+    const { user, workspace } = await seed();
+    const project = await createTestProject(user.id, workspace.id);
+    const otherWorkspace = await createTestWorkspace(user.id, { name: "Other" });
 
-    const afterDelete = await TaskModel.find({ project: project._id });
-    expect(afterDelete).toHaveLength(0);
+    await expect(
+      updateProjectService(otherWorkspace.id, project.id, { name: "Renamed" })
+    ).rejects.toThrow(NotFoundException);
+  });
 
-    const projectStillExists = await ProjectModel.findById(project._id);
-    expect(projectStillExists).toBeNull();
+  it("deleteProjectService cascades to its tasks", async () => {
+    const { user, workspace } = await seed();
+    const project = await createTestProject(user.id, workspace.id);
+    const [task] = await db
+      .insert(tasks)
+      .values({
+        taskCode: generateTaskCode(),
+        title: "Cascade Task",
+        projectId: project.id,
+        workspaceId: workspace.id,
+        createdBy: user.id,
+      })
+      .returning();
+
+    await deleteProjectService(workspace.id, project.id);
+
+    const [refetched] = await db.select().from(tasks).where(eq(tasks.id, task.id));
+    expect(refetched).toBeUndefined();
   });
 });

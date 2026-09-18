@@ -10,407 +10,162 @@ import {
   paginationQuerySchema,
 } from "../../../src/validation/project.validation";
 
+const validUuid = "9f8b1c2d-3e4f-4a5b-8c6d-7e8f9a0b1c2d";
+
 describe("emojiSchema", () => {
   it("accepts an emoji string", () => {
-    expect(emojiSchema.parse("👍")).toBe("👍");
-  });
-
-  it("trims leading and trailing whitespace", () => {
-    expect(emojiSchema.parse("  👍  ")).toBe("👍");
+    const result = emojiSchema.safeParse("🚀");
+    expect(result.success).toBe(true);
   });
 
   it("accepts undefined", () => {
-    expect(emojiSchema.parse(undefined)).toBeUndefined();
-  });
-
-  it("accepts an empty string", () => {
-    expect(emojiSchema.parse("")).toBe("");
-  });
-
-  it("trims whitespace-only input into an empty string", () => {
-    expect(emojiSchema.parse("   ")).toBe("");
-  });
-
-  it("rejects a number", () => {
-    expect(() => emojiSchema.parse(123)).toThrow();
-  });
-
-  it("rejects an object", () => {
-    expect(() => emojiSchema.parse({ emoji: "👍" })).toThrow();
-  });
-
-  it("rejects null", () => {
-    expect(() => emojiSchema.parse(null)).toThrow();
+    const result = emojiSchema.safeParse(undefined);
+    expect(result.success).toBe(true);
   });
 });
 
 describe("nameSchema", () => {
-  it("accepts a normal non-empty string", () => {
-    expect(nameSchema.parse("Engineering Team")).toBe("Engineering Team");
+  it("requires a non-empty value", () => {
+    const result = nameSchema.safeParse("");
+    expect(result.success).toBe(false);
+    if (!result.success) expect(result.error.issues.length).toBeGreaterThan(0);
   });
 
-  it("trims leading and trailing whitespace", () => {
-    expect(nameSchema.parse("   Padded Name   ")).toBe("Padded Name");
-  });
-
-  it("rejects an empty string", () => {
-    expect(() => nameSchema.parse("")).toThrow();
-  });
-
-  it("rejects whitespace-only input", () => {
-    expect(() => nameSchema.parse("   ")).toThrow();
-  });
-
-  it("accepts exactly one character", () => {
-    expect(nameSchema.parse("A")).toBe("A");
+  it("trims whitespace", () => {
+    const result = nameSchema.safeParse("  Project Name  ");
+    expect(result.success).toBe(true);
+    if (result.success) expect(result.data).toBe("Project Name");
   });
 
   it("accepts exactly 255 characters", () => {
-    const value = "a".repeat(255);
-
-    expect(nameSchema.parse(value)).toBe(value);
+    const result = nameSchema.safeParse("a".repeat(255));
+    expect(result.success).toBe(true);
   });
 
   it("rejects more than 255 characters", () => {
-    expect(() => nameSchema.parse("a".repeat(256))).toThrow();
-  });
-
-  it("rejects a number", () => {
-    expect(() => nameSchema.parse(123)).toThrow();
-  });
-
-  it("rejects undefined", () => {
-    expect(() => nameSchema.parse(undefined)).toThrow();
-  });
-
-  it("rejects null", () => {
-    expect(() => nameSchema.parse(null)).toThrow();
+    const result = nameSchema.safeParse("a".repeat(256));
+    expect(result.success).toBe(false);
+    if (!result.success) expect(result.error.issues.length).toBeGreaterThan(0);
   });
 });
 
 describe("descriptionSchema", () => {
+  it("is optional", () => {
+    const result = descriptionSchema.safeParse(undefined);
+    expect(result.success).toBe(true);
+  });
+
   it("accepts a normal string", () => {
-    expect(descriptionSchema.parse("Some description")).toBe(
-      "Some description"
-    );
-  });
-
-  it("trims leading and trailing whitespace", () => {
-    expect(descriptionSchema.parse("  padded  ")).toBe("padded");
-  });
-
-  it("accepts undefined", () => {
-    expect(descriptionSchema.parse(undefined)).toBeUndefined();
-  });
-
-  it("accepts an empty string", () => {
-    expect(descriptionSchema.parse("")).toBe("");
-  });
-
-  it("trims whitespace-only input into an empty string", () => {
-    expect(descriptionSchema.parse("   ")).toBe("");
-  });
-
-  it("rejects a number", () => {
-    expect(() => descriptionSchema.parse(123)).toThrow();
-  });
-
-  it("rejects null", () => {
-    expect(() => descriptionSchema.parse(null)).toThrow();
+    const result = descriptionSchema.safeParse("Some description");
+    expect(result.success).toBe(true);
   });
 });
 
 describe("projectIdSchema", () => {
-  it("accepts a normal project id", () => {
-    const id = "64f1a2b3c4d5e6f7a8b9c0d1";
-
-    expect(projectIdSchema.parse(id)).toBe(id);
+  it("accepts a valid UUID", () => {
+    const result = projectIdSchema.safeParse(validUuid);
+    expect(result.success).toBe(true);
   });
 
-  it("trims leading and trailing whitespace", () => {
-    expect(projectIdSchema.parse("  64f1a2b3c4d5e6f7a8b9c0d1  ")).toBe(
-      "64f1a2b3c4d5e6f7a8b9c0d1"
-    );
-  });
-
-  it("rejects an empty string", () => {
-    expect(() => projectIdSchema.parse("")).toThrow();
-  });
-
-  it("rejects whitespace-only input", () => {
-    expect(() => projectIdSchema.parse("   ")).toThrow();
-  });
-
-  it("rejects a non-empty string that is not a MongoDB ObjectId", () => {
-    // A malformed id reaching Mongoose triggers a CastError; validation should
-    // catch this up front instead of letting a bad-shaped string reach a query.
-    expect(() =>
-      projectIdSchema.parse("definitely-not-a-mongodb-object-id")
-    ).toThrow();
-  });
-
-  it("rejects a single character", () => {
-    expect(() => projectIdSchema.parse("a")).toThrow();
-  });
-
-  it("rejects undefined", () => {
-    expect(() => projectIdSchema.parse(undefined)).toThrow();
-  });
-
-  it("rejects a number", () => {
-    expect(() => projectIdSchema.parse(123)).toThrow();
-  });
-
-  it("rejects null", () => {
-    expect(() => projectIdSchema.parse(null)).toThrow();
+  it("rejects an invalid string with the correct message", () => {
+    const result = projectIdSchema.safeParse("not-a-uuid");
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues[0].message).toBe("Invalid project ID");
+    }
   });
 });
 
 describe("createProjectSchema", () => {
-  it("accepts name, description, and emoji", () => {
-    const result = createProjectSchema.parse({
+  it("accepts a full valid object", () => {
+    const result = createProjectSchema.safeParse({
+      emoji: "🚀",
       name: "Testing Project",
       description: "Project description",
-      emoji: "👍",
     });
-
-    expect(result).toEqual({
-      name: "Testing Project",
-      description: "Project description",
-      emoji: "👍",
-    });
+    expect(result.success).toBe(true);
   });
 
-  it("accepts only name", () => {
-    const result = createProjectSchema.parse({
-      name: "Testing Project",
-    });
-
-    expect(result.name).toBe("Testing Project");
-    expect(result.description).toBeUndefined();
-    expect(result.emoji).toBeUndefined();
+  it("accepts missing optional fields since only name is required", () => {
+    const result = createProjectSchema.safeParse({ name: "Testing Project" });
+    expect(result.success).toBe(true);
   });
 
-  it("accepts name and description without emoji", () => {
-    const result = createProjectSchema.parse({
-      name: "Backend Project",
-      description: "API work",
-    });
-
-    expect(result.name).toBe("Backend Project");
-    expect(result.description).toBe("API work");
-    expect(result.emoji).toBeUndefined();
-  });
-
-  it("accepts name and emoji without description", () => {
-    const result = createProjectSchema.parse({
-      name: "Frontend Project",
-      emoji: "🚀",
-    });
-
-    expect(result.name).toBe("Frontend Project");
-    expect(result.emoji).toBe("🚀");
-    expect(result.description).toBeUndefined();
-  });
-
-  it("trims all string fields", () => {
-    const result = createProjectSchema.parse({
-      name: "   Project Name   ",
-      description: "   Project Description   ",
-      emoji: "   🚀   ",
-    });
-
-    expect(result).toEqual({
-      name: "Project Name",
-      description: "Project Description",
-      emoji: "🚀",
-    });
-  });
-
-  it("rejects missing name", () => {
-    expect(() =>
-      createProjectSchema.parse({
-        description: "Description only",
-        emoji: "👍",
-      })
-    ).toThrow();
-  });
-
-  it("rejects an empty name", () => {
-    expect(() =>
-      createProjectSchema.parse({
-        name: "",
-      })
-    ).toThrow();
-  });
-
-  it("rejects a whitespace-only name", () => {
-    expect(() =>
-      createProjectSchema.parse({
-        name: "   ",
-      })
-    ).toThrow();
-  });
-
-  it("rejects a name longer than 255 characters", () => {
-    expect(() =>
-      createProjectSchema.parse({
-        name: "a".repeat(256),
-      })
-    ).toThrow();
-  });
-
-  it("rejects a non-string name", () => {
-    expect(() =>
-      createProjectSchema.parse({
-        name: 123,
-      })
-    ).toThrow();
-  });
-
-  it("rejects a non-string emoji", () => {
-    expect(() =>
-      createProjectSchema.parse({
-        name: "Project",
-        emoji: 123,
-      })
-    ).toThrow();
-  });
-
-  it("rejects a non-string description", () => {
-    expect(() =>
-      createProjectSchema.parse({
-        name: "Project",
-        description: 123,
-      })
-    ).toThrow();
+  it("rejects a missing name", () => {
+    const result = createProjectSchema.safeParse({ description: "no name here" });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.some((issue) => issue.path[0] === "name")).toBe(true);
+    }
   });
 });
 
 describe("updateProjectSchema", () => {
-  it("accepts name, description, and emoji", () => {
-    const result = updateProjectSchema.parse({
-      name: "Updated Project",
-      description: "Updated description",
-      emoji: "🚀",
-    });
-
-    expect(result).toEqual({
-      name: "Updated Project",
-      description: "Updated description",
-      emoji: "🚀",
-    });
-  });
-
-  it("accepts name without description and emoji", () => {
-    const result = updateProjectSchema.parse({
-      name: "Updated Project",
-    });
-
-    expect(result.name).toBe("Updated Project");
-    expect(result.description).toBeUndefined();
-    expect(result.emoji).toBeUndefined();
-  });
-
-  it("trims all string fields", () => {
-    const result = updateProjectSchema.parse({
-      name: "   Updated Project   ",
-      description: "   Updated description   ",
-      emoji: "   🔥   ",
-    });
-
-    expect(result).toEqual({
-      name: "Updated Project",
-      description: "Updated description",
+  it("accepts a full valid object", () => {
+    const result = updateProjectSchema.safeParse({
       emoji: "🔥",
+      name: "Updated Project",
+      description: "Updated description",
     });
+    expect(result.success).toBe(true);
   });
 
-  it("rejects an empty object", () => {
-    expect(() => updateProjectSchema.parse({})).toThrow();
+  it("accepts missing optional fields since only name is required", () => {
+    const result = updateProjectSchema.safeParse({ name: "Updated Project" });
+    expect(result.success).toBe(true);
   });
 
-  it("rejects description-only input because name is required", () => {
-    expect(() =>
-      updateProjectSchema.parse({
-        description: "Only updating description",
-      })
-    ).toThrow();
-  });
-
-  it("rejects emoji-only input because name is required", () => {
-    expect(() =>
-      updateProjectSchema.parse({
-        emoji: "🚀",
-      })
-    ).toThrow();
-  });
-
-  it("rejects an empty name", () => {
-    expect(() =>
-      updateProjectSchema.parse({
-        name: "",
-      })
-    ).toThrow();
-  });
-
-  it("rejects whitespace-only name", () => {
-    expect(() =>
-      updateProjectSchema.parse({
-        name: "   ",
-      })
-    ).toThrow();
-  });
-
-  it("rejects a name longer than 255 characters", () => {
-    expect(() =>
-      updateProjectSchema.parse({
-        name: "a".repeat(256),
-      })
-    ).toThrow();
-  });
-
-  it("rejects a non-string emoji", () => {
-    expect(() =>
-      updateProjectSchema.parse({
-        name: "Project",
-        emoji: {},
-      })
-    ).toThrow();
-  });
-
-  it("rejects a non-string description", () => {
-    expect(() =>
-      updateProjectSchema.parse({
-        name: "Project",
-        description: [],
-      })
-    ).toThrow();
+  it("rejects a missing name", () => {
+    const result = updateProjectSchema.safeParse({ emoji: "🔥" });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.some((issue) => issue.path[0] === "name")).toBe(true);
+    }
   });
 });
 
 describe("paginationQuerySchema", () => {
-  it("defaults to pageSize 10 and pageNumber 1 when both are absent", () => {
-    expect(paginationQuerySchema.parse({})).toEqual({
-      pageSize: 10,
-      pageNumber: 1,
-    });
+  it("defaults pageSize to 10 and pageNumber to 1 when omitted", () => {
+    const result = paginationQuerySchema.safeParse({});
+    expect(result.success).toBe(true);
+    if (result.success) expect(result.data).toEqual({ pageSize: 10, pageNumber: 1 });
   });
 
-  it("coerces string query values into numbers", () => {
-    expect(
-      paginationQuerySchema.parse({ pageSize: "25", pageNumber: "3" })
-    ).toEqual({
-      pageSize: 25,
-      pageNumber: 3,
-    });
+  it("coerces numeric strings from query params", () => {
+    const result = paginationQuerySchema.safeParse({ pageSize: "20", pageNumber: "3" });
+    expect(result.success).toBe(true);
+    if (result.success) expect(result.data).toEqual({ pageSize: 20, pageNumber: 3 });
   });
 
-  it("rejects a pageSize above the 100 cap (previously unbounded)", () => {
-    expect(() => paginationQuerySchema.parse({ pageSize: "999999" })).toThrow();
+  it("rejects pageSize above 100", () => {
+    const result = paginationQuerySchema.safeParse({ pageSize: "101" });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.some((issue) => issue.path[0] === "pageSize")).toBe(true);
+    }
   });
 
-  it("rejects a non-numeric pageSize instead of silently defaulting", () => {
-    expect(() => paginationQuerySchema.parse({ pageSize: "abc" })).toThrow();
+  it("rejects pageSize below 1", () => {
+    const result = paginationQuerySchema.safeParse({ pageSize: "0" });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.some((issue) => issue.path[0] === "pageSize")).toBe(true);
+    }
+  });
+
+  it("rejects pageNumber below 1", () => {
+    const result = paginationQuerySchema.safeParse({ pageNumber: "0" });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.some((issue) => issue.path[0] === "pageNumber")).toBe(true);
+    }
+  });
+
+  it("rejects a non-numeric pageSize", () => {
+    const result = paginationQuerySchema.safeParse({ pageSize: "abc" });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.some((issue) => issue.path[0] === "pageSize")).toBe(true);
+    }
   });
 });

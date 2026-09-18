@@ -1,30 +1,27 @@
-import { TaskPriorityEnum, TaskStatusEnum } from "../enums/task.enum";
-import MemberModel from "../models/member.model";
-import ProjectModel from "../models/project.model";
-import TaskModel from "../models/task.model";
+import { eq, and, desc, sql, inArray, SQL } from "drizzle-orm";
+import { db } from "../db/client";
+import { tasks, users, projects, workspaceMembers } from "../db/schema";
 import { BadRequestException, NotFoundException } from "../utils/appError";
 
-// Escapes regex metacharacters so user-supplied search keywords are always
-// matched as a literal substring, never interpreted as a regex pattern -
-// otherwise a crafted keyword (e.g. "(a+)+$") can trigger catastrophic
-// backtracking (ReDoS) against the database.
-const escapeRegExp = (value: string): string =>
-  value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-
-// A task may only be assigned to someone who is actually a member of the
-// workspace it lives in - otherwise anyone holding CREATE_TASK/EDIT_TASK
-// could assign work to (and leak the task's existence to) any user account
-// in the system. Enforced on both the create and the update path.
+// Ports task.service.ts's assertAssigneeIsWorkspaceMember. Mongo's
+// `MemberModel.exists({ userId, workspaceId })` becomes a `LIMIT 1` select
+// checked for a result, per Phase 2 §2.8 item 3.
 const assertAssigneeIsWorkspaceMember = async (
   workspaceId: string,
   assignedTo: string
 ): Promise<void> => {
-  const isAssignedToUser = await MemberModel.exists({
-    userId: assignedTo,
-    workspaceId,
-  });
+  const [row] = await db
+    .select({ id: workspaceMembers.id })
+    .from(workspaceMembers)
+    .where(
+      and(
+        eq(workspaceMembers.userId, assignedTo),
+        eq(workspaceMembers.workspaceId, workspaceId)
+      )
+    )
+    .limit(1);
 
-  if (!isAssignedToUser) {
+  if (!row) {
     throw new BadRequestException(
       "Assigned user is not a member of this workspace"
     );
@@ -38,38 +35,43 @@ export const createTaskService = async (
   body: {
     title: string;
     description?: string;
-    priority: string;
-    status: string;
+    priority?: "LOW" | "MEDIUM" | "HIGH";
+    status?: "BACKLOG" | "TODO" | "IN_PROGRESS" | "IN_REVIEW" | "DONE";
     assignedTo?: string | null;
     dueDate?: string;
+    taskCode: string; // application-generated, same as today (Phase 1 §1.4)
   }
 ) => {
-  const { title, description, priority, status, assignedTo, dueDate } = body;
+  const [project] = await db
+    .select()
+    .from(projects)
+    .where(eq(projects.id, projectId));
 
-  const project = await ProjectModel.findById(projectId);
-
-  if (!project || project.workspace.toString() !== workspaceId.toString()) {
+  if (!project || project.workspaceId !== workspaceId) {
     throw new NotFoundException(
       "Project not found or does not belong to this workspace"
     );
   }
 
-  if (assignedTo) {
-    await assertAssigneeIsWorkspaceMember(workspaceId, assignedTo);
+  if (body.assignedTo) {
+    await assertAssigneeIsWorkspaceMember(workspaceId, body.assignedTo);
   }
-  const task = new TaskModel({
-    title,
-    description,
-    priority: priority || TaskPriorityEnum.MEDIUM,
-    status: status || TaskStatusEnum.TODO,
-    assignedTo,
-    createdBy: userId,
-    workspace: workspaceId,
-    project: projectId,
-    dueDate,
-  });
 
-  await task.save();
+  const [task] = await db
+    .insert(tasks)
+    .values({
+      title: body.title,
+      description: body.description,
+      priority: body.priority ?? "MEDIUM",
+      status: body.status ?? "TODO",
+      assignedTo: body.assignedTo,
+      createdBy: userId,
+      workspaceId,
+      projectId,
+      dueDate: body.dueDate ? new Date(body.dueDate) : undefined,
+      taskCode: body.taskCode,
+    })
+    .returning();
 
   return { task };
 };
@@ -81,40 +83,51 @@ export const updateTaskService = async (
   body: {
     title: string;
     description?: string;
-    priority: string;
-    status: string;
+    priority: "LOW" | "MEDIUM" | "HIGH";
+    status: "BACKLOG" | "TODO" | "IN_PROGRESS" | "IN_REVIEW" | "DONE";
     assignedTo?: string | null;
     dueDate?: string;
   }
 ) => {
-  const project = await ProjectModel.findById(projectId);
+  const [project] = await db
+    .select()
+    .from(projects)
+    .where(eq(projects.id, projectId));
 
-  if (!project || project.workspace.toString() !== workspaceId.toString()) {
+  if (!project || project.workspaceId !== workspaceId) {
     throw new NotFoundException(
       "Project not found or does not belong to this workspace"
     );
   }
 
-  const task = await TaskModel.findById(taskId);
+  const [task] = await db
+    .select()
+    .from(tasks)
+    .where(eq(tasks.id, taskId));
 
-  if (!task || task.project.toString() !== projectId.toString()) {
+  if (!task || task.projectId !== projectId) {
     throw new NotFoundException(
       "Task not found or does not belong to this project"
     );
   }
 
-  const { assignedTo } = body;
-  if (assignedTo) {
-    await assertAssigneeIsWorkspaceMember(workspaceId, assignedTo);
+  if (body.assignedTo) {
+    await assertAssigneeIsWorkspaceMember(workspaceId, body.assignedTo);
   }
 
-  const updatedTask = await TaskModel.findByIdAndUpdate(
-    taskId,
-    {
-      ...body,
-    },
-    { new: true }
-  );
+  const [updatedTask] = await db
+    .update(tasks)
+    .set({
+      title: body.title,
+      description: body.description,
+      priority: body.priority,
+      status: body.status,
+      assignedTo: body.assignedTo,
+      dueDate: body.dueDate ? new Date(body.dueDate) : undefined,
+      updatedAt: new Date(),
+    })
+    .where(eq(tasks.id, taskId))
+    .returning();
 
   if (!updatedTask) {
     throw new BadRequestException("Failed to update task");
@@ -123,6 +136,10 @@ export const updateTaskService = async (
   return { updatedTask };
 };
 
+// The core relational-thinking exercise (Phase 2 §2.6): Mongo's
+// `.populate("assignedTo", ...).populate("project", ...)` is two extra
+// round trips, stitched together in application memory. This is one query,
+// with the join pushed down to Postgres.
 export const getAllTasksService = async (
   workspaceId: string,
   filters: {
@@ -133,66 +150,57 @@ export const getAllTasksService = async (
     keyword?: string;
     dueDate?: string;
   },
-  pagination: {
-    pageSize: number;
-    pageNumber: number;
-  }
+  pagination: { pageSize: number; pageNumber: number }
 ) => {
-  const query: Record<string, unknown> = {
-    workspace: workspaceId,
-  };
-
-  if (filters.projectId) {
-    query.project = filters.projectId;
+  const conditions: SQL[] = [eq(tasks.workspaceId, workspaceId)];
+  if (filters.projectId) conditions.push(eq(tasks.projectId, filters.projectId));
+  if (filters.status?.length)
+    conditions.push(inArray(tasks.status, filters.status as (typeof tasks.status.enumValues)[number][]));
+  if (filters.priority?.length)
+    conditions.push(inArray(tasks.priority, filters.priority as (typeof tasks.priority.enumValues)[number][]));
+  if (filters.assignedTo?.length)
+    conditions.push(inArray(tasks.assignedTo, filters.assignedTo));
+  if (filters.keyword) {
+    // ILIKE, not $regex - Phase 2 §2.6's ReDoS-vs-pattern-matching note:
+    // '%'/'_' are the only special characters, no full regex engine involved.
+    conditions.push(sql`${tasks.title} ILIKE ${"%" + filters.keyword + "%"}`);
   }
+  if (filters.dueDate) conditions.push(eq(tasks.dueDate, new Date(filters.dueDate)));
 
-  if (filters.status && filters.status?.length > 0) {
-    query.status = { $in: filters.status };
-  }
-
-  if (filters.priority && filters.priority?.length > 0) {
-    query.priority = { $in: filters.priority };
-  }
-
-  if (filters.assignedTo && filters.assignedTo?.length > 0) {
-    query.assignedTo = { $in: filters.assignedTo };
-  }
-
-  if (filters.keyword && filters.keyword !== undefined) {
-    query.title = { $regex: escapeRegExp(filters.keyword), $options: "i" };
-  }
-
-  if (filters.dueDate) {
-    query.dueDate = {
-      $eq: new Date(filters.dueDate),
-    };
-  }
-
-  //Pagination Setup
   const { pageSize, pageNumber } = pagination;
   const skip = (pageNumber - 1) * pageSize;
 
-  const [tasks, totalCount] = await Promise.all([
-    TaskModel.find(query)
-      .skip(skip)
-      .limit(pageSize)
-      .sort({ createdAt: -1 })
-      .populate("assignedTo", "_id name profilePicture -password")
-      .populate("project", "_id emoji name"),
-    TaskModel.countDocuments(query),
-  ]);
+  const rows = await db
+    .select({
+      id: tasks.id,
+      taskCode: tasks.taskCode,
+      title: tasks.title,
+      status: tasks.status,
+      priority: tasks.priority,
+      dueDate: tasks.dueDate,
+      createdAt: tasks.createdAt,
+      assignee: { id: users.id, name: users.name, profilePicture: users.profilePicture },
+      project: { id: projects.id, emoji: projects.emoji, name: projects.name },
+    })
+    .from(tasks)
+    // leftJoin, not innerJoin: assignedTo is nullable (Phase 2 §2.6) - an
+    // innerJoin here would silently drop every unassigned task from the
+    // result, unlike Mongo's .populate() which just leaves the field null.
+    .leftJoin(users, eq(tasks.assignedTo, users.id))
+    .leftJoin(projects, eq(tasks.projectId, projects.id))
+    .where(and(...conditions))
+    .orderBy(desc(tasks.createdAt))
+    .limit(pageSize)
+    .offset(skip);
 
-  const totalPages = Math.ceil(totalCount / pageSize);
+  const [{ count }] = await db
+    .select({ count: sql<number>`count(*)::int` })
+    .from(tasks)
+    .where(and(...conditions));
 
   return {
-    tasks,
-    pagination: {
-      pageSize,
-      pageNumber,
-      totalCount,
-      totalPages,
-      skip,
-    },
+    tasks: rows,
+    pagination: { pageSize, pageNumber, totalCount: count, totalPages: Math.ceil(count / pageSize), skip },
   };
 };
 
@@ -201,41 +209,40 @@ export const getTaskByIdService = async (
   projectId: string,
   taskId: string
 ) => {
-  const project = await ProjectModel.findById(projectId);
-
-  if (!project || project.workspace.toString() !== workspaceId.toString()) {
-    throw new NotFoundException(
-      "Project not found or does not belong to this workspace"
+  const [row] = await db
+    .select({
+      id: tasks.id,
+      taskCode: tasks.taskCode,
+      title: tasks.title,
+      description: tasks.description,
+      status: tasks.status,
+      priority: tasks.priority,
+      dueDate: tasks.dueDate,
+      assignee: { id: users.id, name: users.name, profilePicture: users.profilePicture },
+    })
+    .from(tasks)
+    .leftJoin(users, eq(tasks.assignedTo, users.id))
+    .where(
+      and(
+        eq(tasks.id, taskId),
+        eq(tasks.workspaceId, workspaceId),
+        eq(tasks.projectId, projectId)
+      )
     );
-  }
 
-  const task = await TaskModel.findOne({
-    _id: taskId,
-    workspace: workspaceId,
-    project: projectId,
-  }).populate("assignedTo", "_id name profilePicture -password");
-
-  if (!task) {
-    throw new NotFoundException("Task not found.");
-  }
-
-  return task;
+  if (!row) throw new NotFoundException("Task not found.");
+  return row;
 };
 
-export const deleteTaskService = async (
-  workspaceId: string,
-  taskId: string
-) => {
-  const task = await TaskModel.findOneAndDelete({
-    _id: taskId,
-    workspace: workspaceId,
-  });
+export const deleteTaskService = async (workspaceId: string, taskId: string) => {
+  const [deleted] = await db
+    .delete(tasks)
+    .where(and(eq(tasks.id, taskId), eq(tasks.workspaceId, workspaceId)))
+    .returning();
 
-  if (!task) {
+  if (!deleted) {
     throw new NotFoundException(
       "Task not found or does not belong to the specified workspace"
     );
   }
-
-  return;
 };

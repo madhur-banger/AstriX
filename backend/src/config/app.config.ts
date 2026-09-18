@@ -6,26 +6,27 @@ const NODE_ENV = getEnv<NodeEnv>("NODE_ENV", "development");
 const PORT = getEnv("PORT", "8000");
 const BASE_PATH = getEnv("BASE_PATH", "/api");
 
-// The Mongo driver's default maxPoolSize is 100 PER PROCESS. With several
-// ECS tasks scaling out behind the ALB, that can exhaust a lower-tier Atlas
-// cluster's total connection ceiling long before any single task is
-// actually saturated - so bound it explicitly instead of inheriting the
-// default. minPoolSize keeps a few connections warm so a freshly started
-// task doesn't pay handshake latency on its first requests.
-const DEFAULT_MONGO_MAX_POOL_SIZE = "15";
-const DEFAULT_MONGO_MIN_POOL_SIZE = "2";
+// With several ECS tasks scaling out behind the ALB, an unbounded pool per
+// task can exhaust a lower-tier Postgres instance's total connection
+// ceiling long before any single task is actually saturated - so bound it
+// explicitly instead of inheriting pg's default. PG_MIN_POOL_SIZE keeps a
+// few connections warm so a freshly started task doesn't pay handshake
+// latency on its first requests.
+const DEFAULT_PG_MAX_POOL_SIZE = "15";
+const DEFAULT_PG_MIN_POOL_SIZE = "2";
 
 const appConfig = () => ({
   NODE_ENV,
   PORT,
   BASE_PATH,
-  MONGO_URI: getEnv("MONGO_URI", ""),
-  MONGO_MAX_POOL_SIZE: Number(
-    getEnv("MONGO_MAX_POOL_SIZE", DEFAULT_MONGO_MAX_POOL_SIZE)
+  DATABASE_URL: getEnv("DATABASE_URL", ""),
+  PG_MAX_POOL_SIZE: Number(
+    getEnv("PG_MAX_POOL_SIZE", DEFAULT_PG_MAX_POOL_SIZE)
   ),
-  MONGO_MIN_POOL_SIZE: Number(
-    getEnv("MONGO_MIN_POOL_SIZE", DEFAULT_MONGO_MIN_POOL_SIZE)
+  PG_MIN_POOL_SIZE: Number(
+    getEnv("PG_MIN_POOL_SIZE", DEFAULT_PG_MIN_POOL_SIZE)
   ),
+  REDIS_URL: getEnv("REDIS_URL", "redis://localhost:6379"),
 
   // The externally-reachable API base URL, shown as the "try it out" server
   // in /api/docs. Defaults to a local dev guess; set explicitly for any
@@ -107,6 +108,25 @@ const appConfig = () => ({
   // ============================================
   RESEND_API_KEY: process.env.RESEND_API_KEY || undefined,
   EMAIL_FROM: getEnv("EMAIL_FROM", "onboarding@resend.dev"),
+
+  // Genuinely optional (same getEnv-default-undefined caveat as
+  // COOKIE_DOMAIN above): unset, /metrics is open to anyone who can reach
+  // the ALB - fine for local/dev. Set it in any environment reachable from
+  // outside a private scrape network, and point Prometheus/the scraper at
+  // the same value via an `Authorization: Bearer <token>` header.
+  METRICS_AUTH_TOKEN: process.env.METRICS_AUTH_TOKEN || undefined,
+
+  // Requests/15min per IP for the general apiLimiter in app.ts. Needs
+  // raising in any environment a load test targets, since a k6 run from one
+  // machine is one IP.
+  API_RATE_LIMIT_MAX: Number(getEnv("API_RATE_LIMIT_MAX", "300")),
+
+  // Requests/15min per IP shared by /auth/login and /auth/register (see
+  // auth.route.ts). Needs raising even further than API_RATE_LIMIT_MAX for
+  // any load test simulating many distinct users - logging in (and, on
+  // first run, registering) N synthetic users from one IP costs N requests
+  // against this single limiter regardless of API_RATE_LIMIT_MAX.
+  AUTH_RATE_LIMIT_MAX: Number(getEnv("AUTH_RATE_LIMIT_MAX", "5")),
 });
 
 export const config = appConfig();

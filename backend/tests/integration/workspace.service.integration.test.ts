@@ -1,153 +1,264 @@
 /**
- * INTEGRATION TESTS: workspace.service.ts
- * -------------------------------------------
- * Unlike the unit test file, we do NOT mock any Mongoose models here.
- * Every model import below is the REAL one from src/models. Because
- * tests/setup/vitest.setup.ts already connected mongoose to an in-memory
- * MongoDB before this file runs, every `.save()`, `.find()`, `.findById()`
- * etc. actually reads/writes real documents (that just happen to live in
- * RAM instead of on disk / in the cloud).
- *
- * WHY BOTHER, IF WE ALREADY HAVE UNIT TESTS?
- * Because unit tests can only ever be as correct as the mocks you wrote.
- * If you get a filter field name wrong (e.g. `{ workspace: id }` instead of
- * `{ workspaceId: id }`), a mocked test won't notice - YOU told the mock to
- * return data for that exact call, so it happily does. A REAL query with a
- * wrong field name just silently returns zero results, and only an
- * integration test against a real DB will expose that.
- *
- * ASSUMPTION CALLOUT:
- * We don't have the source for user.model.ts / member.model.ts /
- * roles-permission.model.ts / project.model.ts / task.model.ts in this
- * conversation, so the required fields used in `.create({...})` below are
- * a best guess based on how they're referenced in workspace.service.ts.
- * If Mongoose throws a "path `X` is required" validation error when you
- * run this, just add the missing field(s) to the relevant `buildFake*`
- * factory call - that error message tells you exactly what's missing.
+ * INTEGRATION TESTS: services/workspace.service.ts
+ * -------------------------------------------------
+ * Real Postgres (testcontainers, see tests/setup/global-setup.ts) via
+ * the real Drizzle client (src/db/client.ts) - no mocks. Mirrors
+ * tests/integration/workspace.service.integration.test.ts (Mongo) so the
+ * two suites can be compared feature-by-feature per Phase 5 §5.6's parity
+ * checklist.
  */
-
-import { describe, it, expect, beforeEach } from "vitest";
-import mongoose from "mongoose";
-
+import { describe, it, expect } from "vitest";
+import { eq } from "drizzle-orm";
 import {
   createWorkspaceService,
+  getAllWorkspacesUserIsMemberService,
   getWorkspaceByIdService,
   updateWorkspaceByIdService,
+  resetWorkspaceInviteCodeService,
+  removeMemberFromWorkspaceService,
+  getWorkspaceMembersService,
   deleteWorkspaceService,
+  getWorkspaceAnalyticsService,
+  changeMemberRoleService,
 } from "../../src/services/workspace.service";
+import { db } from "../../src/db/client";
+import { users, workspaceMembers, projects, tasks } from "../../src/db/schema";
+import { BadRequestException, ForbiddenException, NotFoundException } from "../../src/utils/appError";
+import { generateTaskCode } from "../../src/utils/uuid";
+import { createTestUser, createTestWorkspace, createTestProject, getRoleIdByName } from "../setup/fixtures";
 
-import UserModel from "../../src/models/user.model";
-import RoleModel from "../../src/models/roles-permission.model";
-import MemberModel from "../../src/models/member.model";
-import WorkspaceModel from "../../src/models/workspace.model";
-import { Roles } from "../../src/enums/role.enum";
-import {
-  NotFoundException,
-  ForbiddenException,
-} from "../../src/utils/appError";
+describe("workspace.service (integration - real Postgres via testcontainers)", () => {
+  it("creates the OWNER membership for the creator and sets currentWorkspaceId", async () => {
+    const user = await createTestUser();
 
-describe("workspace.service (integration - real in-memory MongoDB)", () => {
-  let userId: string;
+    const { workspace } = await createWorkspaceService(user.id, { name: "Acme" });
 
-  beforeEach(async () => {
-    // Seed exactly what createWorkspaceService needs to find in a REAL DB:
-    // an OWNER role document, and a real user document.
-    // Adjust these fields if your real schemas require more (e.g. a
-    // hashed password field, a required `provider` field, etc.)
-    await RoleModel.create({ name: Roles.OWNER, permissions: [] });
+    const [membership] = await db
+      .select()
+      .from(workspaceMembers)
+      .where(eq(workspaceMembers.workspaceId, workspace.id));
+    expect(membership.userId).toBe(user.id);
 
-    const user = await UserModel.create({
-      name: "Integration Test User",
-      email: `integration-${Date.now()}@example.com`,
-      // If UserModel requires a password field, add one here, e.g.:
-      // password: "hashed-value-irrelevant-for-this-test",
-    });
-    userId = user._id.toString();
+    const ownerRoleId = await getRoleIdByName("OWNER");
+    expect(membership.roleId).toBe(ownerRoleId);
+
+    const [refetchedUser] = await db.select().from(users).where(eq(users.id, user.id));
+    expect(refetchedUser.currentWorkspaceId).toBe(workspace.id);
   });
 
-  it("persists a real workspace document and links it via a real member document", async () => {
-    // Act
-    const { workspace } = await createWorkspaceService(userId, {
-      name: "Integration Workspace",
-      description: "created for real via mongoose",
-    });
+  it("getAllWorkspacesUserIsMemberService only returns workspaces the user is a member of", async () => {
+    const user = await createTestUser();
+    const myWorkspace = await createTestWorkspace(user.id);
+    const otherOwner = await createTestUser();
+    await createTestWorkspace(otherOwner.id, { name: "Not Mine" });
 
-    // Assert: re-read from the DB independently of the function under test,
-    // to prove the write actually landed (not just that the in-memory
-    // return value looked right).
-    const persistedWorkspace = await WorkspaceModel.findById(workspace._id);
-    expect(persistedWorkspace).not.toBeNull();
-    expect(persistedWorkspace!.name).toBe("Integration Workspace");
-    // inviteCode has a `default: generateInviteCode` in the schema - verify
-    // the default actually fired, since defaults are a common source of
-    // "works in mocked tests, mysteriously null in prod" bugs.
-    expect(persistedWorkspace!.inviteCode).toBeTruthy();
+    const { workspaces } = await getAllWorkspacesUserIsMemberService(user.id);
 
-    const member = await MemberModel.findOne({ workspaceId: workspace._id });
-    expect(member).not.toBeNull();
-    expect(member!.userId.toString()).toBe(userId);
+    expect(workspaces).toHaveLength(1);
+    expect(workspaces[0].id).toBe(myWorkspace.id);
+  });
 
-    const updatedUser = await UserModel.findById(userId);
-    expect(updatedUser!.currentWorkspace?.toString()).toBe(
-      workspace._id.toString()
+  it("getWorkspaceByIdService 404s for a nonexistent id", async () => {
+    await expect(getWorkspaceByIdService(crypto.randomUUID())).rejects.toThrow(NotFoundException);
+  });
+
+  it("getWorkspaceByIdService includes members", async () => {
+    const user = await createTestUser();
+    const workspace = await createTestWorkspace(user.id);
+
+    const { workspace: found } = await getWorkspaceByIdService(workspace.id);
+
+    expect(found.members).toHaveLength(1);
+    expect(found.members[0].user.id).toBe(user.id);
+  });
+
+  it("updateWorkspaceByIdService persists name/description changes", async () => {
+    const user = await createTestUser();
+    const workspace = await createTestWorkspace(user.id);
+
+    const { workspace: updated } = await updateWorkspaceByIdService(
+      workspace.id,
+      "Renamed",
+      "New description"
+    );
+
+    expect(updated.name).toBe("Renamed");
+    expect(updated.description).toBe("New description");
+  });
+
+  it("resetWorkspaceInviteCodeService changes the invite code", async () => {
+    const user = await createTestUser();
+    const workspace = await createTestWorkspace(user.id);
+
+    const { workspace: updated } = await resetWorkspaceInviteCodeService(workspace.id);
+
+    expect(updated.inviteCode).not.toBe(workspace.inviteCode);
+  });
+
+  it("removeMemberFromWorkspaceService refuses to remove the owner", async () => {
+    const user = await createTestUser();
+    const workspace = await createTestWorkspace(user.id);
+
+    await expect(removeMemberFromWorkspaceService(workspace.id, user.id)).rejects.toThrow(
+      BadRequestException
     );
   });
 
-  it("throws NotFoundException for a well-formed but non-existent workspace id", async () => {
-    const randomButValidId = new mongoose.Types.ObjectId().toString();
+  it("removeMemberFromWorkspaceService unassigns the removed member's tasks", async () => {
+    const owner = await createTestUser();
+    const workspace = await createTestWorkspace(owner.id);
+    const project = await createTestProject(owner.id, workspace.id);
+    const memberRoleId = await getRoleIdByName("MEMBER");
+    const member = await createTestUser();
+    await db.insert(workspaceMembers).values({ userId: member.id, workspaceId: workspace.id, roleId: memberRoleId });
+    const [task] = await db
+      .insert(tasks)
+      .values({
+        taskCode: generateTaskCode(),
+        title: "Assigned to member",
+        projectId: project.id,
+        workspaceId: workspace.id,
+        assignedTo: member.id,
+        createdBy: owner.id,
+      })
+      .returning();
 
-    await expect(getWorkspaceByIdService(randomButValidId)).rejects.toThrow(
-      NotFoundException
+    await removeMemberFromWorkspaceService(workspace.id, member.id);
+
+    const [refetchedTask] = await db.select().from(tasks).where(eq(tasks.id, task.id));
+    expect(refetchedTask.assignedTo).toBeNull();
+
+    const remainingMembers = await db
+      .select()
+      .from(workspaceMembers)
+      .where(eq(workspaceMembers.workspaceId, workspace.id));
+    expect(remainingMembers.find((m) => m.userId === member.id)).toBeUndefined();
+  });
+
+  it("getWorkspaceMembersService returns members with role populated", async () => {
+    const user = await createTestUser();
+    const workspace = await createTestWorkspace(user.id);
+
+    const { members } = await getWorkspaceMembersService(workspace.id);
+
+    expect(members).toHaveLength(1);
+    expect(members[0].role.name).toBe("OWNER");
+  });
+
+  it("deleteWorkspaceService throws ForbiddenException when the caller isn't the owner", async () => {
+    const owner = await createTestUser();
+    const workspace = await createTestWorkspace(owner.id);
+    const outsider = await createTestUser();
+
+    await expect(deleteWorkspaceService(workspace.id, outsider.id)).rejects.toThrow(ForbiddenException);
+  });
+
+  it("deleteWorkspaceService cascades to members/projects/tasks and reassigns currentWorkspaceId", async () => {
+    const owner = await createTestUser();
+    const workspace = await createTestWorkspace(owner.id);
+    const project = await createTestProject(owner.id, workspace.id);
+    await db.insert(tasks).values({
+      taskCode: generateTaskCode(),
+      title: "Doomed task",
+      projectId: project.id,
+      workspaceId: workspace.id,
+      createdBy: owner.id,
+    });
+    const otherWorkspace = await createTestWorkspace(owner.id, { name: "Fallback" });
+
+    const result = await deleteWorkspaceService(workspace.id, owner.id);
+
+    const remainingMembers = await db
+      .select()
+      .from(workspaceMembers)
+      .where(eq(workspaceMembers.workspaceId, workspace.id));
+    expect(remainingMembers).toHaveLength(0);
+
+    const remainingProjects = await db.select().from(projects).where(eq(projects.workspaceId, workspace.id));
+    expect(remainingProjects).toHaveLength(0);
+
+    const remainingTasks = await db.select().from(tasks).where(eq(tasks.workspaceId, workspace.id));
+    expect(remainingTasks).toHaveLength(0);
+
+    expect(result.currentWorkspaceId).toBe(otherWorkspace.id);
+
+    const [refetchedUser] = await db.select().from(users).where(eq(users.id, owner.id));
+    expect(refetchedUser.currentWorkspaceId).toBe(otherWorkspace.id);
+  });
+
+  it("deleteWorkspaceService nulls currentWorkspaceId when no other membership exists", async () => {
+    const owner = await createTestUser();
+    const workspace = await createTestWorkspace(owner.id);
+
+    const result = await deleteWorkspaceService(workspace.id, owner.id);
+
+    expect(result.currentWorkspaceId).toBeNull();
+  });
+
+  it("changeMemberRoleService refuses to change the owner's role", async () => {
+    const owner = await createTestUser();
+    const workspace = await createTestWorkspace(owner.id);
+    const adminRoleId = await getRoleIdByName("ADMIN");
+
+    await expect(changeMemberRoleService(workspace.id, owner.id, adminRoleId)).rejects.toThrow(
+      BadRequestException
     );
   });
 
-  it("update then re-fetch reflects the new name in the real DB", async () => {
-    const { workspace } = await createWorkspaceService(userId, {
-      name: "Before Update",
-    });
+  it("changeMemberRoleService updates a non-owner member's role", async () => {
+    const owner = await createTestUser();
+    const workspace = await createTestWorkspace(owner.id);
+    const memberRoleId = await getRoleIdByName("MEMBER");
+    const member = await createTestUser();
+    await db.insert(workspaceMembers).values({ userId: member.id, workspaceId: workspace.id, roleId: memberRoleId });
+    const adminRoleId = await getRoleIdByName("ADMIN");
 
-    await updateWorkspaceByIdService(workspace._id.toString(), "After Update");
+    const { member: updated } = await changeMemberRoleService(workspace.id, member.id, adminRoleId);
 
-    const refetched = await WorkspaceModel.findById(workspace._id);
-    expect(refetched!.name).toBe("After Update");
+    expect(updated.roleId).toBe(adminRoleId);
   });
 
-  it("deleting a workspace really removes its member documents (cascade check)", async () => {
-    const { workspace } = await createWorkspaceService(userId, {
-      name: "To Be Deleted",
-    });
+  it("getWorkspaceAnalyticsService counts totalTasks/overdueTasks/completedTasks correctly", async () => {
+    const owner = await createTestUser();
+    const workspace = await createTestWorkspace(owner.id);
+    const project = await createTestProject(owner.id, workspace.id);
 
-    // Sanity check: the member exists before we delete anything.
-    const beforeDelete = await MemberModel.find({ workspaceId: workspace._id });
-    expect(beforeDelete.length).toBe(1);
+    const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    const tomorrow = new Date(Date.now() + 24 * 60 * 60 * 1000);
 
-    await deleteWorkspaceService(workspace._id.toString(), userId);
+    await db.insert(tasks).values([
+      {
+        taskCode: generateTaskCode(),
+        title: "Overdue",
+        projectId: project.id,
+        workspaceId: workspace.id,
+        status: "TODO",
+        dueDate: yesterday,
+        createdBy: owner.id,
+      },
+      {
+        taskCode: generateTaskCode(),
+        title: "Completed",
+        projectId: project.id,
+        workspaceId: workspace.id,
+        status: "DONE",
+        createdBy: owner.id,
+      },
+      {
+        taskCode: generateTaskCode(),
+        title: "Future",
+        projectId: project.id,
+        workspaceId: workspace.id,
+        status: "TODO",
+        dueDate: tomorrow,
+        createdBy: owner.id,
+      },
+    ]);
 
-    const afterDelete = await MemberModel.find({ workspaceId: workspace._id });
-    expect(afterDelete.length).toBe(0);
+    const { analytics } = await getWorkspaceAnalyticsService(workspace.id);
 
-    const workspaceStillExists = await WorkspaceModel.findById(workspace._id);
-    expect(workspaceStillExists).toBeNull();
-  });
-
-  it("rejects deletion attempted by a user who is not the owner", async () => {
-    const { workspace } = await createWorkspaceService(userId, {
-      name: "Owned Workspace",
-    });
-
-    const otherUser = await UserModel.create({
-      name: "Someone Else",
-      email: `other-${Date.now()}@example.com`,
-    });
-
-    await expect(
-      deleteWorkspaceService(workspace._id.toString(), otherUser._id.toString())
-    ).rejects.toThrow(ForbiddenException);
-
-    // Confirm the workspace was NOT deleted despite the failed attempt -
-    // this is exactly the kind of guarantee a real transaction should provide,
-    // and only an integration test can actually verify it held.
-    const stillThere = await WorkspaceModel.findById(workspace._id);
-    expect(stillThere).not.toBeNull();
+    expect(analytics.totalTasks).toBe(3);
+    expect(analytics.overdueTasks).toBe(1);
+    expect(analytics.completedTasks).toBe(1);
   });
 });

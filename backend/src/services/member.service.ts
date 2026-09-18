@@ -1,89 +1,63 @@
-import { ErrorCodeEnum } from "../enums/error-code.enum";
+import { eq, and } from "drizzle-orm";
+import { db } from "../db/client";
+import { workspaceMembers, workspaces, roles } from "../db/schema";
 import { Roles } from "../enums/role.enum";
-import MemberModel from "../models/member.model";
-import RoleModel from "../models/roles-permission.model";
-import WorkspaceModel from "../models/workspace.model";
-import {
-  BadRequestException,
-  NotFoundException,
-  UnauthorizedException,
-} from "../utils/appError";
+import { BadRequestException, NotFoundException, UnauthorizedException } from "../utils/appError";
 
-export const getMemberRoleInWorkspace = async (
-  userId: string,
-  workspaceId: string
-) => {
-  const workspace = await WorkspaceModel.findById(workspaceId);
+// Ports member.service.ts's getMemberRoleInWorkspace.
+export const getMemberRoleInWorkspace = async (userId: string, workspaceId: string) => {
+  const [workspace] = await db.select().from(workspaces).where(eq(workspaces.id, workspaceId));
   if (!workspace) {
     throw new NotFoundException("Workspace not found");
   }
 
-  const member = await MemberModel.findOne({
-    userId,
-    workspaceId,
-  }).populate("role");
+  const [member] = await db
+    .select({ roleName: roles.name })
+    .from(workspaceMembers)
+    .innerJoin(roles, eq(workspaceMembers.roleId, roles.id))
+    .where(and(eq(workspaceMembers.userId, userId), eq(workspaceMembers.workspaceId, workspaceId)));
 
   if (!member) {
-    throw new UnauthorizedException(
-      "You are not a member of this workspace",
-      ErrorCodeEnum.ACCESS_UNAUTHORIZED
-    );
+    throw new UnauthorizedException("You are not a member of this workspace");
   }
 
-  const roleName = member.role?.name;
-
-  return { role: roleName };
+  return { role: member.roleName };
 };
 
-export const joinWorkspaceByInviteService = async (
-  userId: string,
-  inviteCode: string
-) => {
-  // Find workspace by invite code
-  const workspace = await WorkspaceModel.findOne({ inviteCode }).exec();
+// Ports member.service.ts's joinWorkspaceByInviteService. The unique
+// (workspaceId, userId) index on workspace_members (Phase 1 §1.4) is the
+// real guard against the race between the pre-check and the insert, same
+// as the Mongo original's reliance on its own unique index.
+export const joinWorkspaceByInviteService = async (userId: string, inviteCode: string) => {
+  const [workspace] = await db.select().from(workspaces).where(eq(workspaces.inviteCode, inviteCode));
   if (!workspace) {
     throw new NotFoundException("Invalid invite code or workspace not found");
   }
 
-  // Check if user is already a member
-  const existingMember = await MemberModel.findOne({
-    userId,
-    workspaceId: workspace._id,
-  }).exec();
+  const [existingMember] = await db
+    .select({ id: workspaceMembers.id })
+    .from(workspaceMembers)
+    .where(and(eq(workspaceMembers.userId, userId), eq(workspaceMembers.workspaceId, workspace.id)));
 
   if (existingMember) {
     throw new BadRequestException("You are already a member of this workspace");
   }
 
-  const role = await RoleModel.findOne({ name: Roles.MEMBER });
-
+  const [role] = await db.select().from(roles).where(eq(roles.name, Roles.MEMBER));
   if (!role) {
     throw new NotFoundException("Role not found");
   }
 
-  // Add user to workspace as a member. The pre-check above isn't atomic
-  // with this insert - two concurrent join requests for the same user can
-  // both pass it before either save() lands. The unique (userId, workspaceId)
-  // index on MemberModel is the real guard; if it fires here, it means we
-  // lost that race, and the outcome is the same one the pre-check above
-  // reports, so surface it identically rather than leaking a raw duplicate
-  // key error.
   try {
-    const newMember = new MemberModel({
-      userId,
-      workspaceId: workspace._id,
-      role: role._id,
-    });
-    await newMember.save();
+    await db.insert(workspaceMembers).values({ userId, workspaceId: workspace.id, roleId: role.id });
   } catch (error) {
-    const code = (error as { code?: number } | undefined)?.code;
-    if (code === 11000) {
-      throw new BadRequestException(
-        "You are already a member of this workspace"
-      );
+    const code = (error as { code?: string } | undefined)?.code;
+    if (code === "23505") {
+      // unique_violation - lost the race against a concurrent join.
+      throw new BadRequestException("You are already a member of this workspace");
     }
     throw error;
   }
 
-  return { workspaceId: workspace._id, role: role.name };
+  return { workspaceId: workspace.id, role: role.name };
 };

@@ -1,209 +1,333 @@
 /**
- * INTEGRATION TESTS: auth.service.ts
- * --------------------------------------
- * No mocking at all here - real Mongoose models against the in-memory DB.
- *
- * WHY THIS FILE MATTERS MORE THAN USUAL:
- * Unit tests mock `user.comparePassword()` to return true/false on command -
- * they can NEVER catch a bug where your bcrypt hashing or comparison logic
- * is actually broken (e.g. hashing twice, comparing against the wrong
- * field, a schema `select: false` on password silently returning
- * `undefined` to bcrypt.compare). Only a REAL register -> REAL login
- * roundtrip proves password auth actually works end to end. This is the
- * single most important integration test in your whole auth system.
+ * INTEGRATION TESTS: services/auth.service.ts
+ * -------------------------------------------------
+ * Real Postgres + Redis (testcontainers, see tests/setup/global-setup.ts)
+ * via the real Drizzle client and session/token services - no mocks except
+ * spying on the email provider to capture raw reset/verification tokens
+ * (they're hashed before storage and normally only ever leave the process
+ * via the outgoing email). OAuth network calls (Google) are out of scope
+ * here - loginOrCreateAccountService itself makes no network calls, only
+ * the controller layer does, so it's exercised directly as a plain function.
  */
-
-import { describe, it, expect, beforeEach } from "vitest";
-
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { eq } from "drizzle-orm";
 import {
   registerUserService,
   verifyUserService,
   loginOrCreateAccountService,
   createSessionService,
   refreshAccessTokenService,
+  requestPasswordResetService,
+  resetPasswordService,
+  requestEmailVerificationService,
+  verifyEmailService,
+  changePasswordService,
+  revokeSessionService,
+  authenticateAccessTokenService,
+  getUserSessionsService,
 } from "../../src/services/auth.service";
+import { createAccountService } from "../../src/services/account.service";
+import * as emailProvider from "../../src/providers/email.provider";
+import { db } from "../../src/db/client";
+import { redis } from "../../src/redis/client";
+import { users, accounts, workspaces, workspaceMembers } from "../../src/db/schema";
+import { BadRequestException, NotFoundException, UnauthorizedException } from "../../src/utils/appError";
+import { createTestUser, createTestWorkspace } from "../setup/fixtures";
 
-import UserModel from "../../src/models/user.model";
-import AccountModel from "../../src/models/account.model";
-import WorkspaceModel from "../../src/models/workspace.model";
-import MemberModel from "../../src/models/member.model";
-import SessionModel from "../../src/models/session.model";
-import RoleModel from "../../src/models/roles-permission.model";
-import { Roles } from "../../src/enums/role.enum";
-import {
-  BadRequestException,
-  UnauthorizedException,
-} from "../../src/utils/appError";
-
-describe("auth.service (integration - real in-memory MongoDB)", () => {
-  beforeEach(async () => {
-    // registerUserService and loginOrCreateAccountService both need a real
-    // OWNER role document to exist, exactly like workspace's integration test.
-    await RoleModel.create({ name: Roles.OWNER, permissions: [] });
+describe("auth.service (integration - real Postgres + Redis via testcontainers)", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
   });
 
-  it("REGISTER -> LOGIN roundtrip: the password set at registration actually verifies at login", async () => {
-    // This is the test that catches "the schema hashes on save but
-    // comparePassword compares against the plaintext" type bugs - a
-    // mistake that's invisible to any mocked unit test.
-    const { userId, workspaceId } = await registerUserService({
-      email: "roundtrip@example.com",
-      name: "Roundtrip User",
-      password: "Correc@123",
+  describe("registerUserService", () => {
+    it("creates user+EMAIL account+OWNER workspace+membership+currentWorkspaceId atomically", async () => {
+      const { userId, workspaceId } = await registerUserService({
+        email: `register-${Date.now()}@example.com`,
+        name: "New User",
+        password: "Password1!",
+      });
+
+      const [user] = await db.select().from(users).where(eq(users.id, userId));
+      expect(user.currentWorkspaceId).toBe(workspaceId);
+
+      const [account] = await db.select().from(accounts).where(eq(accounts.userId, userId));
+      expect(account.provider).toBe("EMAIL");
+
+      const [workspace] = await db.select().from(workspaces).where(eq(workspaces.id, workspaceId));
+      expect(workspace.ownerId).toBe(userId);
+
+      const [membership] = await db
+        .select()
+        .from(workspaceMembers)
+        .where(eq(workspaceMembers.workspaceId, workspaceId));
+      expect(membership.userId).toBe(userId);
     });
 
-    expect(userId).toBeDefined();
-    expect(workspaceId).toBeDefined();
+    it("throws BadRequestException for a duplicate email", async () => {
+      const email = `dup-${Date.now()}@example.com`;
+      await registerUserService({ email, name: "First", password: "Password1!" });
 
-    // Confirm the password was NOT stored in plaintext - if this fails,
-    // your pre-save hashing hook isn't running.
-    const rawUser = await UserModel.findById(userId).select("+password");
-    expect(rawUser!.password).not.toBe("Correc@123");
-
-    // Now actually log in with the SAME password via the real service.
-    const loggedInUser = await verifyUserService({
-      email: "roundtrip@example.com",
-      password: "Correc@123",
+      await expect(
+        registerUserService({ email, name: "Second", password: "Password1!" })
+      ).rejects.toThrow(BadRequestException);
     });
-    expect(String(loggedInUser._id)).toBe(String(userId));
-    // omitPassword() should mean the password never comes back to the caller.
-    expect((loggedInUser as any).password).toBeUndefined();
+
+    it("still succeeds when the best-effort verification email step no-ops (RESEND_API_KEY unset in test env)", async () => {
+      const result = await registerUserService({
+        email: `noresend-${Date.now()}@example.com`,
+        name: "No Resend",
+        password: "Password1!",
+      });
+
+      expect(result.userId).toBeTruthy();
+    });
   });
 
-  it("LOGIN fails with the wrong password against a real hash", async () => {
-    await registerUserService({
-      email: "wrongpass@example.com",
-      name: "Test",
-      password: "the-real-password",
+  describe("verifyUserService", () => {
+    it("throws UnauthorizedException with the same message for a nonexistent email and a wrong password", async () => {
+      const user = await createTestUser({ password: "CorrectPass1!" });
+
+      let nonexistentMessage = "";
+      let wrongPasswordMessage = "";
+      try {
+        await verifyUserService({ email: "no-such-user@example.com", password: "whatever" });
+      } catch (error) {
+        nonexistentMessage = (error as Error).message;
+      }
+      try {
+        await verifyUserService({ email: user.email, password: "WrongPass1!" });
+      } catch (error) {
+        wrongPasswordMessage = (error as Error).message;
+      }
+
+      expect(nonexistentMessage).toBeTruthy();
+      expect(nonexistentMessage).toBe(wrongPasswordMessage);
     });
 
-    await expect(
-      verifyUserService({
-        email: "wrongpass@example.com",
-        password: "a-guessed-password",
-      })
-    ).rejects.toThrow(UnauthorizedException);
+    it("succeeds and updates lastLogin for a correct password, excluding passwordHash", async () => {
+      const user = await createTestUser({ password: "CorrectPass1!" });
+      await createAccountService({ userId: user.id, provider: "EMAIL", providerId: user.email });
+
+      const result = await verifyUserService({ email: user.email, password: "CorrectPass1!" });
+
+      expect(result).not.toHaveProperty("passwordHash");
+
+      const [refetched] = await db.select().from(users).where(eq(users.id, user.id));
+      expect(refetched.lastLogin).not.toBeNull();
+    });
   });
 
-  it("REGISTER rejects a duplicate email and leaves no partial data behind (transaction rollback check)", async () => {
-    await registerUserService({
-      email: "duplicate@example.com",
-      name: "First",
-      password: "pw1",
+  describe("loginOrCreateAccountService", () => {
+    it("creates a new user+workspace when no account/email match exists", async () => {
+      const { user } = await loginOrCreateAccountService({
+        provider: "GOOGLE",
+        displayName: "OAuth New",
+        providerId: `google-${Date.now()}`,
+        email: `oauth-new-${Date.now()}@example.com`,
+        emailVerified: true,
+      });
+
+      expect(user.currentWorkspaceId).toBeTruthy();
+      const memberships = await db
+        .select()
+        .from(workspaceMembers)
+        .where(eq(workspaceMembers.userId, user.id));
+      expect(memberships).toHaveLength(1);
     });
 
-    await expect(
-      registerUserService({
-        email: "duplicate@example.com",
-        name: "Second",
-        password: "pw2",
-      })
-    ).rejects.toThrow(BadRequestException);
+    it("returns the existing user for an existing (provider, providerId) account without creating a second workspace", async () => {
+      const providerId = `google-${Date.now()}`;
+      const { user: firstUser } = await loginOrCreateAccountService({
+        provider: "GOOGLE",
+        displayName: "OAuth Repeat",
+        providerId,
+        email: `oauth-repeat-${Date.now()}@example.com`,
+        emailVerified: true,
+      });
 
-    // Only ONE user should exist with this email - confirms the second
-    // (failed) attempt didn't partially write anything despite the abort.
-    const users = await UserModel.find({ email: "duplicate@example.com" });
-    expect(users).toHaveLength(1);
+      const { user: secondUser } = await loginOrCreateAccountService({
+        provider: "GOOGLE",
+        displayName: "OAuth Repeat",
+        providerId,
+        email: `oauth-repeat-${Date.now()}@example.com`,
+        emailVerified: true,
+      });
+
+      expect(secondUser.id).toBe(firstUser.id);
+      const workspaceCount = await db
+        .select()
+        .from(workspaces)
+        .where(eq(workspaces.ownerId, firstUser.id));
+      expect(workspaceCount).toHaveLength(1);
+    });
+
+    it("refuses to auto-link when the email matches an existing user but emailVerified is false", async () => {
+      const existing = await createTestUser();
+
+      await expect(
+        loginOrCreateAccountService({
+          provider: "GOOGLE",
+          displayName: "Impersonator",
+          providerId: `google-${Date.now()}`,
+          email: existing.email,
+          emailVerified: false,
+        })
+      ).rejects.toThrow(UnauthorizedException);
+    });
+
+    it("links the new account to the existing user without a second workspace when emailVerified is true", async () => {
+      const existing = await createTestUser();
+      await createTestWorkspace(existing.id);
+
+      const { user } = await loginOrCreateAccountService({
+        provider: "GOOGLE",
+        displayName: "Verified Link",
+        providerId: `google-${Date.now()}`,
+        email: existing.email,
+        emailVerified: true,
+      });
+
+      expect(user.id).toBe(existing.id);
+      const workspaceCount = await db.select().from(workspaces).where(eq(workspaces.ownerId, existing.id));
+      expect(workspaceCount).toHaveLength(1);
+    });
   });
 
-  it("REGISTER really creates exactly one workspace + one member for the new owner", async () => {
-    const { userId, workspaceId } = await registerUserService({
-      email: "onboarding@example.com",
-      name: "New Owner",
-      password: "pw",
+  describe("createSessionService / refreshAccessTokenService", () => {
+    it("rejects a token from an invalidated session", async () => {
+      const user = await createTestUser();
+      const { refreshToken, sessionId } = await createSessionService({ userId: user.id });
+      await revokeSessionService(user.id, sessionId).catch(() => undefined);
+      await redis.del(`session:${sessionId}`);
+
+      await expect(refreshAccessTokenService(refreshToken)).rejects.toThrow(UnauthorizedException);
     });
 
-    const member = await MemberModel.findOne({ workspaceId, userId });
-    expect(member).not.toBeNull();
+    it("detects refresh token reuse, kills the session, and rejects the rotated token too", async () => {
+      const user = await createTestUser();
+      const { refreshToken: originalToken } = await createSessionService({ userId: user.id });
 
-    const account = await AccountModel.findOne({ userId });
-    expect(account).not.toBeNull();
-    expect(account!.provider).toBe("EMAIL"); // adjust to match your ProviderEnum.EMAIL value if different
+      // JWT `iat` has 1-second resolution: signing the rotated token in the
+      // same wall-clock second as the original would produce a byte-identical
+      // string (same payload, same iat), defeating the reuse check below.
+      await new Promise((resolve) => setTimeout(resolve, 1100));
 
-    // account.model.ts declares a toJSON.transform that strips refreshToken -
-    // this only fires through real Mongoose serialization, not a mocked doc,
-    // so it belongs here rather than in the mocked unit test file.
-    expect(account!.toJSON()).not.toHaveProperty("refreshToken");
+      const { refreshToken: rotatedToken } = await refreshAccessTokenService(originalToken);
+
+      await expect(refreshAccessTokenService(originalToken)).rejects.toThrow(
+        "Refresh token reuse detected. Please log in again."
+      );
+
+      await expect(refreshAccessTokenService(rotatedToken)).rejects.toThrow(UnauthorizedException);
+    });
   });
 
-  it("OAuth: a returning Google identity logs in without creating a second workspace", async () => {
-    // First-time Google login - full onboarding.
-    const { user: firstLoginUser } = await loginOrCreateAccountService({
-      provider: "GOOGLE",
-      providerId: "real-google-sub-1",
-      displayName: "Google Person",
-      email: "google-person@example.com",
+  describe("requestPasswordResetService / resetPasswordService", () => {
+    it("is a silent no-op for an unknown email", async () => {
+      await expect(requestPasswordResetService("unknown@example.com")).resolves.toBeUndefined();
     });
 
-    const workspacesAfterFirstLogin = await WorkspaceModel.find({
-      owner: firstLoginUser._id,
-    });
-    expect(workspacesAfterFirstLogin).toHaveLength(1);
-
-    // Second login with the SAME provider+providerId should reuse the
-    // existing account/user, not create anything new.
-    const { user: secondLoginUser } = await loginOrCreateAccountService({
-      provider: "GOOGLE",
-      providerId: "real-google-sub-1",
-      displayName: "Google Person",
-      email: "google-person@example.com",
+    it("resetPasswordService rejects a bogus/never-stored token", async () => {
+      await expect(resetPasswordService("bogus-token", "NewPassword1!")).rejects.toThrow(
+        "Invalid or expired reset token"
+      );
     });
 
-    expect(String(secondLoginUser._id)).toBe(String(firstLoginUser._id));
-    const workspacesAfterSecondLogin = await WorkspaceModel.find({
-      owner: firstLoginUser._id,
+    it("full round trip: capture the raw token via a spy, reset the password, and invalidate all sessions", async () => {
+      const user = await createTestUser({ password: "OldPassword1!" });
+      await createSessionService({ userId: user.id });
+      const spy = vi.spyOn(emailProvider, "sendPasswordResetEmail").mockResolvedValue(undefined);
+
+      await requestPasswordResetService(user.email);
+
+      const resetUrl = spy.mock.calls[0][1];
+      const rawToken = new URL(resetUrl).searchParams.get("token");
+      expect(rawToken).toBeTruthy();
+
+      const [beforeReset] = await db.select().from(users).where(eq(users.id, user.id));
+
+      await resetPasswordService(rawToken as string, "NewPassword1!");
+
+      const [afterReset] = await db.select().from(users).where(eq(users.id, user.id));
+      expect(afterReset.passwordHash).not.toBe(beforeReset.passwordHash);
+
+      const sessions = await getUserSessionsService(user.id);
+      expect(sessions).toHaveLength(0);
     });
-    // Still exactly one - this is the exact bug class an "email-first"
-    // implementation could reintroduce if ever refactored carelessly.
-    expect(workspacesAfterSecondLogin).toHaveLength(1);
   });
 
-  it("OAuth: linking Google to an existing email/password account does NOT create a second workspace", async () => {
-    const { userId } = await registerUserService({
-      email: "hybrid-login@example.com",
-      name: "Hybrid User",
-      password: "pw",
+  describe("requestEmailVerificationService / verifyEmailService", () => {
+    it("throws BadRequestException when the user's email is already verified", async () => {
+      const user = await createTestUser();
+      await db.update(users).set({ isEmailVerified: true }).where(eq(users.id, user.id));
+
+      await expect(requestEmailVerificationService(user.id)).rejects.toThrow(BadRequestException);
     });
 
-    await loginOrCreateAccountService({
-      provider: "GOOGLE",
-      providerId: "hybrid-google-sub",
-      displayName: "Hybrid User",
-      email: "hybrid-login@example.com",
-      emailVerified: true,
-    });
+    it("full round trip: capture the raw token via a spy and verify the email", async () => {
+      const user = await createTestUser();
+      const spy = vi.spyOn(emailProvider, "sendVerificationEmail").mockResolvedValue(undefined);
 
-    const accountsForUser = await AccountModel.find({ userId });
-    // Should now have TWO accounts (email + google) linked to the SAME user...
-    expect(accountsForUser.length).toBeGreaterThanOrEqual(2);
-    // ...but still only ONE workspace.
-    const workspaces = await WorkspaceModel.find({ owner: userId });
-    expect(workspaces).toHaveLength(1);
+      await requestEmailVerificationService(user.id);
+
+      const verifyUrl = spy.mock.calls[0][1];
+      const rawToken = new URL(verifyUrl).searchParams.get("token");
+      expect(rawToken).toBeTruthy();
+
+      await verifyEmailService(rawToken as string);
+
+      const [refetched] = await db.select().from(users).where(eq(users.id, user.id));
+      expect(refetched.isEmailVerified).toBe(true);
+    });
   });
 
-  it("REFRESH: a session created at login can mint a new access token, and a deleted/expired one cannot", async () => {
-    const { userId } = await registerUserService({
-      email: "refresh-flow@example.com",
-      name: "Refresh Test",
-      password: "pw",
+  describe("changePasswordService", () => {
+    it("throws UnauthorizedException for a wrong current password", async () => {
+      const user = await createTestUser({ password: "CorrectPass1!" });
+
+      await expect(
+        changePasswordService(user.id, undefined, "WrongPass1!", "NewPassword1!")
+      ).rejects.toThrow(UnauthorizedException);
     });
 
-    const { refreshToken, sessionId } = await createSessionService({ userId });
+    it("invalidates all OTHER sessions but keeps the current one", async () => {
+      const user = await createTestUser({ password: "CorrectPass1!" });
+      const sessionA = await createSessionService({ userId: user.id });
+      await createSessionService({ userId: user.id });
 
-    const refreshed = await refreshAccessTokenService(refreshToken);
-    expect(typeof refreshed.accessToken).toBe("string");
+      await changePasswordService(user.id, sessionA.sessionId, "CorrectPass1!", "NewPassword1!");
 
-    // Now actually expire the session in the real DB and confirm refresh fails.
-    await SessionModel.findByIdAndUpdate(sessionId, {
-      expiresAt: new Date(Date.now() - 1000),
+      const sessions = await getUserSessionsService(user.id);
+      expect(sessions).toHaveLength(1);
+      expect(sessions[0].id).toBe(sessionA.sessionId);
+    });
+  });
+
+  describe("revokeSessionService", () => {
+    it("throws NotFoundException (not 403) when the session belongs to a different user", async () => {
+      const owner = await createTestUser();
+      const otherUser = await createTestUser();
+      const { sessionId } = await createSessionService({ userId: owner.id });
+
+      await expect(revokeSessionService(otherUser.id, sessionId)).rejects.toThrow(NotFoundException);
+    });
+  });
+
+  describe("authenticateAccessTokenService", () => {
+    it("throws UnauthorizedException for an inactive user", async () => {
+      const user = await createTestUser();
+      const { accessToken } = await createSessionService({ userId: user.id });
+      await db.update(users).set({ isActive: false }).where(eq(users.id, user.id));
+
+      await expect(authenticateAccessTokenService(accessToken)).rejects.toThrow(UnauthorizedException);
     });
 
-    await expect(refreshAccessTokenService(refreshToken)).rejects.toThrow(
-      UnauthorizedException
-    );
+    it("throws UnauthorizedException for a session whose isValid isn't \"1\"", async () => {
+      const user = await createTestUser();
+      const { accessToken, sessionId } = await createSessionService({ userId: user.id });
+      await redis.hset(`session:${sessionId}`, { isValid: "0" });
 
-    // Bonus: the service should have deleted the expired session document.
-    const stillExists = await SessionModel.findById(sessionId);
-    expect(stillExists).toBeNull();
+      await expect(authenticateAccessTokenService(accessToken)).rejects.toThrow(UnauthorizedException);
+    });
   });
 });

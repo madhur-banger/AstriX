@@ -1,10 +1,8 @@
 /**
  * UNIT TESTS: errorHandles.middleware.ts
  * ------------------------------------------
- * This is the file both e2e suites previously bypassed with a hand-rolled
- * stand-in (see PLAN.md fix F3) - it needs its own direct unit test
- * regardless of that fix, since e2e coverage alone can't enumerate every
- * error-type branch cleanly.
+ * Direct unit tests for this middleware's branches - e2e coverage alone
+ * can't enumerate every error-type branch cleanly.
  */
 
 import { describe, it, expect, vi } from "vitest";
@@ -114,61 +112,6 @@ describe("errorHandler", () => {
     expect(res.json).toHaveBeenCalledWith({
       message: "Request body is too large.",
     });
-  });
-
-  it("returns 400 (not 500) for a Mongoose CastError, without leaking the raw error message", () => {
-    const { req, res, next } = createMockReqRes();
-    const error = Object.assign(
-      new Error(
-        'Cast to ObjectId failed for value "not-a-real-id" (type string) at path "_id" for model "Workspace"'
-      ),
-      { name: "CastError" }
-    );
-
-    errorHandler(error, req, res, next);
-
-    expect(res.status).toHaveBeenCalledWith(HTTPSTATUS.BAD_REQUEST);
-    const [responseBody] = vi.mocked(res.json).mock.calls[0];
-    expect(responseBody.message).toBe("Invalid identifier");
-    expect(JSON.stringify(responseBody)).not.toContain("not-a-real-id");
-  });
-
-  it("returns 400 with field-level errors for a Mongoose ValidationError", () => {
-    const { req, res, next } = createMockReqRes();
-    const error = Object.assign(new Error("Workspace validation failed"), {
-      name: "ValidationError",
-      errors: {
-        name: { path: "name", message: "Path `name` is required." },
-      },
-    });
-
-    errorHandler(error, req, res, next);
-
-    expect(res.status).toHaveBeenCalledWith(HTTPSTATUS.BAD_REQUEST);
-    expect(res.json).toHaveBeenCalledWith({
-      message: "Validation failed",
-      errors: [{ field: "name", message: "Path `name` is required." }],
-      errorCode: "VALIDATION_ERROR",
-    });
-  });
-
-  it("returns 409 (not 500) for a Mongo duplicate-key error, without leaking the raw error message", () => {
-    const { req, res, next } = createMockReqRes();
-    const error = Object.assign(
-      new Error(
-        'E11000 duplicate key error collection: test.users index: email_1 dup key: { email: "someone@example.com" }'
-      ),
-      { code: 11000 }
-    );
-
-    errorHandler(error, req, res, next);
-
-    expect(res.status).toHaveBeenCalledWith(HTTPSTATUS.CONFLICT);
-    const [responseBody] = vi.mocked(res.json).mock.calls[0];
-    expect(responseBody.message).toBe(
-      "A resource with these details already exists"
-    );
-    expect(JSON.stringify(responseBody)).not.toContain("someone@example.com");
   });
 
   it("hides the raw error message for an unknown/generic Error when NODE_ENV=production", async () => {

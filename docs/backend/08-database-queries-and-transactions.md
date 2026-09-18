@@ -2,7 +2,9 @@
 
 # Database Queries & Transactions
 
-This file owns two things: how AstriX actually talks to MongoDB on a per-query basis (connection lifecycle, pool sizing, the ODM boundary), and every place in the codebase where more than one write has to succeed or fail together as a single atomic unit. The *shape* of the data — which collections exist, how they reference each other, which fields are indexed for which query — belongs to [`07-database-schema-design.md`](./07-database-schema-design.md); this file assumes that shape exists and focuses on the mechanics of reading and writing it safely under concurrency and partial failure.
+This file owns two things: how AstriX actually talks to PostgreSQL on a per-query basis (connection lifecycle, pool sizing, the query-builder boundary), and every place in the codebase where more than one write has to succeed or fail together as a single atomic unit. The *shape* of the data — which tables exist, how they reference each other, which columns are indexed for which query — belongs to [`07-database-schema-design.md`](./07-database-schema-design.md); this file assumes that shape exists and focuses on the mechanics of reading and writing it safely under concurrency and partial failure.
+
+> **Note on this revision:** AstriX's backend was migrated off MongoDB/Mongoose onto PostgreSQL (via Drizzle ORM) and Redis (via `ioredis`) — see [`backend/migrations/PLAN.md`](../../backend/migrations/PLAN.md) for the full six-phase history. Everything below documents the Drizzle/Postgres mechanics as they exist today; the old Mongoose session/transaction API (`startSession`/`.session(...)`/`abortTransaction()`/`endSession()`) is gone from this codebase entirely, and shows up here only where it's useful contrast for *why* the current shape looks the way it does.
 
 ---
 
@@ -12,73 +14,62 @@ Before looking at AstriX, it's worth naming the actual menu of options for "how 
 
 ### 1.1 Data-access approaches
 
-**(a) Raw driver calls.** No abstraction layer at all — you call the database vendor's own client library directly. For MongoDB, that's the official `mongodb` Node driver:
+**(a) Raw driver calls.** No abstraction layer at all — you call the database vendor's own client library directly. For Postgres in Node, that's `pg` (`node-postgres`):
 
 ```js
-const client = new MongoClient(uri);
-const db = client.db("app");
-const user = await db.collection("users").findOne({ email });
-await db.collection("users").insertOne({ email, name, createdAt: new Date() });
+const pool = new Pool({ connectionString });
+const { rows } = await pool.query("SELECT * FROM users WHERE email = $1", [email]);
 ```
 
-Maximum control — you see exactly what goes over the wire, and there's no framework "magic" to work around when you need something unusual. The cost is that *everything* is boilerplate: no schema enforcement (a typo'd field name just silently writes a new field), no built-in validation, and any convention (timestamps, soft-delete flags, default values) has to be hand-rolled and repeated at every call site.
+Maximum control — you see exactly what goes over the wire, and there's no framework "magic" to work around when you need something unusual. The cost is that *everything* is boilerplate: no compile-time column-name checking (a typo'd column name is a runtime `42703` error, not a type error), and every query's result shape has to be hand-typed or cast, since `pg` returns `any`-shaped rows.
 
-**(b) Query builder.** A library that constructs queries programmatically, with some type safety, but without a full object-document/object-relational mapping layer sitting between your code and the returned rows. The canonical SQL example is [Knex](https://knexjs.org/):
-
-```js
-const user = await knex("users").where({ email }).first();
-await knex("users").insert({ email, name });
-```
-
-For MongoDB, the closest equivalent isn't a separate library — it's using the driver's own aggregation-pipeline builder directly instead of a full ODM, composing `$match`/`$lookup`/`$group` stages by hand for anything beyond a simple `find`. You get composability and some protection against string-concatenated queries, but no schema, no hooks, and the mapping from "row/document" back to a typed object is still your problem.
-
-**(c) Full ODM/ORM.** A layer that maps application objects to documents/rows *and* owns schema definition, validation, and lifecycle hooks — Mongoose for MongoDB, or Prisma/TypeORM/Sequelize for SQL. This is what AstriX uses.
-
-```js
-// Mongoose
-const UserSchema = new Schema({ email: { type: String, required: true, unique: true } });
-const User = model("User", UserSchema);
-const user = await User.findOne({ email });
-```
+**(b) Query builder.** A library that constructs queries programmatically, with real type safety, without a full ORM's schema-validation/lifecycle-hook machinery sitting between your code and the returned rows. Knex is the long-standing example; Drizzle ORM (despite the name) is architecturally this category, not a full ORM — its query builder methods map close to 1:1 onto SQL clauses, and the types come directly from the schema definition, not from a separate declarative DSL a code generator has to run over.
 
 ```ts
-// Prisma (SQL, but same category of tool)
+// Drizzle
+const user = await db.select().from(users).where(eq(users.email, email));
+await db.insert(users).values({ email, name });
+```
+
+You get composability, full type inference end to end (a `.select({...})` projection's TypeScript type is derived from the columns you actually listed), and full visibility into the generated SQL — at the cost of no lifecycle hooks and no schema-level validation; anything resembling "validate before this hits the database" has to happen in application code before the query runs.
+
+**(c) Full ORM.** A layer that maps application objects to rows *and* owns schema definition, validation, and lifecycle hooks — Prisma, TypeORM, Sequelize for SQL; Mongoose was this category for MongoDB.
+
+```ts
+// Prisma, for comparison — not what AstriX uses
 const user = await prisma.user.findUnique({ where: { email } });
 ```
 
-The ODM/ORM enforces a schema at the application layer (Mongoose validates types and required fields before a write reaches Mongo at all), gives you lifecycle hooks (pre-save password hashing, for instance), and turns a raw document/row into a typed, method-bearing object. The cost is an abstraction layer with its own behavior to learn — Mongoose's casting rules, its query builder chaining, its session/transaction API — and a real performance tax if you don't opt out of it for read-only paths (see §7 on `.lean()`).
+The ORM enforces more at the application layer and can give you lifecycle hooks (pre-save hashing, for instance), at the cost of an abstraction layer with its own behavior to learn — Prisma's own query engine and migration model, for instance — and often a real performance/debuggability tax versus a query builder when a query gets complex enough that you need to see the actual generated SQL to reason about it.
 
-**(d) Repository pattern.** Layered on top of any of the above: an explicit interface sits between services and the underlying data-access technology, so business logic depends on an abstraction (`UserRepository`) rather than directly on Mongoose or Prisma.
+**(d) Repository pattern.** Layered on top of any of the above: an explicit interface sits between services and the underlying data-access technology, so business logic depends on an abstraction (`UserRepository`) rather than directly on Drizzle or Prisma.
 
 ```ts
 interface UserRepository {
   findByEmail(email: string): Promise<User | null>;
-  create(data: NewUser): Promise<User>;
 }
 
-class MongooseUserRepository implements UserRepository {
+class DrizzleUserRepository implements UserRepository {
   async findByEmail(email: string) {
-    return UserModel.findOne({ email }).lean();
-  }
-  async create(data: NewUser) {
-    return UserModel.create(data);
+    const [user] = await db.select().from(users).where(eq(users.email, email));
+    return user ?? null;
   }
 }
 ```
 
-The theoretical payoff is swappability — the database technology could change underneath the interface without touching business logic — and centralization of query logic that would otherwise be duplicated across services. The cost is a whole extra layer that needs its own tests, its own maintenance, and a translation step between "what the repository interface promises" and "what the underlying ODM actually does" (a Mongoose-specific concept like `.session()` for transactions has to be threaded through the interface too, or the abstraction leaks the moment you need a multi-document transaction). **AstriX does not have this layer** — verified directly: every service under `backend/src/services/` imports Mongoose models (`UserModel`, `WorkspaceModel`, etc.) and calls them directly. There is no `repositories/` folder, no `IUserRepository` interface, nothing between a service function and `mongoose.model(...)`.
+The theoretical payoff is swappability — the database technology could change underneath the interface without touching business logic — and centralization of query logic that would otherwise be duplicated across services. The cost is a whole extra layer that needs its own tests and its own maintenance. **AstriX does not have this layer** — verified directly: every service under `backend/src/services/` imports `db` from `../db/client` and the relevant tables from `../db/schema` and queries them directly. There is no `repositories/` folder, no `IUserRepository` interface, nothing between a service function and Drizzle's query builder. This mirrors the choice already documented in [`01-architecture-patterns-and-project-structure.md`](./01-architecture-patterns-and-project-structure.md) — AstriX's earlier migration draft tried exactly this repository/ports-and-adapters shape for Phase 4 and walked it back as unjustified ceremony at this scale (see that file's §5).
 
 ### 1.2 Transaction models
 
 Separately from "how do you issue a single query," there's "how do you guarantee multiple writes succeed or fail together." Three real approaches:
 
-**No transactions at all — relying on single-document atomicity.** MongoDB *always* guarantees that a write to a single document is atomic, regardless of transaction usage — a `updateOne` that touches five fields on one document either applies all five or none, with no explicit transaction needed. A huge fraction of real-world writes never need more than this guarantee:
+**No transactions at all — relying on single-statement atomicity.** A single SQL statement is always atomic in Postgres — an `UPDATE` that touches five columns on one row either applies all five or none, with no explicit transaction needed, and the same holds for a single `INSERT ... RETURNING` or `DELETE`. A huge fraction of real-world writes never need more than this guarantee:
 
-```js
-await TaskModel.findByIdAndUpdate(taskId, { status: "done", completedAt: new Date() });
+```ts
+await db.update(tasks).set({ status: "DONE", updatedAt: new Date() }).where(eq(tasks.id, taskId));
 ```
 
-This is the cheapest option (no session overhead, no two-phase-commit-style locking) and it's suffient whenever "atomic" only needs to mean "this one document, all its fields, together."
+This is the cheapest option (no transaction-block overhead, no extra round trips for `BEGIN`/`COMMIT`) and it's sufficient whenever "atomic" only needs to mean "this one statement, all its rows, together."
 
 **Application-level saga / compensating transactions.** Used when true ACID transactions aren't available or desirable across service or database boundaries — most commonly in a microservices architecture where each step lives in a different service with its own datastore, so no single database transaction could span all of them anyway. Each step defines an explicit "undo":
 
@@ -101,32 +92,26 @@ async function bookTrip(order) {
 }
 ```
 
-This buys cross-service atomicity-in-spirit without a distributed transaction coordinator, at the cost of every step needing a correct, tested "undo" — and a window where partial state is visible to the rest of the system before the compensation runs.
+This buys cross-service atomicity-in-spirit without a distributed transaction coordinator, at the cost of every step needing a correct, tested "undo" — and a window where partial state is visible to the rest of the system before the compensation runs. AstriX is a single database behind a single service, so this pattern doesn't apply anywhere in the codebase — it's included here because it's the answer once a system genuinely does span multiple datastores, which AstriX's Postgres+Redis split technically already is in a narrow sense (see §3.2's note on why session cleanup can't be transactional).
 
-**True multi-document ACID transactions**, via `mongoose.startSession()` / `session.startTransaction()`. MongoDB has supported multi-document ACID transactions since version 4.0 (replica sets) / 4.2 (sharded clusters). A session groups a set of operations so they commit or abort together, with snapshot isolation for reads inside the transaction:
+**True multi-statement ACID transactions**, via Drizzle's `db.transaction(async (tx) => { ... })`. Postgres has supported multi-statement ACID transactions since long before this migration — `BEGIN`/`COMMIT`/`ROLLBACK` at the SQL level, with real snapshot isolation for reads inside the transaction. Drizzle wraps this in a callback API:
 
-```js
-const session = await mongoose.startSession();
-try {
-  session.startTransaction();
-  await ModelA.create([{ ... }], { session });
-  await ModelB.updateOne({ ... }, { ... }, { session });
-  await session.commitTransaction();
-} catch (err) {
-  await session.abortTransaction();
-  throw err;
-} finally {
-  session.endSession();
-}
+```ts
+await db.transaction(async (tx) => {
+  const [a] = await tx.insert(tableA).values({ ... }).returning();
+  await tx.update(tableB).set({ ... }).where(eq(tableB.id, a.id));
+  // no explicit commit call - resolving the callback commits;
+  // throwing inside it rolls back automatically.
+});
 ```
 
-This is the strongest guarantee available inside a single MongoDB deployment — genuinely all-or-nothing across collections — but it isn't free: transactions hold locks for their duration, add round-trip overhead for `startTransaction`/`commitTransaction`, and (critically, see §3.4) require the target deployment to be a replica set or sharded cluster; a standalone `mongod` cannot run transactions at all. **This is what AstriX uses, selectively**, for exactly the operations where single-document atomicity isn't enough.
+Drizzle's `db.transaction()` issues a real `BEGIN` before the callback runs, passes a `tx` object (itself a full query-builder client, scoped to that transaction) into the callback, and automatically issues `COMMIT` if the callback's promise resolves or `ROLLBACK` if it rejects — there's no separate `startTransaction()`/`commitTransaction()`/`abortTransaction()` call sequence to get right by hand, and no `finally` block needed to release anything, because the transaction's lifetime is exactly the callback's lifetime. **This is what AstriX uses, selectively**, for exactly the operations where single-statement atomicity isn't enough.
 
 ---
 
 ## 2. AstriX's Choice
 
-AstriX uses **Mongoose as a full ODM** — schemas, validation, and lifecycle hooks live on the model definitions in `backend/src/models/`, and every service imports those models directly with no repository layer in between. For the subset of operations that write across more than one collection as a single logical unit — user registration, OAuth login-or-create, account deletion, workspace creation, and workspace deletion — AstriX reaches for a real multi-document ACID transaction via `mongoose.startSession()`/`startTransaction()`. Every other write (a task update, a project creation, a role change) relies on MongoDB's built-in single-document atomicity and skips the session machinery entirely.
+AstriX uses **Drizzle ORM as a typed query builder** — table definitions and their columns/enums/indexes live in `backend/src/db/schema.ts` (owned in full by [`07-database-schema-design.md`](./07-database-schema-design.md)), and every service imports `db` and the tables it needs directly, with no repository layer in between. For the subset of operations that write across more than one table as a single logical unit — user registration, OAuth login-or-create, account deletion, workspace creation, and workspace deletion — AstriX reaches for a real Postgres transaction via `db.transaction(async (tx) => { ... })`. Every other write (a task update, a project creation, a role change) relies on Postgres's built-in single-statement atomicity and never opens a transaction at all.
 
 ---
 
@@ -135,409 +120,174 @@ AstriX uses **Mongoose as a full ODM** — schemas, validation, and lifecycle ho
 ### 3.1 Connection setup and pool sizing
 
 ```ts
-// backend/src/config/database.config.ts:1-19
-import mongoose from "mongoose";
-import { config } from "./app.config";
-import { logger } from "../utils/logger";
+// backend/src/db/client.ts, in full
+import { drizzle } from "drizzle-orm/node-postgres";
+import { Pool } from "pg";
+import * as schema from "./schema";
+import { getEnv } from "../utils/get-env";
 
-const connectDatabase = async () => {
-  try {
-    await mongoose.connect(config.MONGO_URI, {
-      maxPoolSize: config.MONGO_MAX_POOL_SIZE,
-      minPoolSize: config.MONGO_MIN_POOL_SIZE,
-    });
-    logger.info("Connected to Mongo Database");
-  } catch (error) {
-    logger.error({ err: error }, "Error connecting to Mongo Database");
-    process.exit(1);
-  }
-};
-
-export default connectDatabase;
-```
-
-The pool bounds themselves are computed in `app.config.ts`, with the reasoning spelled out in the source comment:
-
-```ts
-// backend/src/config/app.config.ts:9-28 (excerpted — the object literal continues past line 28 with unrelated config)
-// The Mongo driver's default maxPoolSize is 100 PER PROCESS. With several
-// ECS tasks scaling out behind the ALB, that can exhaust a lower-tier Atlas
-// cluster's total connection ceiling long before any single task is
-// actually saturated - so bound it explicitly instead of inheriting the
-// default. minPoolSize keeps a few connections warm so a freshly started
-// task doesn't pay handshake latency on its first requests.
-const DEFAULT_MONGO_MAX_POOL_SIZE = "15";
-const DEFAULT_MONGO_MIN_POOL_SIZE = "2";
-
-const appConfig = () => ({
-  NODE_ENV,
-  PORT,
-  BASE_PATH,
-  MONGO_URI: getEnv("MONGO_URI", ""),
-  MONGO_MAX_POOL_SIZE: Number(
-    getEnv("MONGO_MAX_POOL_SIZE", DEFAULT_MONGO_MAX_POOL_SIZE)
-  ),
-  MONGO_MIN_POOL_SIZE: Number(
-    getEnv("MONGO_MIN_POOL_SIZE", DEFAULT_MONGO_MIN_POOL_SIZE)
-  ),
-  ...
-```
-
-`connectDatabase()` is awaited before the server starts listening — the exact code and reasoning for that ordering lives in the bootstrap file and is already covered in full in the master backend file, reused here because it's the other half of "connection lifecycle":
-
-```ts
-// backend/src/index.ts:176-182, 188-236 (excerpted — see 00-master-backend-architecture.md §3 for the complete bootstrap file)
-mongoose.connection.on("error", (error) => {
-  logger.error({ err: error }, "MongoDB connection error");
+export const pool = new Pool({
+  connectionString: getEnv("DATABASE_URL", ""),
+  max: Number(getEnv("PG_MAX_POOL_SIZE", "15")),
+  min: Number(getEnv("PG_MIN_POOL_SIZE", "2")),
 });
 
-mongoose.connection.on("disconnected", () => {
-  logger.warn("MongoDB disconnected");
-});
-
-const startServer = async () => {
-  // Connect BEFORE binding to the port - a task should never report itself
-  // as listening/ready if it can't reach its database. connectDatabase()
-  // already process.exit(1)s on failure, so getting past this line means
-  // the connection is good.
-  await connectDatabase();
-
-  const server = app.listen(config.PORT, () => {
-    logger.info(
-      `Server listening on port ${config.PORT} in ${config.NODE_ENV} environment`
-    );
-  });
-
-  const shutdown = (signal: string) => {
-    logger.info(`${signal} received, shutting down gracefully`);
-
-    // Stop accepting new connections and wait for in-flight requests to
-    // finish before closing the DB connection and exiting - avoids
-    // dropping requests mid-response when ECS replaces this task.
-    server.close(async (closeError) => {
-      if (closeError) {
-        logger.error({ err: closeError }, "Error while closing HTTP server");
-      }
-
-      try {
-        await mongoose.connection.close();
-      } catch (dbCloseError) {
-        logger.error(
-          { err: dbCloseError },
-          "Error while closing MongoDB connection"
-        );
-      }
-
-      logger.info("Shutdown complete");
-      process.exit(closeError ? 1 : 0);
-    });
-
-    // Belt-and-suspenders: force-exit if graceful shutdown hangs (e.g. a
-    // connection that never drains) rather than leaving the process stuck
-    // past the orchestrator's grace period.
-    setTimeout(() => {
-      logger.error("Graceful shutdown timed out, forcing exit");
-      process.exit(1);
-    }, 10_000).unref();
-  };
-
-  process.on("SIGTERM", () => shutdown("SIGTERM"));
-  process.on("SIGINT", () => shutdown("SIGINT"));
-};
+export const db = drizzle(pool, { schema });
 ```
 
-Two connection-lifecycle listeners (`error`, `disconnected`) are wired once, globally, at bootstrap — not per-query — and the `/health` endpoint reads `mongoose.connection.readyState` as an in-memory flag rather than issuing a round-trip ping, so an ALB health check reflects real connectivity without adding load. Full detail on the health-check route and the rest of the bootstrap sequence is in [`00-master-backend-architecture.md`](./00-master-backend-architecture.md).
+Two exports, not one — this is a genuine, deliberate change from a Mongoose-style single-connection-object setup, and it matters for shutdown (§3.5): `pool` is the raw `pg` connection pool, and `db` is the Drizzle query-builder instance wrapped around it. `pool` was kept as its own export specifically so `src/index.ts` can call `pool.end()` directly during graceful shutdown — Drizzle's `db` object doesn't itself expose a "close everything" method, since it's a thin query-building layer over whatever pool it was handed, not the connection owner.
+
+`max`/`min` here are Postgres's `PG_MAX_POOL_SIZE`/`PG_MIN_POOL_SIZE` — the direct renaming of Mongoose's `maxPoolSize`/`minPoolSize` for the same reasoning (bound the pool explicitly so N horizontally-scaled ECS tasks × pool size doesn't exceed the database's actual connection ceiling; keep a small warm floor so a freshly started task doesn't pay full connection-handshake latency on its first requests). One thing worth being precise about, because it's a real, checkable detail of this exact file rather than a paraphrase: `client.ts` reads `PG_MAX_POOL_SIZE`/`PG_MIN_POOL_SIZE` directly via `getEnv(...)`, not through `config.app.config`'s already-parsed `config.PG_MAX_POOL_SIZE`/`config.PG_MIN_POOL_SIZE` — even though `app.config.ts` computes exactly those two fields (with the same default values, `"15"`/`"2"`) and documents the same ECS-connection-ceiling reasoning in its own comment. In practice the two reads agree, because both default to the same values and read the same env vars — but it means `config.PG_MAX_POOL_SIZE`/`config.PG_MIN_POOL_SIZE` are currently unused dead fields on the config object; nothing in `backend/src` imports them. A future engineer changing the pool size by editing `app.config.ts`'s default and not noticing `client.ts` never reads it would ship a no-op change — worth flagging as a small, real inconsistency rather than assuming the two are wired together just because they compute the same thing.
 
 ### 3.2 Every transaction in the codebase
 
-A grep for `startSession`/`startTransaction` across `backend/src` turns up exactly six real usages (plus their corresponding test-side mocks, which aren't counted here):
+A grep for `db.transaction(` across `backend/src` turns up exactly four real usages:
 
 | # | Location | Protects |
 |---|---|---|
-| 1 | `backend/src/seeders/role.seeder.ts:12-51` | Clearing and re-inserting the fixed set of roles/permissions as one atomic reset |
-| 2 | `backend/src/services/auth.service.ts:96-166` (`registerUserService`) | Creating User + Account + Workspace + Member, and setting the user's `currentWorkspace`, as one atomic unit |
-| 3 | `backend/src/services/auth.service.ts:239-329` (`loginOrCreateAccountService`) | OAuth login-or-create: creating User + Workspace + Member + linking the OAuth Account together |
-| 4 | `backend/src/services/user.service.ts:100-130` (`deleteAccountService`) | Unassigning the user's tasks and deleting Member/Account/Session/PasswordResetToken/EmailVerificationToken/User records together |
-| 5 | `backend/src/services/workspace.service.ts:28-73` (`createWorkspaceService`) | Creating Workspace + Member and updating the user's `currentWorkspace` together |
-| 6 | `backend/src/services/workspace.service.ts:285-347` (`deleteWorkspaceService`) | Deleting Project + Task + Member records, updating the deleting user's `currentWorkspace`, and deleting the Workspace itself, together |
+| 1 | `backend/src/services/auth.service.ts:97-127` (`registerUserService`) | Creating the User row, an EMAIL `Account` row, the OWNER `Role` lookup, the Workspace, and the `workspace_members` row, plus setting the user's `currentWorkspaceId`, as one atomic unit |
+| 2 | `backend/src/services/auth.service.ts:207-276` (`loginOrCreateAccountService`) | OAuth login-or-create: creating the User + Workspace + `workspace_members` row (new-user branch) and linking the OAuth `Account`, together |
+| 3 | `backend/src/services/user.service.ts:114-122` (`deleteAccountService`) | Unassigning the user's tasks and deleting their `workspace_members`/`accounts`/`users` rows together |
+| 4 | `backend/src/services/workspace.service.ts:24-56` (`createWorkspaceService`) | Creating the Workspace + `workspace_members` row and updating the user's `currentWorkspaceId`, together |
 
-Every one of these follows the identical `try { startTransaction(); ...; commitTransaction() } catch { abortTransaction(); throw } finally { endSession() }` shape. Here is each one in full.
+`deleteWorkspaceService` (`backend/src/services/workspace.service.ts:226-263`) also opens a transaction, worth listing as a fifth real usage even though its shape is different from the other four — it exists mainly to make the ownership check and the delete-plus-reassignment read-after-write consistent, since the actual multi-table cleanup (removing `workspace_members`, `projects`, and `tasks` rows for the deleted workspace) is now Postgres's `ON DELETE CASCADE` doing it automatically, not application code inside the transaction (§3.3 below covers exactly what changed here).
 
-**The role seeder** (a one-shot script, not request-driven, but it uses the same session machinery):
+Every one of these follows the same shape: call `db.transaction(async (tx) => { ... })`, use `tx` — never the module-level `db` — for every read and write inside the callback, and either `return` a value (which becomes `db.transaction()`'s own resolved value) or `throw` (which Drizzle turns into an automatic `ROLLBACK`, with the original error re-thrown to the caller). Here is each one in full.
 
-```ts
-// backend/src/seeders/role.seeder.ts:1-52
-import "dotenv/config";
-import mongoose from "mongoose";
-import connectDatabase from "../config/database.config";
-import RoleModel from "../models/roles-permission.model";
-import { RolePermissions } from "../utils/role-permission";
-
-const seedRoles = async () => {
-  console.log("Seeding roles started...");
-
-  await connectDatabase();
-
-  const session = await mongoose.startSession();
-
-  try {
-    session.startTransaction();
-
-    console.log("Clearing existing roles...");
-    await RoleModel.deleteMany({}, { session });
-
-    for (const roleName in RolePermissions) {
-      const role = roleName as keyof typeof RolePermissions;
-      const permissions = RolePermissions[role];
-
-      // Check if the role already exists
-      const existingRole = await RoleModel.findOne({ name: role }).session(
-        session
-      );
-      if (!existingRole) {
-        const newRole = new RoleModel({
-          name: role,
-          permissions: permissions,
-        });
-        await newRole.save({ session });
-        console.log(`Role ${role} added with permissions.`);
-      } else {
-        console.log(`Role ${role} already exists.`);
-      }
-    }
-
-    await session.commitTransaction();
-    console.log("Transaction committed.");
-    console.log("Seeding completed successfully.");
-  } catch (error) {
-    // Without this the transaction stayed open on failure, holding locks
-    // until the server timed it out. Same try/catch/finally shape as the
-    // transactional services (see auth.service.ts / workspace.service.ts).
-    await session.abortTransaction();
-    throw error;
-  } finally {
-    session.endSession();
-  }
-};
-```
-
-**User registration** — the most involved of the six, five documents across four collections written as one unit:
+**User registration** — the most involved of the four, five statements across four tables written as one unit:
 
 ```ts
-// backend/src/services/auth.service.ts:90-166 (registerUserService)
+// backend/src/services/auth.service.ts:90-143 (registerUserService)
 export const registerUserService = async (body: {
   email: string;
   name: string;
   password: string;
 }) => {
   const { email, name, password } = body;
-  const session = await mongoose.startSession();
 
-  try {
-    session.startTransaction();
-
-    const existingUser = await UserModel.findOne({ email }).session(session);
+  const { userId, workspaceId } = await db.transaction(async (tx) => {
+    const [existingUser] = await tx.select().from(users).where(eq(users.email, email));
     if (existingUser) {
       throw new BadRequestException("Email already exists");
     }
 
-    const user = new UserModel({ email, name, password });
-    await user.save({ session });
+    const passwordHash = await hashValue(password);
+    const [user] = await tx.insert(users).values({ email, name, passwordHash }).returning();
 
-    const account = new AccountModel({
-      userId: user._id,
-      provider: ProviderEnum.EMAIL,
-      providerId: email,
-    });
-    await account.save({ session });
+    await tx.insert(accounts).values({ userId: user.id, provider: "EMAIL", providerId: email });
 
-    const workspace = new WorkspaceModel({
-      name: "My Workspace",
-      description: `Workspace created for ${user.name}`,
-      owner: user._id,
-    });
-    await workspace.save({ session });
-
-    const ownerRole = await RoleModel.findOne({ name: Roles.OWNER }).session(
-      session
-    );
+    const [ownerRole] = await tx.select().from(roles).where(eq(roles.name, Roles.OWNER));
     if (!ownerRole) {
       throw new NotFoundException("Owner role not found");
     }
 
-    const member = new MemberModel({
-      userId: user._id,
-      workspaceId: workspace._id,
-      role: ownerRole._id,
-      joinedAt: new Date(),
-    });
-    await member.save({ session });
+    const [workspace] = await tx
+      .insert(workspaces)
+      .values({
+        name: "My Workspace",
+        description: `Workspace created for ${user.name}`,
+        ownerId: user.id,
+        inviteCode: generateInviteCode(),
+      })
+      .returning();
 
-    user.currentWorkspace = workspace._id as mongoose.Types.ObjectId;
-    await user.save({ session });
+    await tx.insert(workspaceMembers).values({ userId: user.id, workspaceId: workspace.id, roleId: ownerRole.id });
+    await tx.update(users).set({ currentWorkspaceId: workspace.id }).where(eq(users.id, user.id));
 
-    await session.commitTransaction();
+    return { userId: user.id, workspaceId: workspace.id };
+  });
 
-    // Best-effort, outside the transaction (it already committed - the
-    // account exists regardless of what happens here). A hiccup creating
-    // the verification token or sending the email must NOT turn into a
-    // registration failure; the user can always request a new one later.
-    try {
-      await requestEmailVerificationService(user._id.toString());
-    } catch (verificationError) {
-      logger.error(
-        { err: verificationError },
-        "Failed to send verification email during registration"
-      );
-    }
-
-    return {
-      userId: user._id,
-      workspaceId: workspace._id,
-    };
-  } catch (error) {
-    await session.abortTransaction();
-    throw error;
-  } finally {
-    session.endSession();
+  // Best-effort, outside the transaction (it already committed - the
+  // account exists regardless of what happens here). A hiccup creating the
+  // verification token or sending the email must NOT turn into a
+  // registration failure; the user can always request a new one later.
+  try {
+    await requestEmailVerificationService(userId);
+  } catch (verificationError) {
+    logger.error(
+      { err: verificationError },
+      "Failed to send verification email during registration"
+    );
   }
+
+  return { userId, workspaceId };
 };
 ```
 
-**OAuth login-or-create** — the same shape, with a branch that skips the writes entirely when the user already exists:
+Note the shape difference from a hand-rolled session API: there is no `session.commitTransaction()` call anywhere in this function. The transaction commits *implicitly*, the instant the callback's returned promise resolves with `{ userId: user.id, workspaceId: workspace.id }` — Drizzle issues the `COMMIT` for you at that point. If any `throw` happens anywhere inside the callback (the duplicate-email check, a missing owner role, a Postgres constraint violation on any of the four writes), Drizzle catches the rejection, issues a `ROLLBACK`, and re-throws the original error out of `db.transaction(...)` itself — the calling code doesn't write its own `catch`/`rollback`/`finally` at all; the `try`/`catch` visible in this function is for the unrelated, deliberately-non-transactional email-verification step *after* the transaction has already committed.
+
+**OAuth login-or-create** — the same shape, with a branch that skips most of the writes when the user already exists:
 
 ```ts
-// backend/src/services/auth.service.ts:226-329 (loginOrCreateAccountService)
+// backend/src/services/auth.service.ts:194-280 (loginOrCreateAccountService, excerpted)
 export const loginOrCreateAccountService = async (data: {
-  provider: string;
+  provider: "GOOGLE" | "GITHUB" | "FACEBOOK" | "EMAIL";
   displayName: string;
   providerId: string;
   picture?: string;
   email?: string;
-  // Whether the IdP itself confirmed the user controls this email. Only
-  // gates auto-linking to a PRE-EXISTING account (see below) - a brand new
-  // account is always fine to create regardless.
   emailVerified?: boolean;
 }) => {
-  const { providerId, provider, displayName, email, picture, emailVerified } =
-    data;
-  const session = await mongoose.startSession();
+  const { providerId, provider, displayName, email, picture, emailVerified } = data;
 
-  try {
-    session.startTransaction();
-
-    const account = await AccountModel.findOne({
-      provider,
-      providerId,
-    }).session(session);
-
-    let user;
+  const user = await db.transaction(async (tx) => {
+    const [account] = await tx
+      .select()
+      .from(accounts)
+      .where(and(eq(accounts.provider, provider), eq(accounts.providerId, providerId)));
 
     if (account) {
-      user = await UserModel.findById(account.userId).session(session);
-      if (!user) {
+      const [existingUser] = await tx.select().from(users).where(eq(users.id, account.userId));
+      if (!existingUser) {
         throw new Error("Account exists but user not found");
       }
-    } else {
-      user = await UserModel.findOne({ email }).session(session);
-
-      if (user) {
-        // Auto-linking a new OAuth identity to a PRE-EXISTING account by
-        // email match. Without the IdP confirming it verified this email,
-        // we can't tell "this is genuinely the same person" from "someone
-        // registered an OAuth app / IdP account using someone else's
-        // email" - refuse rather than risk linking (and thus granting
-        // login access) to the wrong account.
-        if (!emailVerified) {
-          throw new UnauthorizedException(
-            "This email is already registered. Log in with your password, or verify this email with your provider first."
-          );
-        }
-      }
-
-      if (!user) {
-        user = new UserModel({
-          email,
-          name: displayName,
-          profilePicture: picture || null,
-          // A brand new account, not a link to an existing one - safe to
-          // trust the IdP's verification status directly since there's no
-          // pre-existing identity being taken over.
-          isEmailVerified: !!emailVerified,
-        });
-        await user.save({ session });
-
-        const workspace = new WorkspaceModel({
-          name: "My Workspace",
-          description: `Workspace created for ${user.name}`,
-          owner: user._id,
-        });
-        await workspace.save({ session });
-
-        const ownerRole = await RoleModel.findOne({
-          name: Roles.OWNER,
-        }).session(session);
-        if (!ownerRole) {
-          throw new NotFoundException("Owner role not found");
-        }
-
-        const member = new MemberModel({
-          userId: user._id,
-          workspaceId: workspace._id,
-          role: ownerRole._id,
-          joinedAt: new Date(),
-        });
-        await member.save({ session });
-
-        user.currentWorkspace = workspace._id as mongoose.Types.ObjectId;
-        await user.save({ session });
-      }
-      // If user exists (email match), we don't create new workspace
-
-      // NOW: Create the OAuth account link
-      const newAccount = new AccountModel({
-        userId: user._id,
-        provider,
-        providerId,
-      });
-      await newAccount.save({ session });
+      return existingUser;
     }
 
-    await session.commitTransaction();
-    return { user };
-  } catch (error) {
-    await session.abortTransaction();
-    throw error;
-  } finally {
-    session.endSession();
-  }
+    let user = email ? (await tx.select().from(users).where(eq(users.email, email)))[0] : undefined;
+
+    if (user && !emailVerified) {
+      throw new UnauthorizedException(
+        "This email is already registered. Log in with your password, or verify this email with your provider first."
+      );
+    }
+
+    if (!user) {
+      // ...creates User + Workspace + workspace_members, same shape as
+      // registerUserService above (see the real file for the full branch)
+    }
+
+    await tx.insert(accounts).values({ userId: user.id, provider, providerId });
+    return user;
+  });
+
+  const { passwordHash: _passwordHash, ...safeUser } = user;
+  return { user: safeUser };
 };
 ```
 
-**Account deletion** — the widest fan-out of any transaction here (six collections), and the only one guarded by a pre-check performed *before* the session even opens:
+The transaction opens *before* it's known which branch will run — whether this call ends up writing to one table (linking a new OAuth `accounts` row to an existing user) or five (a brand-new user, workspace, membership, and account) isn't decided until the account/email lookups inside the callback resolve, so the transaction has to wrap the whole decision tree rather than being added after the fact to just the "new user" branch.
+
+**Account deletion** — a pre-check runs *before* the transaction opens, then three tables are touched together:
 
 ```ts
-// backend/src/services/user.service.ts:59-130 (deleteAccountService, in full)
+// backend/src/services/user.service.ts:73-129 (deleteAccountService, in full)
 export const deleteAccountService = async (
   userId: string,
   password?: string
 ): Promise<void> => {
-  const user = await UserModel.findById(userId);
+  const [user] = await db.select().from(users).where(eq(users.id, userId));
   if (!user) {
     throw new NotFoundException("User not found");
   }
 
-  // Require re-confirming the password before a destructive, irreversible
-  // action - guards against a stolen/leaked access token being enough on
-  // its own to delete the account. OAuth-only accounts have no password to
-  // confirm, so being authenticated is the only bar for those.
-  if (user.password) {
+  if (user.passwordHash) {
     if (!password) {
       throw new BadRequestException(
         "Password confirmation is required to delete your account"
       );
     }
-    const isMatch = await user.comparePassword(password);
+    const isMatch = await compareValue(password, user.passwordHash);
     if (!isMatch) {
       throw new UnauthorizedException("Incorrect password");
     }
@@ -545,12 +295,12 @@ export const deleteAccountService = async (
 
   // Deliberately blocked, not cascaded: a workspace can have other members
   // who'd lose it with no warning if we silently deleted every workspace
-  // this user owns. Make them delete/transfer those explicitly first,
-  // using the existing (permission-checked, transactional) workspace
-  // deletion flow.
-  const ownedWorkspaces = await WorkspaceModel.find({ owner: userId }).select(
-    "name"
-  );
+  // this user owns. Make them delete/transfer those explicitly first.
+  const ownedWorkspaces = await db
+    .select({ name: workspaces.name })
+    .from(workspaces)
+    .where(eq(workspaces.ownerId, userId));
+
   if (ownedWorkspaces.length > 0) {
     throw new BadRequestException(
       `Delete or transfer ownership of ${ownedWorkspaces.length} workspace(s) you own before deleting your account: ${ownedWorkspaces
@@ -559,537 +309,395 @@ export const deleteAccountService = async (
     );
   }
 
-  const session = await mongoose.startSession();
-  session.startTransaction();
+  await db.transaction(async (tx) => {
+    // Unassign (don't delete) tasks in workspaces this user is just a
+    // member of - the tasks themselves are still valid workspace history.
+    await tx.update(tasks).set({ assignedTo: null }).where(eq(tasks.assignedTo, userId));
 
-  try {
-    const memberships = await MemberModel.find({ userId }).session(session);
-    const workspaceIds = memberships.map((m) => m.workspaceId);
+    await tx.delete(workspaceMembers).where(eq(workspaceMembers.userId, userId));
+    await tx.delete(accounts).where(eq(accounts.userId, userId));
+    await tx.delete(users).where(eq(users.id, userId));
+  });
 
-    if (workspaceIds.length > 0) {
-      // Unassign (don't delete) tasks in workspaces this user is just a
-      // member of - the tasks themselves are still valid workspace history.
-      await TaskModel.updateMany(
-        { workspace: { $in: workspaceIds }, assignedTo: userId },
-        { assignedTo: null }
-      ).session(session);
-    }
-
-    await MemberModel.deleteMany({ userId }).session(session);
-    await AccountModel.deleteMany({ userId }).session(session);
-    await SessionModel.deleteMany({ userId }).session(session);
-    await PasswordResetTokenModel.deleteMany({ userId }).session(session);
-    await EmailVerificationTokenModel.deleteMany({ userId }).session(session);
-    await UserModel.findByIdAndDelete(userId).session(session);
-
-    await session.commitTransaction();
-  } catch (error) {
-    await session.abortTransaction();
-    throw error;
-  } finally {
-    session.endSession();
-  }
+  // Sessions live in Redis, not Postgres, so this can't be part of the
+  // transaction above - best-effort cleanup after the account row is gone.
+  await invalidateAllSessionsForUser(userId);
 };
 ```
 
-**Workspace creation** — the smallest of the six, three writes across three collections:
+The password check and the owned-workspaces guard both run against the plain `db` object, outside any transaction — they're pure reads with no write to roll back if they fail, so there's nothing to gain from wrapping them. Only the four actual mutations (unassign tasks, delete memberships, delete accounts, delete the user row) are inside `db.transaction(...)`. This is also the clearest example in the codebase of the Postgres/Redis split's one real transactional limitation: `invalidateAllSessionsForUser(userId)` touches Redis, and Redis isn't part of the Postgres transaction Drizzle manages — it's called *after* the transaction has already committed, as an explicit best-effort step, the same "can't fail the caller over this" posture `registerUserService` uses for its post-commit verification-email send. There is no cross-database transaction here, by construction: Postgres commits the account deletion, and only then does a separate, non-transactional call clean up the Redis-side session state.
+
+**Workspace creation** — the smallest of the four, three statements across three tables:
 
 ```ts
-// backend/src/services/workspace.service.ts:19-73 (createWorkspaceService, in full)
+// backend/src/services/workspace.service.ts:20-57 (createWorkspaceService, in full)
 export const createWorkspaceService = async (
   userId: string,
-  body: {
-    name: string;
-    description?: string | undefined;
-  }
+  body: { name: string; description?: string }
 ) => {
-  const { name, description } = body;
+  return db.transaction(async (tx) => {
+    const [user] = await tx.select().from(users).where(eq(users.id, userId));
+    if (!user) throw new NotFoundException("User not found");
 
-  const session = await mongoose.startSession();
-  session.startTransaction();
+    const [ownerRole] = await tx
+      .select()
+      .from(roles)
+      .where(eq(roles.name, "OWNER"));
+    if (!ownerRole) throw new NotFoundException("Owner role not found");
 
-  try {
-    const user = await UserModel.findById(userId).session(session);
-    if (!user) {
-      throw new NotFoundException("User not found");
-    }
+    const [workspace] = await tx
+      .insert(workspaces)
+      .values({
+        name: body.name,
+        description: body.description,
+        ownerId: user.id,
+        inviteCode: generateInviteCode(),
+      })
+      .returning();
 
-    const ownerRole = await RoleModel.findOne({ name: Roles.OWNER }).session(
-      session
-    );
-    if (!ownerRole) {
-      throw new NotFoundException("Owner role not found");
-    }
-
-    const workspace = new WorkspaceModel({
-      name: name,
-      description: description,
-      owner: user._id,
+    await tx.insert(workspaceMembers).values({
+      userId: user.id,
+      workspaceId: workspace.id,
+      roleId: ownerRole.id,
     });
-    await workspace.save({ session });
 
-    const member = new MemberModel({
-      userId: user._id,
-      workspaceId: workspace._id,
-      role: ownerRole._id,
-      joinedAt: new Date(),
-    });
-    await member.save({ session });
+    await tx
+      .update(users)
+      .set({ currentWorkspaceId: workspace.id })
+      .where(eq(users.id, user.id));
 
-    user.currentWorkspace = workspace._id as mongoose.Types.ObjectId;
-    await user.save({ session });
-
-    await session.commitTransaction();
-    session.endSession();
-
-    return {
-      workspace,
-    };
-  } catch (error) {
-    await session.abortTransaction();
-    session.endSession();
-    throw error;
-  }
+    return { workspace };
+  });
 };
 ```
 
-Note this one calls `session.endSession()` in both the success path and the `catch` block, rather than a shared `finally` — functionally equivalent to the `finally`-based shape used everywhere else, just spelled differently.
+`createWorkspaceService` itself `return`s the whole `db.transaction(...)` call directly — there's no separate variable-then-return step, because the transaction's own resolved value *is* the function's return value.
 
-**Workspace deletion** — the inverse of creation, tearing down every dependent collection plus fixing up the deleting user's `currentWorkspace` if it pointed at the workspace being removed:
+**Workspace deletion** — the clearest before/after contrast with the old model, because `ON DELETE CASCADE` (documented in full in [`07-database-schema-design.md` §6](./07-database-schema-design.md#6-design-decisions--tradeoffs)) now does most of the work that used to be explicit application code:
 
 ```ts
-// backend/src/services/workspace.service.ts:285-347 (deleteWorkspaceService, in full)
+// backend/src/services/workspace.service.ts:222-264 (deleteWorkspaceService, in full)
 export const deleteWorkspaceService = async (
   workspaceId: string,
   userId: string
 ) => {
-  const session = await mongoose.startSession();
-  session.startTransaction();
+  return db.transaction(async (tx) => {
+    const [workspace] = await tx
+      .select()
+      .from(workspaces)
+      .where(eq(workspaces.id, workspaceId));
+    if (!workspace) throw new NotFoundException("Workspace not found");
 
-  try {
-    const workspace =
-      await WorkspaceModel.findById(workspaceId).session(session);
-    if (!workspace) {
-      throw new NotFoundException("Workspace not found");
-    }
-
-    // Check if the user owns the workspace
-    if (!workspace.owner.equals(new mongoose.Types.ObjectId(userId))) {
+    if (workspace.ownerId !== userId) {
       throw new ForbiddenException(
         "You are not authorized to delete this workspace"
       );
     }
 
-    const user = await UserModel.findById(userId).session(session);
-    if (!user) {
-      throw new NotFoundException("User not found");
+    await tx.delete(workspaces).where(eq(workspaces.id, workspaceId));
+    // ON DELETE CASCADE already removed workspace_members/projects/tasks
+    // rows for this workspace, and set users.current_workspace_id to NULL
+    // for every user whose current workspace was this one.
+
+    const [anotherMembership] = await tx
+      .select({ workspaceId: workspaceMembers.workspaceId })
+      .from(workspaceMembers)
+      .where(eq(workspaceMembers.userId, userId))
+      .limit(1);
+
+    if (anotherMembership) {
+      await tx
+        .update(users)
+        .set({ currentWorkspaceId: anotherMembership.workspaceId })
+        .where(eq(users.id, userId));
     }
 
-    await ProjectModel.deleteMany({ workspace: workspace._id }).session(
-      session
-    );
-    await TaskModel.deleteMany({ workspace: workspace._id }).session(session);
+    const [updatedUser] = await tx
+      .select({ currentWorkspaceId: users.currentWorkspaceId })
+      .from(users)
+      .where(eq(users.id, userId));
 
-    await MemberModel.deleteMany({
-      workspaceId: workspace._id,
-    }).session(session);
-
-    // Update the user's currentWorkspace if it matches the deleted workspace
-    if (user?.currentWorkspace?.equals(workspaceId)) {
-      const memberWorkspace = await MemberModel.findOne({ userId }).session(
-        session
-      );
-      // Update the user's currentWorkspace
-      user.currentWorkspace = memberWorkspace
-        ? memberWorkspace.workspaceId
-        : null;
-
-      await user.save({ session });
-    }
-
-    await workspace.deleteOne({ session });
-
-    await session.commitTransaction();
-
-    session.endSession();
-
-    return {
-      currentWorkspace: user.currentWorkspace,
-    };
-  } catch (error) {
-    await session.abortTransaction();
-    session.endSession();
-    throw error;
-  }
+    return { currentWorkspaceId: updatedUser?.currentWorkspaceId ?? null };
+  });
 };
 ```
 
-### 3.3 Everything else: single-document writes, no session
+The transaction here isn't protecting a manual multi-table cleanup the way it once did — deleting `projects`/`tasks`/`workspace_members` rows for the workspace is now a single database-level side effect of the one `DELETE FROM workspaces` statement, not four separate application-issued deletes that could partially fail. What the transaction *is* still protecting is read-after-write consistency across the remaining three statements: the workspace-ownership check, the cascade-triggered deletion, and the `currentWorkspaceId` reassignment all need to see a single consistent view of the data, and the reassignment specifically depends on the delete (and its cascade side effects) having already happened within the same transaction — reading `anotherMembership` outside the transaction could race against a concurrent membership change.
 
-For contrast, project and task creation — by far the most frequent writes in the app — never touch a session at all, because each is a single document going into a single collection:
+### 3.3 Everything else: single-statement writes, no transaction
+
+For contrast, project and task creation — by far the most frequent writes in the app — never open a transaction at all, because each is a single `INSERT` into a single table:
 
 ```ts
-// backend/src/services/project.service.ts:7-27
+// backend/src/services/project.service.ts:6-23
 export const createProjectService = async (
   userId: string,
   workspaceId: string,
-  body: {
-    emoji?: string;
-    name: string;
-    description?: string;
-  }
+  body: { emoji?: string; name: string; description?: string }
 ) => {
-  const project = new ProjectModel({
-    ...(body.emoji && { emoji: body.emoji }),
-    name: body.name,
-    description: body.description,
-    workspace: workspaceId,
-    createdBy: userId,
-  });
-
-  await project.save();
+  const [project] = await db
+    .insert(projects)
+    .values({
+      ...(body.emoji ? { emoji: body.emoji } : {}),
+      name: body.name,
+      description: body.description,
+      workspaceId,
+      createdBy: userId,
+    })
+    .returning();
 
   return { project };
 };
 ```
 
 ```ts
-// backend/src/services/task.service.ts:34-75 (createTaskService, excerpted)
+// backend/src/services/task.service.ts:31-77 (createTaskService, excerpted)
 export const createTaskService = async (
   workspaceId: string,
   projectId: string,
   userId: string,
-  body: {
-    title: string;
-    description?: string;
-    priority: string;
-    status: string;
-    assignedTo?: string | null;
-    dueDate?: string;
-  }
+  body: { title: string; /* ... */ taskCode: string }
 ) => {
-  const { title, description, priority, status, assignedTo, dueDate } = body;
+  const [project] = await db.select().from(projects).where(eq(projects.id, projectId));
 
-  const project = await ProjectModel.findById(projectId);
-
-  if (!project || project.workspace.toString() !== workspaceId.toString()) {
+  if (!project || project.workspaceId !== workspaceId) {
     throw new NotFoundException(
       "Project not found or does not belong to this workspace"
     );
   }
 
-  if (assignedTo) {
-    await assertAssigneeIsWorkspaceMember(workspaceId, assignedTo);
+  if (body.assignedTo) {
+    await assertAssigneeIsWorkspaceMember(workspaceId, body.assignedTo);
   }
-  const task = new TaskModel({
-    title,
-    description,
-    priority: priority || TaskPriorityEnum.MEDIUM,
-    status: status || TaskStatusEnum.TODO,
-    assignedTo,
-    createdBy: userId,
-    workspace: workspaceId,
-    project: projectId,
-    dueDate,
-  });
 
-  await task.save();
+  const [task] = await db
+    .insert(tasks)
+    .values({ /* ... */ workspaceId, projectId, taskCode: body.taskCode })
+    .returning();
 
   return { task };
 };
 ```
 
-Both do a *read* first (to validate the parent project exists and belongs to the right workspace) and then a single `.save()` — the read is not part of any atomicity guarantee, it's just a validation step, and the actual write is exactly one document.
+Both do a *read* first (to validate the parent project exists and belongs to the right workspace) and then a single `.insert(...).returning()` — the read is not part of any atomicity guarantee, it's just a validation step, and the actual write is exactly one statement against one table.
 
-### 3.4 The Mongo-backed rate limiter — a distinct query pattern
+### 3.4 Query mechanics: the combinators and raw `sql` this codebase actually uses
 
-Rate limiting is a query pattern worth calling out on its own: it isn't a Mongoose model at all, but a raw collection used as a shared counter store so every ECS task enforces the same limit against the same numbers, instead of each task keeping its own in-memory count:
+Every non-trivial query in `backend/src/services/` is built from a small, consistent vocabulary of Drizzle functions, and `getAllTasksService` (`backend/src/services/task.service.ts:143-205`) is the single best file to read for all of it in one place — it's the most filter-heavy list query in the codebase.
+
+**`and()`/`eq()`/`inArray()` for multi-condition filtering.** `getAllTasksService` builds its `WHERE` clause incrementally, pushing a Drizzle `SQL` condition onto a `conditions` array for each filter that's actually present, then combining them all with `and(...conditions)` at the end:
 
 ```ts
-// backend/src/utils/rate-limiter.ts:1-79
-import rateLimit, {
-  type LegacyStore,
-  type Options,
-  type RateLimitRequestHandler,
-} from "express-rate-limit";
-import MongoStore from "rate-limit-mongo";
-import { config } from "../config/app.config";
-import { logger } from "./logger";
+// backend/src/services/task.service.ts:155-168
+const conditions: SQL[] = [eq(tasks.workspaceId, workspaceId)];
+if (filters.projectId) conditions.push(eq(tasks.projectId, filters.projectId));
+if (filters.status?.length)
+  conditions.push(inArray(tasks.status, filters.status as (typeof tasks.status.enumValues)[number][]));
+if (filters.priority?.length)
+  conditions.push(inArray(tasks.priority, filters.priority as (typeof tasks.priority.enumValues)[number][]));
+if (filters.assignedTo?.length)
+  conditions.push(inArray(tasks.assignedTo, filters.assignedTo));
+if (filters.keyword) {
+  conditions.push(sql`${tasks.title} ILIKE ${"%" + filters.keyword + "%"}`);
+}
+if (filters.dueDate) conditions.push(eq(tasks.dueDate, new Date(filters.dueDate)));
+```
 
-// express-rate-limit's default store lives in the process's own memory. With
-// N ECS tasks behind the ALB that makes every limit effectively N times
-// looser than it reads (a 5-attempts-per-15-minutes login limit becomes
-// 5 x N), and every deploy or task replacement resets all counters to zero.
-// Backing the counters with Mongo - already a dependency, so no new
-// infrastructure - makes them cluster-wide and survive task churn.
-//
-// One store instance is shared by every limiter, so there is exactly one
-// extra Mongo connection per task rather than one per limiter. Each limiter
-// namespaces its own keys (see `withKeyPrefix`), so sharing the collection
-// does NOT merge their budgets.
-const RATE_LIMIT_COLLECTION = "rateLimits";
+`inArray(tasks.status, [...])` is what a Mongo-style `{ status: { $in: [...] } }` filter becomes in SQL — it compiles to `status = ANY($1)` (or an `IN (...)` list, depending on Drizzle's driver-specific choice), parameterized exactly like every other Drizzle-built condition, never string-concatenated. Building the `conditions` array incrementally like this — only pushing a condition when the corresponding filter is actually present — is what lets one query serve "list all tasks in this workspace" and "list tasks in this workspace filtered by status, priority, assignee, and keyword, all at once" without four different hand-written query variants.
 
-// All limiters in this codebase use the same 15-minute window, which is what
-// lets them share one store (the store's TTL is a per-instance setting).
-export const RATE_LIMIT_WINDOW_MS = 15 * 60 * 1000;
+**Raw `sql` template literals for what the query builder doesn't have a typed method for.** Two real cases in this codebase reach for `sql\`...\`` deliberately, both in `getAllTasksService`/`getProjectAnalyticsService`, rather than treating it as an escape hatch of last resort:
 
-let sharedStore: MongoStore | undefined;
+- **`ILIKE` for case-insensitive keyword search**: `sql\`${tasks.title} ILIKE ${"%" + filters.keyword + "%"}\`` (`task.service.ts:166`). Drizzle has no dedicated `.ilike()` helper in this codebase's version, so the raw SQL operator is used directly — but the interpolated values (`tasks.title`, the pattern string) are still passed through Drizzle's tagged-template mechanism, which parameterizes them exactly the way `eq()`/`inArray()` do; nothing here is string concatenation, and `'%'`/`'_'` are the only characters `ILIKE` treats specially — there's no regex engine involved, so there's no ReDoS surface the way an unbounded user-supplied `$regex` pattern would be in a document database.
+- **`count(*) filter (where ...)` for multi-condition aggregates in one pass**: `getProjectAnalyticsService` (`backend/src/services/project.service.ts:88-113`) needs three different counts — total tasks, overdue tasks, completed tasks — computed from the same underlying row set, in one query rather than three separate ones:
 
-const getSharedStore = (): MongoStore | undefined => {
-  // No MONGO_URI means local dev or the test suite, neither of which has a
-  // cluster to coordinate through. Fall back to express-rate-limit's own
-  // in-memory store - still rate limited, just per-process.
-  if (!config.MONGO_URI) {
-    return undefined;
+```ts
+// backend/src/services/project.service.ts:103-111
+const [row] = await db
+  .select({
+    totalTasks: sql<number>`count(*)::int`,
+    overdueTasks: sql<number>`count(*) filter (where ${tasks.dueDate} < now() and ${tasks.status} != 'DONE')::int`,
+    completedTasks: sql<number>`count(*) filter (where ${tasks.status} = 'DONE')::int`,
+  })
+  .from(tasks)
+  .where(eq(tasks.projectId, projectId));
+```
+
+Postgres's `FILTER (WHERE ...)` clause is the SQL-native answer to "count rows matching condition A, and separately count rows matching condition B, from the same input, in one query" — a shape that in a document database without a native equivalent gets built out of a multi-stage aggregation pipeline running several conditional sub-counts as parallel branches over one filtered input. `getWorkspaceAnalyticsService` (`backend/src/services/workspace.service.ts:266-280`) uses the identical `FILTER` pattern at the workspace level instead of the project level — same shape, different `WHERE` scope.
+
+**`.limit()`/`.offset()` for pagination**, paired with a second `count(*)` query for the total: `getAllTasksService` and `getProjectsInWorkspaceService` (`backend/src/services/project.service.ts:25-60`) both compute `skip = (pageNumber - 1) * pageSize` and pass it to `.offset(skip)` alongside `.limit(pageSize)` on the main `SELECT`, then run a second, separate `SELECT count(*)::int ... WHERE <same conditions>` to get the total row count for computing `totalPages`. `getProjectsInWorkspaceService` runs its two queries (`.limit()/.offset()`'d rows, and the `count(*)`) concurrently via `Promise.all([...])` rather than sequentially — since neither query depends on the other's result and both hit the same table, there's no reason to pay two round trips in series when one round trip's latency can cover both.
+
+**`.leftJoin()` vs. `.innerJoin()` — a real correctness distinction, not a style choice.** This is the single most important query-mechanics lesson this codebase has to teach, and it's worth stating precisely because getting it wrong doesn't throw an error — it silently drops rows. `getAllTasksService` joins `tasks` to `users` (for the assignee) and to `projects` (for the parent project), and uses `leftJoin` for both:
+
+```ts
+// backend/src/services/task.service.ts:185-191
+.from(tasks)
+// leftJoin, not innerJoin: assignedTo is nullable - an innerJoin here
+// would silently drop every unassigned task from the result.
+.leftJoin(users, eq(tasks.assignedTo, users.id))
+.leftJoin(projects, eq(tasks.projectId, projects.id))
+```
+
+`tasks.assignedTo` is a nullable foreign key (`uuid("assigned_to").references(() => users.id, { onDelete: "set null" })`, per `07-database-schema-design.md` §3.7) — an unassigned task is a completely valid, common row. An `INNER JOIN` only returns a row from the left table when a matching row exists on the right; for every task where `assigned_to IS NULL`, there is by definition no matching `users` row, so an `innerJoin(users, eq(tasks.assignedTo, users.id))` would silently exclude every unassigned task from the result set entirely — no error, no warning, just fewer rows than expected, and specifically the rows a real user (an unassigned-tasks board column, a "show me everything" filter) most needs to see. `leftJoin` returns the task row regardless, with every `users.*` projected column coming back `null` when there's no match — exactly the semantics an optional relationship needs.
+
+Contrast this with `getWorkspaceMembersService` (`backend/src/services/workspace.service.ts:193-212`), which joins `workspace_members` to `users` and to `roles` using `innerJoin` for both — correctly, this time, because `workspace_members.userId` and `workspace_members.roleId` are both `NOT NULL` foreign keys (per the schema, every membership row is guaranteed to reference a real user and a real role), so an inner join can never silently drop a membership the way it would if either FK were nullable. The rule this codebase actually follows, checkable against both examples: **join type is a direct function of whether the foreign key being joined on is nullable — `leftJoin` for a nullable FK, `innerJoin` for a `NOT NULL` one** — never a default reached for out of habit. Getting this backwards in either direction is a real bug class: an `innerJoin` on a nullable column silently drops valid rows (as just shown), and a `leftJoin` on a genuinely mandatory relationship just adds unnecessary planner overhead without being wrong, which is a much smaller cost but still worth naming as the two failure directions of the same underlying choice.
+
+### 3.5 Connection lifecycle: startup and graceful shutdown
+
+`db.execute(sql\`SELECT 1\`)` is awaited in `src/index.ts` before the server ever calls `app.listen(...)` — this is `backend/src/index.ts`'s startup gate, already shown in full in [`00-master-backend-architecture.md` §3](./00-master-backend-architecture.md#3-bootstrap-in-full-backendsrcappts--backendsrcindexts). A failure there calls `process.exit(1)` before the process ever binds a port, so an ECS health check never sees this task report itself as listening while it can't reach Postgres. Redis is deliberately *not* part of that same startup gate — `redis/client.ts`'s own `"error"` listener logs a connection error non-fatally, on the theory that a transient Redis blip is recoverable mid-life and shouldn't crash process startup the way an unreachable primary datastore should.
+
+Shutdown is the mirror image, and it's where `client.ts`'s separate `pool` export actually gets used:
+
+```ts
+// backend/src/index.ts (excerpted — full file in 00-master-backend-architecture.md §3)
+import { db, pool } from "./db/client";
+import { redis } from "./redis/client";
+// ...
+server.close(async (closeError) => {
+  // ...
+  await pool.end();
+  redis.disconnect();
+  // ...
+});
+```
+
+`server.close()`'s callback runs only once every in-flight HTTP request has finished draining — so `pool.end()` (which waits for any query the pool is still mid-executing to finish, then closes every pooled connection) and `redis.disconnect()` only run after that drain completes, not concurrently with live requests. This ordering is what prevents a request that's mid-query when `SIGTERM` arrives from having its connection yanked out from under it. `db` itself is never explicitly closed — closing `pool` is sufficient, since `db` holds no connections of its own; it only ever borrows from `pool` for the duration of each query.
+
+### 3.6 Test-database strategy: real containers, not mocks
+
+The test suite doesn't mock Drizzle or stub out Postgres/Redis — it runs against real, ephemeral containers spun up once per test run via `testcontainers`:
+
+```ts
+// backend/tests/setup/global-setup.ts, in full
+import { PostgreSqlContainer, StartedPostgreSqlContainer } from "@testcontainers/postgresql";
+import { GenericContainer, StartedTestContainer } from "testcontainers";
+import { drizzle } from "drizzle-orm/node-postgres";
+import { migrate } from "drizzle-orm/node-postgres/migrator";
+import { Pool } from "pg";
+import path from "path";
+import { RolePermissions } from "../../src/utils/role-permission";
+import * as schema from "../../src/db/schema";
+
+let postgresContainer: StartedPostgreSqlContainer;
+let redisContainer: StartedTestContainer;
+
+const seedRoles = async (connectionString: string): Promise<void> => {
+  const pool = new Pool({ connectionString });
+  const db = drizzle(pool, { schema });
+
+  for (const [name, permissions] of Object.entries(RolePermissions)) {
+    await db
+      .insert(schema.roles)
+      .values({ name: name as keyof typeof RolePermissions, permissions })
+      .onConflictDoNothing({ target: schema.roles.name });
   }
 
-  if (!sharedStore) {
-    sharedStore = new MongoStore({
-      uri: config.MONGO_URI,
-      collectionName: RATE_LIMIT_COLLECTION,
-      expireTimeMs: RATE_LIMIT_WINDOW_MS,
-      errorHandler: (error) =>
-        logger.error({ err: error }, "Rate limit store error"),
-    });
-  }
-
-  return sharedStore;
+  await pool.end();
 };
 
-// express-rate-limit passes the store nothing but the client key (the IP, by
-// default), so two limiters sharing a collection would otherwise share a
-// counter. Prefixing per limiter keeps each budget independent.
-const withKeyPrefix = (store: MongoStore, prefix: string): LegacyStore => ({
-  incr: (key, callback) => store.incr(`${prefix}:${key}`, callback),
-  decrement: (key) => store.decrement(`${prefix}:${key}`),
-  resetKey: (key) => store.resetKey(`${prefix}:${key}`),
-});
+export default async function setup(): Promise<() => Promise<void>> {
+  [postgresContainer, redisContainer] = await Promise.all([
+    new PostgreSqlContainer("postgres:16").start(),
+    new GenericContainer("redis:7").withExposedPorts(6379).start(),
+  ]);
 
-/**
- * Builds a rate limiter whose counters are shared across every running
- * instance of the app.
- *
- * @param name - Namespace for this limiter's counters. Must be unique per
- *   limiter, or two limiters will spend each other's budget.
- */
-export const createRateLimiter = (
-  name: string,
-  options: Partial<Options>
-): RateLimitRequestHandler => {
-  const store = getSharedStore();
+  const databaseUrl = postgresContainer.getConnectionUri();
+  const redisUrl = `redis://${redisContainer.getHost()}:${redisContainer.getMappedPort(6379)}`;
 
-  return rateLimit({
-    windowMs: RATE_LIMIT_WINDOW_MS,
-    standardHeaders: true,
-    legacyHeaders: false,
-    ...options,
-    ...(store ? { store: withKeyPrefix(store, name) } : {}),
+  const migrationPool = new Pool({ connectionString: databaseUrl });
+  const migrationDb = drizzle(migrationPool);
+  await migrate(migrationDb, {
+    migrationsFolder: path.resolve(__dirname, "../../src/db/migrations"),
   });
-};
+  await migrationPool.end();
+
+  await seedRoles(databaseUrl);
+
+  process.env.DATABASE_URL = databaseUrl;
+  process.env.REDIS_URL = redisUrl;
+
+  return async () => {
+    await Promise.all([postgresContainer.stop(), redisContainer.stop()]);
+  };
+}
 ```
 
-This bypasses Mongoose entirely — `rate-limit-mongo` opens its own connection directly to the same `MONGO_URI` and manages the `rateLimits` collection itself (increment-and-read counters with a TTL, not a Mongoose schema). It's the one place in the backend where a query goes straight to the MongoDB driver layer rather than through a Mongoose model, and it exists specifically because the semantics needed (atomic increment-and-check, shared across processes, self-expiring) map onto a raw counter document better than onto an ODM-validated schema.
+Three things worth internalizing here. First, `migrate(migrationDb, { migrationsFolder: ... })` runs the **real, drizzle-kit-generated SQL migrations** (`backend/src/db/migrations/0000_whole_microchip.sql`, `0001_overrated_tomorrow_man.sql`, `0002_youthful_firestar.sql`) against the throwaway container — the test database's schema is produced by literally the same migration files that would run against a real environment, not a hand-maintained test-only schema that could drift from production DDL. Second, `seedRoles` inserts the fixed `OWNER`/`ADMIN`/`MEMBER` role set using `.onConflictDoNothing({ target: schema.roles.name })` — Drizzle's `INSERT ... ON CONFLICT DO NOTHING`, targeting the same `roles_name_idx` unique constraint documented in [`07-database-schema-design.md` §3.4](./07-database-schema-design.md#34-roles) — mirroring what `backend/src/db/seed-roles.ts` does against a real database. Third, and structurally: this is a Vitest `globalSetup` function, run once for the whole suite (not per test file), specifically because booting a fresh Postgres and Redis container is expensive enough that per-file setup would make the suite prohibitively slow — `process.env.DATABASE_URL`/`REDIS_URL` are set here, before any test file's imports run, which matters because `db/client.ts` and `redis/client.ts` both read those env vars and open their connections at import time.
 
-### 3.5 Reading inside a session, without a transaction: `authenticate`
-
-Not every multi-query read needs a transaction — reads don't need atomicity the way multi-document writes do, since nothing is being mutated. The `authenticate` middleware is the clearest example of a data-access pattern that queries two collections in sequence with no session at all, because there's nothing to roll back if the second query comes back empty:
-
-```ts
-// backend/src/middlewares/auth.middleware.ts:1-57 (reused from Architecture.md §3.2 — same source, discussed here for its query pattern rather than its auth semantics)
-import { Request, Response, NextFunction } from "express";
-import {
-  extractBearerToken,
-  verifyAccessTokenAndGetPayload,
-} from "../utils/jwt";
-import { UnauthorizedException } from "../utils/appError";
-import UserModel from "../models/user.model";
-import SessionModel from "../models/session.model";
-
-export const authenticate = async (
-  req: Request,
-  res: Response,
-  next: NextFunction
-) => {
-  try {
-    const authHeader = req.headers.authorization;
-    const token = extractBearerToken(authHeader);
-
-    if (!token) {
-      throw new UnauthorizedException("Token not found");
-    }
-
-    const payload = verifyAccessTokenAndGetPayload(token);
-
-    const user = await UserModel.findById(payload.userId);
-
-    if (!user) {
-      throw new UnauthorizedException("User not found");
-    }
-
-    if (!user.isActive) {
-      throw new UnauthorizedException("User is not active");
-    }
-
-    const session = await SessionModel.findById(payload.sessionId);
-
-    if (!session) {
-      throw new UnauthorizedException("Session not found");
-    }
-    if (!session.isValid) {
-      throw new UnauthorizedException("Session has been revoked");
-    }
-    if (session.expiresAt <= new Date()) {
-      throw new UnauthorizedException("Session has expired");
-    }
-
-    if (session.userId.toString() != user._id.toString()) {
-      throw new UnauthorizedException("Invalid Session");
-    }
-    req.user = user;
-    req.session = session;
-
-    next();
-  } catch (error) {
-    next(error);
-  }
-};
-```
-
-Two sequential `findById` calls, each a fresh round trip, both indexed lookups by `_id` (Mongo's default primary-key index), running on *every single authenticated request* in the app. This is deliberately not batched into one query (e.g. via `$lookup`/populate) because the two checks are genuinely independent failure conditions with distinct error messages — but it's worth noticing as a query-volume cost: every protected route pays two extra round trips before the actual business logic runs.
-
-### 3.6 Test-database strategy
-
-The test suite doesn't mock Mongoose — it runs against a real, ephemeral MongoDB instance spun up per test run:
-
-```ts
-// backend/tests/setup/vitest.setup.ts:1-50 (in full)
-import { beforeAll, afterAll, afterEach, beforeEach } from "vitest";
-import { MongoMemoryReplSet } from "mongodb-memory-server";
-import mongoose from "mongoose";
-
-let mongod: MongoMemoryReplSet;
-
-// Tracks which models we've already forced into existence, so we don't
-// redo this work before every single test - just the first time each
-// model shows up.
-const initializedModels = new Set<string>();
-
-beforeAll(async () => {
-  mongod = await MongoMemoryReplSet.create({ replSet: { count: 1 } });
-  await mongoose.connect(mongod.getUri());
-});
-
-// NEW: runs before every test. By the time THIS fires, the test file's own
-// top-level imports (which register models like RoleModel, UserModel, etc.
-// via `mongoose.model(...)`) have already executed - so mongoose.modelNames()
-// is populated here, unlike in beforeAll above, which runs before the test
-// file's imports resolve.
-//
-// `.init()` explicitly creates the collection and builds its indexes RIGHT
-// NOW, as a plain (non-transactional) operation. That's the whole fix: it
-// guarantees "does this collection exist" is already answered before any
-// transaction gets anywhere near it, so the transaction never hits the
-// implicit-creation-triggers-a-lock-wait path that was failing.
-beforeEach(async () => {
-  const pending = mongoose
-    .modelNames()
-    .filter((name) => !initializedModels.has(name));
-  await Promise.all(
-    pending.map(async (name) => {
-      await mongoose.model(name).init();
-      initializedModels.add(name);
-    })
-  );
-});
-
-afterEach(async () => {
-  const collections = mongoose.connection.collections;
-  for (const key of Object.keys(collections)) {
-    await collections[key].deleteMany({});
-  }
-});
-
-afterAll(async () => {
-  await mongoose.disconnect();
-  await mongod.stop();
-});
-```
-
-The choice of `MongoMemoryReplSet` over the simpler `MongoMemoryServer` is not incidental — it's load-bearing. `mongoose.startSession()`/`startTransaction()` **requires a replica set or sharded cluster**; a standalone `mongod` (what `MongoMemoryServer` boots) physically cannot run a multi-document transaction. Since six real services in this codebase use transactions, a test double that couldn't support them would leave the most failure-prone code paths in the app (the atomic multi-collection writes) completely untested. `{ replSet: { count: 1 } }` is the minimum replica-set topology — one node — that still gets you real transaction support without paying for a multi-node cluster in every test run.
-
-The `beforeEach` model-initialization step exists to work around a specific, real failure mode: MongoDB implicitly creates a collection the first time it's written to, but that implicit creation is itself an operation that can conflict with an in-flight transaction trying to write to the same not-yet-existent collection. Forcing every registered model's collection (and its indexes) to exist *before* any test body runs — as a plain, non-transactional `.init()` call — sidesteps that race entirely. `afterEach` wipes every collection's documents (not the collections/indexes themselves) between tests for isolation, and `afterAll` tears the in-memory replica set down.
+This is a genuine, structural improvement over what a Mongoose-era test setup needed: there's no equivalent here of needing a *replica set* specifically to support multi-document transactions (a standalone MongoDB instance couldn't run those at all) — a single ordinary Postgres container supports `BEGIN`/`COMMIT`/`ROLLBACK` natively, with no special topology requirement, so `testcontainers`' plain `PostgreSqlContainer` is sufficient for every transactional test path in this codebase.
 
 ---
 
-## 4. Request/Data Flow — tracing `registerUserService`
+## 4. Request/Data Flow — tracing `createWorkspaceService`
 
-Walking `registerUserService` end to end, tying the trace back to the exact code in §3.2:
+Walking `createWorkspaceService` end to end, tying the trace back to the exact code in §3.2:
 
-1. **`const session = await mongoose.startSession();`** — a session object is created and bound to the current Mongoose connection. No transaction has started yet; this just reserves a logical "conversation" with the server that subsequent operations can be attached to via `.session(session)`.
-2. **`session.startTransaction();`** — inside the `try` block, the transaction actually begins. From this point, every read against this session sees a consistent snapshot, and every write is provisional until commit.
-3. **`UserModel.findOne({ email }).session(session)`** — the duplicate-email check runs *inside* the transaction's snapshot, so a race where two requests try to register the same email concurrently is caught consistently rather than racing against an uncommitted write from the other request.
-4. **Four sequential writes, each explicitly passed the session**: `user.save({ session })`, `account.save({ session })`, `workspace.save({ session })`, `member.save({ session })`, and a final `user.save({ session })` to persist `currentWorkspace` once the workspace's `_id` is known. Between the writes, one more session-scoped read: `RoleModel.findOne({ name: Roles.OWNER }).session(session)`, to find the role to assign the new member — if this comes back empty, a `NotFoundException` is thrown immediately, before any further writes happen.
-5. **`await session.commitTransaction();`** — if every write above succeeded, the transaction is committed as a single atomic unit. Either all five documents (new User, Account, Workspace, Member, and the User's `currentWorkspace` update) are durably visible, or — if this line is never reached — none of them are.
-6. **After commit, outside the transaction entirely**: `requestEmailVerificationService(...)` runs in its own nested `try/catch`, deliberately *not* part of the transaction. The comment in the source is explicit about why: the registration has already committed by this point, so a failure sending the verification email must not be allowed to look like a registration failure — it's logged and swallowed, not rethrown.
-7. **The `catch` block**: `await session.abortTransaction(); throw error;`. This is unconditional — any thrown error inside the `try` (the duplicate-email check, a missing owner role, a Mongoose validation failure on any of the four `.save()` calls) reaches this same branch, aborts the transaction explicitly, and rethrows the original error so the caller (the auth controller, then `asyncHandler`, then the global `errorHandler`) still sees the real failure reason.
-8. **The `finally` block**: `session.endSession();` runs regardless of whether the transaction committed or aborted — releasing the session back to the driver's session pool so it doesn't leak across requests.
-
-To answer the question plainly: **yes, `abortTransaction()` is called explicitly** in every one of the six transactional functions in this codebase — there is no code path here relying on an implicit abort-on-uncaught-exception or an abort triggered only by session cleanup. The `catch` block is unconditional and always present.
+1. **`db.transaction(async (tx) => { ... })` is called and awaited.** Drizzle issues `BEGIN` against a connection checked out from `pool`, and the callback receives `tx` — a query-builder client scoped to that one open transaction. From this point, every read against `tx` sees a consistent snapshot within the transaction, and every write through `tx` is provisional until commit.
+2. **`tx.select().from(users).where(eq(users.id, userId))`** — the calling user is looked up *inside* the transaction. If this comes back empty, `NotFoundException("User not found")` is thrown immediately — no writes have happened yet, so there's nothing for the automatic rollback to undo besides the transaction's own `BEGIN`.
+3. **`tx.select().from(roles).where(eq(roles.name, "OWNER"))`** — a second read, still inside the same transaction, to find the role the new workspace's creator will be assigned. Missing this throws `NotFoundException("Owner role not found")` — again, before any write.
+4. **Three sequential writes, all through `tx`**: `tx.insert(workspaces).values({...}).returning()` (get the new workspace's generated `id` back immediately, no separate re-fetch needed), `tx.insert(workspaceMembers).values({...})` (the OWNER membership row), and `tx.update(users).set({ currentWorkspaceId: workspace.id }).where(eq(users.id, user.id))`.
+5. **The callback returns `{ workspace }`.** This is the point Drizzle commits — there is no explicit `await tx.commit()` call anywhere in this function; resolving the callback's promise *is* the commit signal. `db.transaction(...)`'s own returned promise resolves with whatever the callback returned, so `createWorkspaceService`'s `return db.transaction(...)` line passes `{ workspace }` straight through to its caller.
+6. **If anything in steps 2-4 had thrown instead** — the two `NotFoundException`s already covered, or a Postgres-level failure like a constraint violation on the `workspaces.owner_id` foreign key — Drizzle's `db.transaction()` catches that rejection internally, issues `ROLLBACK` on the same connection, and re-throws the original error out of the `await db.transaction(...)` call. The caller (the workspace controller, then `asyncHandler`, then the global `errorHandler`, per [`04-error-handling-patterns.md`](./04-error-handling-patterns.md)) sees the real `NotFoundException` or Postgres error exactly as thrown — there's no separate `catch` block inside `createWorkspaceService` itself deciding when to roll back, because Drizzle's `db.transaction()` API makes "any throw rolls back, any resolve commits" the *only* behavior, not a convention every call site has to remember to implement correctly.
+7. **Connection release is automatic.** Once `db.transaction()` either commits or rolls back, the underlying `pg` connection is returned to `pool` for reuse — there's no equivalent of a manual `session.endSession()` call to remember, and therefore no way to leak a transaction-scoped connection out of the pool by forgetting one, the specific bug class a hand-rolled session API can produce if a `finally` block is missing.
 
 ---
 
 ## 5. Design Decisions & Tradeoffs
 
-**The criterion for "does this need a transaction" is observable directly from the six cases above: a transaction is used exactly when a single logical operation writes to more than one collection, and a partial completion would leave referentially-inconsistent data behind.** Checking each one against that rule:
+**The criterion for "does this need a transaction" is observable directly from the five cases in §3.2: a transaction is used exactly when a single logical operation writes to more than one table, and a partial completion would leave referentially-inconsistent data behind.** Checking each one against that rule:
 
-- `registerUserService` — a User with no Account means the user can never log in with the credentials they just set; a Workspace with no Member means nobody owns it. Four collections, genuinely coupled.
-- `loginOrCreateAccountService` — same coupling as registration, on the "new user via OAuth" branch; the "existing user" branch still opens a transaction even though it ends up writing to only one collection (a new `AccountModel`), because which branch will run isn't known until the session is already open.
-- `deleteAccountService` — deleting the User but leaving orphaned Session/Account/Member rows pointing at a now-nonexistent user would corrupt every one of those collections' referential assumptions.
-- `createWorkspaceService` / `deleteWorkspaceService` — a Workspace with no owning Member (create) or a Workspace deleted while its Projects/Tasks/Members survive (delete) are both broken states.
-- `role.seeder.ts` — clearing and re-inserting the entire role set is only safe as one unit; a script interrupted halfway would leave the app with some roles missing entirely, which breaks every permission check that relies on `RoleModel.findOne({ name })` returning a result.
+- `registerUserService` — a `users` row with no matching `accounts` row means the user can never log in with the credentials they just set; a `workspaces` row with no `workspace_members` row means nobody owns it. Four tables, genuinely coupled.
+- `loginOrCreateAccountService` — same coupling as registration, on the "new user via OAuth" branch; the "existing user" branch still opens a transaction even though it ends up writing to only one table (a new `accounts` row), because which branch will run isn't known until the transaction is already open.
+- `deleteAccountService` — deleting the `users` row but leaving orphaned `workspace_members`/`accounts` rows pointing at a now-nonexistent user would corrupt every one of those tables' referential assumptions (in practice, the `ON DELETE CASCADE` on both FKs would clean this up automatically on the `users` delete alone — the transaction here is about ordering the task-unassignment step correctly relative to the cascade, not about preventing orphaned rows that the schema already forbids).
+- `createWorkspaceService`/`deleteWorkspaceService` — a `workspaces` row with no owning `workspace_members` row (create), or a stale `currentWorkspaceId` reference left unreconciled after a delete's cascade already fired (delete), are both broken-or-inconsistent states worth protecting against.
 
-The rule holds without exception across every transactional case found. Conversely, `createProjectService` and `createTaskService` (§3.3) write to exactly one collection each — Mongo's built-in per-document atomicity is already the strongest guarantee that operation needs, so wrapping it in a session would only add latency and lock overhead for zero additional safety.
+The rule holds without exception across every transactional case found. Conversely, `createProjectService` and `createTaskService` (§3.3) write to exactly one table each — Postgres's built-in per-statement atomicity is already the strongest guarantee that operation needs, so wrapping it in `db.transaction(...)` would only add a round trip for `BEGIN`/`COMMIT` for zero additional safety.
 
-**Bounded connection pool over the driver default.** The Mongo driver's own default (`maxPoolSize: 100`) is sized for "one process, one database, nothing else sharing the connection budget" — exactly wrong for a horizontally-scaled ECS service where every task independently opens its own pool against the same Atlas cluster. Explicitly capping at 15 (with a floor of 2 warm connections) is a deliberate trade of per-task query concurrency for cluster-wide connection safety — see §7 for whether that specific number holds up as a 2026 best practice.
+**`ON DELETE CASCADE` moved real logic out of the transaction, not just out of the codebase.** `deleteWorkspaceService`'s transaction body is dramatically smaller than what a from-scratch, no-FK-constraints version would need — deleting `projects`/`tasks`/`workspace_members` rows for the workspace used to require (in the pre-migration model this schema replaced) explicit, ordered `deleteMany` calls, each one more code that could be gotten wrong or forgotten on a new delete path. Here, one `DELETE FROM workspaces` statement triggers all of that as a database-level, atomic side effect — the transaction's job shrinks to exactly the part that genuinely isn't a pure cascade consequence: reassigning the deleting user's `currentWorkspaceId`. This is the concrete payoff of foreign keys with real `ON DELETE` behavior (fully argued in [`07-database-schema-design.md` §6](./07-database-schema-design.md#6-design-decisions--tradeoffs)) showing up specifically in the query-mechanics layer, not just the schema layer.
 
-**No repository layer — what's given up.** Query logic that would live once behind a `WorkspaceRepository.findByOwner()` in a repository-pattern codebase is instead duplicated per call site: `WorkspaceModel.findById(workspaceId)` with a not-found check appears near-verbatim in `getWorkspaceByIdService`, `changeMemberRoleService`, `removeMemberFromWorkspaceService`, `resetWorkspaceInviteCodeService`, `updateWorkspaceByIdService`, and `deleteWorkspaceService` — six independent copies of the same lookup-and-guard. What's bought in exchange is the absence of an abstraction layer that would need its own tests and its own maintenance burden, for a benefit (swapping out Mongoose for a different persistence technology) that isn't actually on AstriX's roadmap. This is a reasonable trade for a single-database, single-team codebase at this size — the calculus would flip if the query-logic duplication above ever caused a real bug (two of the six copies drifting out of sync on what "not found" means, for instance).
+**Bounded connection pool over the driver default.** `pg`'s own default pool behavior (unbounded, or a very high implicit ceiling depending on version) is sized for "one process, one database, nothing else sharing the connection budget" — exactly wrong for a horizontally-scaled ECS service where every task independently opens its own pool against the same Postgres instance. Explicitly capping at `PG_MAX_POOL_SIZE=15` (with a floor of `PG_MIN_POOL_SIZE=2` warm connections) is a deliberate trade of per-task query concurrency for cluster-wide connection safety — see §7 for whether that specific number holds up as a 2026 best practice, and §3.1 for the real gap between where this value is *computed* (`app.config.ts`) and where it's actually *read* (`db/client.ts`, independently, via `getEnv`).
+
+**No repository layer — what's given up.** Query logic that would live once behind a `WorkspaceRepository.findById()` in a repository-pattern codebase is instead duplicated per call site: `db.select().from(workspaces).where(eq(workspaces.id, workspaceId))` with a not-found check appears near-verbatim in `getWorkspaceByIdService`, `changeMemberRoleService`, `removeMemberFromWorkspaceService`, `resetWorkspaceInviteCodeService`, `updateWorkspaceByIdService`, and `deleteWorkspaceService` — six independent copies of the same lookup-and-guard. What's bought in exchange is the absence of an abstraction layer that would need its own tests and its own maintenance burden, for a benefit (swapping out Drizzle for a different query layer) that isn't actually on AstriX's roadmap — the same tradeoff already argued at the architecture level in [`01-architecture-patterns-and-project-structure.md` §5](./01-architecture-patterns-and-project-structure.md#5-design-decisions--tradeoffs). This is a reasonable trade for a single-database, single-team codebase at this size — the calculus would flip if the query-logic duplication above ever caused a real bug (two of the six copies drifting out of sync on what "not found" means, for instance).
 
 ---
 
 ## 6. Security Considerations
 
-**`MONGO_URI` and log exposure.** The connection string is read once, in `app.config.ts:22`, and used in exactly two places in the source: `mongoose.connect(config.MONGO_URI, ...)` in `database.config.ts:7`, and `new MongoStore({ uri: config.MONGO_URI, ... })` in `rate-limiter.ts:39`. Nothing in the codebase ever logs `config.MONGO_URI` directly, and nothing dumps the full `config` object to a log line. The real exposure risk is indirect: `database.config.ts`'s `catch` block logs `{ err: error }` on a failed connection attempt, and the global `errorHandler` logs `{ err: error, path: req.path }` on every failed request. Whether a MongoDB connection-error object's `.message` embeds the connection string (with or without credentials) is a property of the underlying `mongodb` driver's error formatting, not of this application's code — modern driver versions redact credentials from error messages by default, but that's an assumption resting on the driver's behavior, not something this codebase tests or asserts on its own. This is worth treating as a gap to verify explicitly (e.g. a test that forces a connection failure and asserts the logged error never contains the password segment of the URI) rather than something safe to assume indefinitely.
+**`DATABASE_URL`/`REDIS_URL` and log exposure.** Neither connection string is ever logged directly anywhere in `backend/src` — `db/client.ts` and `redis/client.ts` both read their respective URL once, at import time, and pass it straight to the driver constructor (`new Pool({ connectionString: ... })`, `new Redis(...)`). The real exposure risk is indirect, the same shape [`04-error-handling-patterns.md` §6](./04-error-handling-patterns.md#6-security-considerations) already covers for the general case: `redis/client.ts`'s `"error"` listener logs `{ err }` on every Redis connection error, and the global `errorHandler` logs `{ err: error, path: req.path }` on every failed request. Whether a `pg` or `ioredis` connection-error object's `.message` embeds the connection string (with or without credentials) is a property of those drivers' own error formatting, not of this application's code — modern driver versions generally avoid echoing credentials in error messages, but that's an assumption resting on driver behavior, not something this codebase tests or asserts on its own.
 
-**Partial-transaction-failure reliability.** As shown in §4, all six transactional functions call `abortTransaction()` unconditionally in their `catch` block, so an error thrown by *any* operation inside the transaction — a validation failure, a duplicate-key error, a thrown `NotFoundException` — reliably triggers an explicit abort before the error propagates. What's *not* exercised anywhere in this codebase, and is worth calling out honestly rather than assuming away, is the abort call itself failing (for instance, a network partition between the app and Mongo occurring between the triggering error and the `abortTransaction()` call). Mongoose/MongoDB transactions are designed so that a session tied to a lost connection eventually times out and is cleaned up server-side even if the client's own `abortTransaction()` never completes — but that server-side safety net is a property of MongoDB's session-timeout behavior, not something this codebase has its own test coverage for.
+**Transaction-failure reliability is now structural, not a convention every call site has to get right.** Every one of the five transactional functions in §3.2 relies on the exact same guarantee — `db.transaction()`'s callback contract, where any thrown error triggers `ROLLBACK` automatically. This is a meaningfully stronger property than a hand-rolled session API offers: there is no `catch` block anywhere in this codebase that could accidentally *not* call the rollback equivalent, because there's no separate rollback call for application code to remember at all. What's still worth naming honestly rather than assuming away: `db.transaction()`'s automatic rollback is itself a property of Drizzle's implementation atop `pg`, not something this codebase has its own test coverage independently verifying — a genuine network partition between the app and Postgres mid-transaction is handled by Postgres's own connection-loss semantics (an in-flight, un-committed transaction on a dropped connection is simply never committed, since `COMMIT` itself would fail on a dead connection), not by any explicit code path in this repository.
 
-**Data-integrity gap in non-transactional multi-write flows.** Not every multi-step write in the codebase is wrapped in a transaction — only the six listed in §3.2 are. `removeMemberFromWorkspaceService` (`workspace.service.ts:204-245`) is a concrete counter-example: it runs a `MemberModel.findOneAndDelete(...)`, then a `TaskModel.updateMany(...)` to unassign that member's tasks, then conditionally a `UserModel.findById` + `.save()` to fix up `currentWorkspace` — three independent, non-transactional writes. If the `TaskModel.updateMany` call throws after the member document has already been deleted, the member is gone but their tasks stay assigned to a user who's no longer in the workspace — a real, currently-unprotected partial-completion state. This isn't a case where a rollback happens and this doc is claiming otherwise; the opposite is true: there genuinely is no rollback here, because there's no session in this function at all. It's flagged because it's the kind of case the criterion in §5 (multiple collections, one logical operation) would suggest belongs in a transaction, but doesn't currently have one — a real, verifiable gap, not a hypothetical.
+**Data-integrity gap in non-transactional multi-write flows.** Not every multi-step write in the codebase is wrapped in a transaction — only the five listed in §3.2 are. `removeMemberFromWorkspaceService` (`backend/src/services/workspace.service.ts:132-188`) is a concrete counter-example: it runs a `db.delete(workspaceMembers).where(...).returning()`, then a `db.update(tasks).set({ assignedTo: null }).where(...)` to unassign that member's tasks, then conditionally a `db.select()` + `db.update(users)` to fix up `currentWorkspaceId` — three independent, non-transactional statements against the plain `db` object, not `tx`. If the `tasks` update throws after the membership row has already been deleted, the membership is gone but their tasks stay assigned to a user who's no longer in the workspace — a real, currently-unprotected partial-completion state. This isn't a case where a rollback happens and this doc is claiming otherwise; the opposite is true: there genuinely is no rollback here, because there's no transaction in this function at all. It's flagged because it's the kind of case the criterion in §5 (multiple tables, one logical operation) would suggest belongs in a transaction, but doesn't currently have one — a real, verifiable gap, not a hypothetical.
 
-**Resource exhaustion from unbounded `.find()` calls.** A grep across every service for `.find(` (excluding `findById`/`findOne`-family calls, which return at most one document by construction) turns up several queries with no `.limit()`: `SessionModel.find({ userId, isValid: true, ... })` in `getUserSessionsService` (a user's active-device list), `MemberModel.find({ userId })` in `getAllWorkspacesUserIsMemberService` and again in `deleteAccountService`, `MemberModel.find({ workspaceId })` in `getWorkspaceByIdService` and `getWorkspaceMembersService`, `WorkspaceModel.find({ owner: userId })` in `deleteAccountService`, and `RoleModel.find({})` in `getWorkspaceMembersService`. None of these are currently paginated. In practice, most are bounded by realistic real-world cardinality (a role set fixed by the app's own enum, a user's own workspace memberships), but `MemberModel.find({ workspaceId })` — the full member list of a single workspace — has no enforced ceiling at all: a workspace that grows to thousands of members would return every one of them in a single unpaginated response. This is a genuine, currently-unmitigated latent risk rather than an active incident, since AstriX's actual usage pattern (small team workspaces) keeps the numbers low today — but it's a gap worth flagging plainly rather than assuming away as "fine because nobody's hit it yet."
+**Resource exhaustion from unbounded `.select()` calls.** A grep across every service for `.select(` with no accompanying `.limit(...)` turns up several queries that return every matching row with no ceiling: `getWorkspaceMembersService`'s member list (`workspace.service.ts:193-212`), `getAllWorkspacesUserIsMemberService`'s membership list (`workspace.service.ts:62-70`), and `getUserSessionsService`'s active-session list (backed by Redis, not Postgres, but the same shape). In practice, most are bounded by realistic real-world cardinality today (a user's own workspace memberships, a small team's session count), but `getWorkspaceMembersService` — the full member list of a single workspace — has no enforced ceiling at all: a workspace that grows to thousands of members would return every one of them in a single unpaginated response, the same latent risk this codebase's Mongo-era predecessor had and never resolved. This is a genuine, currently-unmitigated risk rather than an active incident, since AstriX's actual usage pattern (small team workspaces) keeps the numbers low today — worth flagging plainly rather than assuming away as "fine because nobody's hit it yet."
 
 ---
 
 ## 7. Best Practice Check
 
-**Connection pooling.** AstriX's explicit `maxPoolSize: 15` / `minPoolSize: 2`, reasoned about directly against "N ECS tasks × pool size must stay under Atlas's total connection ceiling," is exactly the 2026 industry-standard shape for pooling in a containerized, horizontally-scaled Node service: never inherit the driver's single-process default, size the pool as (total connection budget) ÷ (expected replica count), and keep a small warm floor to avoid cold-connection latency on scale-out. This matches current practice cleanly — the one thing worth periodically re-checking (not a code gap, an operational one) is that `MONGO_MAX_POOL_SIZE × <current ECS task count>` still comfortably clears whatever the live Atlas tier's actual connection ceiling is, since that ceiling can change independently of this code if the Atlas tier is ever resized.
+**Connection pooling.** AstriX's explicit `PG_MAX_POOL_SIZE=15`/`PG_MIN_POOL_SIZE=2`, reasoned about directly against "N ECS tasks × pool size must stay under the database's total connection ceiling," is exactly the 2026 industry-standard shape for pooling in a containerized, horizontally-scaled Node service: never inherit the driver's unbounded default, size the pool as (total connection budget) ÷ (expected replica count), and keep a small warm floor to avoid cold-connection latency on scale-out. The one real, fixable gap here — distinct from the sizing choice itself, which is sound — is the dead-config issue named in §3.1/§5: `app.config.ts` computes `PG_MAX_POOL_SIZE`/`PG_MIN_POOL_SIZE` onto the shared `config` object, but `db/client.ts` never reads them, reaching for `getEnv(...)` directly instead. Worth fixing by having `client.ts` import and use `config.PG_MAX_POOL_SIZE`/`config.PG_MIN_POOL_SIZE` — today it's harmless only because both reads happen to use identical env var names and identical defaults.
 
-**Transaction-usage discipline.** Using ACID transactions only for the six genuinely multi-collection writes identified in §3.2/§5, and leaving every single-document write (the overwhelming majority of the app's write volume — project creation, task creation, task updates, role changes) on plain per-document atomicity, is current (2026) best practice, not a dated compromise. Transactions in MongoDB carry real cost — held locks for the transaction's duration, extra round trips for `startTransaction`/`commitTransaction`, and (for `MongoMemoryReplSet` in tests, see §3.6) even the topology requirement of a replica set — so reaching for one only where atomicity genuinely spans documents, rather than wrapping every write "just in case," is the currently-recommended posture, and AstriX's actual usage matches it precisely.
+**Transaction-usage discipline.** Using real transactions only for the five genuinely multi-table writes identified in §3.2, and leaving every single-statement write (the overwhelming majority of the app's write volume — project creation, task creation, task updates, role changes) on plain per-statement atomicity, is current (2026) best practice, not a dated compromise. Transactions carry real cost — an extra round trip for `BEGIN`/`COMMIT`, and (for a naive implementation) held row/table locks for the transaction's duration — so reaching for one only where atomicity genuinely spans statements, rather than wrapping every write "just in case," is the currently-recommended posture, and AstriX's actual usage matches it precisely. Drizzle's callback-based `db.transaction()` API is also itself a best-practice-aligned choice relative to a manual `BEGIN`/`COMMIT`/`ROLLBACK` sequence: it structurally eliminates the "forgot to roll back" and "forgot to release the connection" bug classes a hand-rolled session/transaction API is exposed to, by making commit-on-resolve/rollback-on-throw the only code path rather than a convention every call site has to independently implement correctly.
 
-**Query-level performance.** Mixed. Field projection (`.select(...)`) is used in several places where it matters — `getCurrentUserService`'s `.select("-password")`, `getProjectByIdAndWorkspaceIdService`'s `.select("_id emoji name")` — which is good practice. `.lean()`, on the other hand, appears exactly once in the entire services layer (`getWorkspaceMembersService`'s roles lookup, `RoleModel.find({}, { name: 1, _id: 1 }).select("-permission").lean()`). Every other read-only query — including ones that populate related documents and return them straight to an HTTP response without ever saving them back — returns full hydrated Mongoose documents, paying the ODM's document-wrapping cost for data that's only ever serialized to JSON. In 2026, the common recommendation for Mongoose-based services is to default to `.lean()` on any query whose result is read-only (never `.save()`d), reserving hydrated documents for the genuinely small set of reads that go on to be mutated in place — AstriX's current pattern (hydrated by default, `.lean()` as a rare exception) is the inverse of that, and is a real, low-risk-to-fix gap rather than a structural one. On indexing: this file doesn't re-derive the full index inventory — that's [`07-database-schema-design.md`](./07-database-schema-design.md)'s job, and it hadn't been written yet as of this pass, so cross-reference it there directly. What's observable from the query patterns covered here is that the indexes backing the *transactional* and *authentication* hot paths line up with how those collections are actually queried — `SessionModel` carries both a `userId` index and a compound `{ userId: 1, isValid: 1 }` index matching exactly the shape of the `authenticate` middleware's lookup, and `TaskModel` carries `{ workspace: 1, project: 1 }` and `{ workspace: 1, status: 1 }` compound indexes matching the filter shapes used in `getAllTasksService`. None of the unpaginated `.find()` calls flagged in §6, by contrast, have a corresponding index specifically sized around "keep this fast at high document counts" — because until §6's gap is fixed with an actual `.limit()`, there isn't a page size for an index to serve efficiently.
+**Query-level performance.** Mixed, in the same direction as the schema-design chapter's own honest gaps. Indexing lines up well with actual query shapes — `tasks_workspace_project_idx` and `tasks_workspace_status_idx` back exactly the two filter combinations `getAllTasksService` runs (per [`07-database-schema-design.md` §3.7](./07-database-schema-design.md#37-tasks)), and every index in the schema traces to a real `WHERE`/`JOIN` clause rather than being added speculatively. What's unresolved, as named in §6, is pagination coverage: `getAllTasksService` and `getProjectsInWorkspaceService` do paginate properly (`.limit()`/`.offset()` plus a matched `count(*)` query), but `getWorkspaceMembersService` and `getAllWorkspacesUserIsMemberService` don't paginate at all — a gap this codebase inherited conceptually from its pre-migration predecessor rather than introducing fresh, and one that's cheap to close (the same `.limit()`/`.offset()` pattern already proven correct elsewhere in this file) whenever workspace member counts actually grow large enough to matter.
+
+**Migration tooling.** `drizzle-kit generate` producing plain, readable `.sql` files (`backend/src/db/migrations/0000_whole_microchip.sql` through `0002_youthful_firestar.sql`, tracked via `backend/src/db/migrations/meta/_journal.json`) rather than an opaque, framework-internal migration format is a genuine 2026-best-practice choice for a small team: the actual DDL that will run against production is reviewable in a pull request diff exactly as written, and `backend/drizzle.config.ts` (`schema: "./src/db/schema.ts"`, `out: "./src/db/migrations"`, `dialect: "postgresql"`) is the entire configuration surface needed to regenerate one. This is a genuine, structural improvement over this codebase's pre-migration predecessor, which had no schema-versioning story at all.
 
 ---
 
 ## 8. Debug Drill
 
-**Scenario 1 — "connection-pool-exhausted" errors under load, in a generic Mongoose/MongoDB-backed Node service.** Where to look first, and why:
+**Scenario 1 — a query joining two tables is returning fewer rows than expected, and nothing threw an error.**
 
-1. **Count the actual concurrent connection demand.** Multiply the configured `maxPoolSize` by the number of running application replicas, and compare that against the database's actual connection ceiling for its current tier. A pool-exhaustion error under load is very often just this arithmetic not holding anymore — a replica count that scaled up, or a database tier that got downsized, without anyone revisiting the pool-size constant.
-2. **Look for connections held longer than expected**, not just more of them. A slow, unindexed query holds its connection for the query's full duration; a burst of those under load can starve the pool even without a raw connection-count problem. Check for missing indexes on whatever query pattern spiked traffic.
-3. **Look for sessions or cursors that never get released.** A `mongoose.startSession()` without a `finally { session.endSession() }` (or a change stream/cursor left open) leaks a connection out of the pool permanently until the process restarts. Audit every `startSession()` call site for exactly this shape.
-4. **Check whether load is actually load, or a retry storm.** A client-side timeout that's shorter than the server's actual response time under load causes retries that add more concurrent connection demand on top of the load that caused the slowdown in the first place — a self-reinforcing spiral that looks like "the pool is too small" but is really "the pool is being asked to serve N+retries requests instead of N."
+1. **Check whether the join is an `innerJoin` where it should be a `leftJoin`.** This is the single most common cause in this codebase specifically, and it's a *correctness* bug, not a performance one: an `innerJoin` against a column that can be `NULL` (`tasks.assignedTo` is the real, checkable example) silently drops every row where that column is null, rather than erroring. §3.4 walks the exact `getAllTasksService`/`getWorkspaceMembersService` contrast that makes this concrete — the rule is "nullable FK → `leftJoin`, `NOT NULL` FK → `innerJoin`," always.
+2. **Confirm the FK's `ON DELETE` behavior matches what you expect for that column.** A row that "should" be there but isn't might have been legitimately removed by a cascade — check whether the parent row was deleted, and whether the child's FK was declared `CASCADE` (row gone), `SET NULL` (row present, reference cleared — check for an unexpected `NULL`), or should have been `RESTRICT`/no-clause (the delete should never have succeeded at all; if it did, the FK is missing or misconfigured). Full inventory of every FK's `ON DELETE` choice and why is [`07-database-schema-design.md` §6](./07-database-schema-design.md#6-design-decisions--tradeoffs).
+3. **Check the `WHERE` clause's condition list, not just the join.** `getAllTasksService` builds its `conditions` array incrementally from optional filters (`filters.status?.length`, `filters.keyword`, etc.) — a filter that's present but evaluates to an empty array/string can silently produce a `WHERE` clause that excludes everything, which reads identically to "the join is wrong" from the caller's side.
+4. **Run `EXPLAIN ANALYZE` on the actual query, not a paraphrase of it.** Confirm which indexes the planner actually chose — a query that "should" use `tasks_workspace_status_idx` but instead does a full sequential scan isn't a correctness bug on its own, but it's often the fastest way to notice that the `WHERE` clause isn't shaped the way you assumed it was (a filter condition compiled into a `sql\`...\`` fragment slightly differently than intended, for instance).
 
-**Scenario 2 — a multi-step operation partially completed instead of cleanly rolling back.** Where to look first, and why:
+**A related, equally common scenario: a write fails with a unique-constraint violation you didn't expect.** First check whether the constraint is compound (`workspace_members_user_workspace_unique`, on `(user_id, workspace_id)` together) rather than single-column — a compound unique constraint is violated by the *combination*, and Postgres's `23505` error payload includes the actual `Key (...)=(...) already exists` detail naming exactly which columns and values collided, which is faster to read than re-deriving it from the schema file. `joinWorkspaceByInviteService` (`backend/src/services/member.service.ts:31-63`) is the one place in this codebase that catches `23505` explicitly, re-throwing it as a clean `BadRequestException` — see [`04-error-handling-patterns.md` §3.3](./04-error-handling-patterns.md#33-the-centralized-errorhandler-full-precedence-chain--now-four-branches-shorter) for the full reasoning on why that's handled at the throw site rather than centrally.
 
-1. **Find the function and check whether it actually opens a session at all.** The single most common cause of "partial completion" in a Mongoose codebase isn't a broken transaction — it's the absence of one. Grep the function for `startSession`/`.session(...)`; if it isn't there, every write inside it is independently committed the moment it runs, and there is nothing to roll back by design.
-2. **If a session is present, check that every write in the function actually passes it.** A single `.save()` or `.updateMany()` missing its `.session(session)` argument is invisible to the transaction — it commits immediately regardless of whether the surrounding transaction later aborts, which produces exactly the "partially completed" symptom even though a transaction is technically in use.
-3. **Check the `catch` block calls `abortTransaction()` unconditionally**, not just on specific error types — a `catch` that only aborts for certain error subclasses leaves the transaction open (and its provisional writes uncommitted-but-unreleased) for anything else that throws.
-4. **Confirm `endSession()` runs in every exit path**, success and failure alike — normally via `finally`. A session that's never ended doesn't cause data corruption on its own, but it does leak a server-side session resource, and under sustained load that leak can itself become the pool-exhaustion problem from Scenario 1.
+**Scenario 2 — a multi-step operation partially completed instead of cleanly rolling back.**
+
+1. **Find the function and check whether it actually calls `db.transaction(...)` at all.** The single most common cause of "partial completion" in this codebase isn't a broken transaction — it's the absence of one. Grep the function for `db.transaction(`; if it isn't there, every write inside it is independently committed the moment it runs, and there is nothing to roll back by design. `removeMemberFromWorkspaceService` (§6) is the real, currently-existing example of exactly this gap.
+2. **If a transaction is present, check that every write in the function actually goes through `tx`, not the module-level `db`.** A single `.insert(...)`/`.update(...)`/`.delete(...)` accidentally called on `db` instead of the callback's `tx` parameter commits immediately, outside the transaction, regardless of whether the surrounding transaction later rolls back — this produces exactly the "partially completed" symptom even though `db.transaction(...)` is technically in use somewhere in the function. This is the direct Drizzle equivalent of the old session-API bug class where a `.save({ session })` call was missing its `session` argument.
+3. **Confirm the throw actually happens inside the transaction callback, not after it.** A `try`/`catch` somewhere between a genuine failure and the transaction boundary could be swallowing the error and letting the callback resolve successfully anyway — `db.transaction()` only rolls back if the callback's promise *rejects*; a caught-and-ignored error inside the callback that doesn't re-throw commits whatever writes happened before it, silently.
+4. **Verify no cross-datastore step was mistakenly assumed to be covered by the Postgres transaction.** `deleteAccountService`'s `invalidateAllSessionsForUser(userId)` (§3.2) runs deliberately *after* the transaction commits, because Redis session state was never part of the Postgres transaction to begin with — if a future change tried to call a Redis-touching function *inside* `db.transaction(async (tx) => {...})`, expecting it to roll back alongside the Postgres writes on failure, that expectation would be wrong: only statements issued through `tx` are transactional, and no Redis client here is transaction-aware at all.

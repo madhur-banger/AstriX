@@ -1,17 +1,5 @@
 import jwt, { SignOptions, VerifyOptions } from "jsonwebtoken";
 import { config } from "../config/app.config";
-import { UserDocument } from "../models/user.model";
-import { UnauthorizedException } from "./appError";
-
-export type AccessTokenPayload = {
-  userId: UserDocument["_id"];
-  sessionId: string;
-};
-
-export type RefreshTokenPayload = {
-  userId: UserDocument["_id"];
-  sessionId: string;
-};
 
 type SignOptsAndSecret = SignOptions & {
   secret: string;
@@ -38,23 +26,6 @@ export const signJwtToken = <T extends object>(
 ): string => {
   const { secret, ...opts } = options;
   return jwt.sign(payload, secret, { ...defaults, ...opts });
-};
-
-export const generateTokenPair = (
-  userId: UserDocument["_id"],
-  sessionId: string
-): { accessToken: string; refreshToken: string } => {
-  const accessToken = signJwtToken<AccessTokenPayload>(
-    { userId, sessionId },
-    accessTokenSignOptions
-  );
-
-  const refreshToken = signJwtToken<RefreshTokenPayload>(
-    { userId, sessionId },
-    refreshTokenSignOptions
-  );
-
-  return { accessToken, refreshToken };
 };
 
 export const verifyJwtToken = <T extends object>(
@@ -88,33 +59,6 @@ export const extractBearerToken = (
   if (scheme !== "Bearer" || !token) return null;
 
   return token;
-};
-
-export const verifyAccessTokenAndGetPayload = (
-  token: string
-): AccessTokenPayload => {
-  const result = verifyJwtToken<AccessTokenPayload>(
-    token,
-    accessTokenSignOptions.secret
-  );
-  if (!result.valid) {
-    throw new UnauthorizedException(result.error);
-  }
-  return result.payload;
-};
-
-export const verifyAccessToken = (token: string) => {
-  return verifyJwtToken<AccessTokenPayload>(
-    token,
-    accessTokenSignOptions.secret
-  );
-};
-
-export const verifyRefreshToken = (token: string) => {
-  return verifyJwtToken<RefreshTokenPayload>(
-    token,
-    refreshTokenSignOptions.secret
-  );
 };
 
 export const calculateExpiryDate = (expiresIn: string): Date => {

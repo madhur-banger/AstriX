@@ -1,15 +1,13 @@
 /**
- * INTEGRATION TESTS: task.service.ts
- * ---------------------------------------
- * Real Mongoose models against the in-memory MongoDB from
- * tests/setup/vitest.setup.ts - no model mocks. See
- * tests/integration/workspace.service.integration.test.ts for why this
- * layer exists alongside the mocked unit tests.
+ * INTEGRATION TESTS: services/task.service.ts
+ * -------------------------------------------------
+ * Real Postgres (testcontainers, see tests/setup/global-setup.ts) via
+ * the real Drizzle client (src/db/client.ts) - no mocks. Mirrors the
+ * existing tests/integration/task.service.integration.test.ts (Mongo) so
+ * the two suites can be compared feature-by-feature per Phase 5 §5.6's
+ * parity checklist.
  */
-
-import { describe, it, expect, beforeEach } from "vitest";
-import mongoose from "mongoose";
-
+import { describe, it, expect } from "vitest";
 import {
   createTaskService,
   updateTaskService,
@@ -18,169 +16,139 @@ import {
   deleteTaskService,
 } from "../../src/services/task.service";
 import { deleteProjectService } from "../../src/services/project.service";
+import { db } from "../../src/db/client";
+import { tasks, workspaceMembers } from "../../src/db/schema";
+import { eq } from "drizzle-orm";
+import { NotFoundException, BadRequestException } from "../../src/utils/appError";
+import { generateTaskCode } from "../../src/utils/uuid";
+import {
+  createTestUser,
+  createTestWorkspace,
+  createTestProject,
+  getRoleIdByName,
+} from "../setup/fixtures";
 
-import UserModel from "../../src/models/user.model";
-import WorkspaceModel from "../../src/models/workspace.model";
-import ProjectModel from "../../src/models/project.model";
-import MemberModel from "../../src/models/member.model";
-import RoleModel from "../../src/models/roles-permission.model";
-import TaskModel from "../../src/models/task.model";
-import { Roles } from "../../src/enums/role.enum";
-import { NotFoundException } from "../../src/utils/appError";
+describe("task.service (integration - real Postgres via testcontainers)", () => {
+  const seed = async () => {
+    const user = await createTestUser();
+    const workspace = await createTestWorkspace(user.id);
+    const project = await createTestProject(user.id, workspace.id);
+    return { user, workspace, project };
+  };
 
-describe("task.service (integration - real in-memory MongoDB)", () => {
-  let userId: string;
-  let workspaceId: string;
-  let projectId: string;
+  it("creates a task with default status/priority and the given taskCode", async () => {
+    const { user, workspace, project } = await seed();
 
-  beforeEach(async () => {
-    const user = await UserModel.create({
-      name: "Task Integration User",
-      email: `task-integration-${Date.now()}@example.com`,
-    });
-    userId = user._id.toString();
-
-    const workspace = await WorkspaceModel.create({
-      name: "Task Integration Workspace",
-      owner: user._id,
-    });
-    workspaceId = workspace._id.toString();
-
-    const project = await ProjectModel.create({
-      name: "Task Integration Project",
-      workspace: workspace._id,
-      createdBy: user._id,
-    });
-    projectId = project._id.toString();
-  });
-
-  it("creates a task with default status/priority and a generated taskCode", async () => {
-    const { task } = await createTaskService(workspaceId, projectId, userId, {
+    const { task } = await createTaskService(workspace.id, project.id, user.id, {
       title: "Persisted Task",
-      priority: "" as any,
-      status: "" as any,
+      taskCode: generateTaskCode(),
     });
 
-    const persisted = await TaskModel.findById(task._id);
-    expect(persisted).not.toBeNull();
-    expect(persisted!.status).toBe("TODO");
-    expect(persisted!.priority).toBe("MEDIUM");
-    expect(persisted!.taskCode).toBeTruthy();
+    const [persisted] = await db.select().from(tasks).where(eq(tasks.id, task.id));
+    expect(persisted).toBeDefined();
+    expect(persisted.status).toBe("TODO");
+    expect(persisted.priority).toBe("MEDIUM");
+    expect(persisted.taskCode).toBeTruthy();
   });
 
   it("rejects creation when the project belongs to a different workspace", async () => {
-    const otherWorkspace = await WorkspaceModel.create({
-      name: "Other Workspace",
-      owner: new mongoose.Types.ObjectId(userId),
-    });
+    const { user, project } = await seed();
+    const otherWorkspace = await createTestWorkspace(user.id, { name: "Other Workspace" });
 
     await expect(
-      createTaskService(otherWorkspace._id.toString(), projectId, userId, {
+      createTaskService(otherWorkspace.id, project.id, user.id, {
         title: "T",
-        priority: "MEDIUM",
-        status: "TODO",
+        taskCode: generateTaskCode(),
       })
     ).rejects.toThrow(NotFoundException);
   });
 
   it("rejects creation when assignedTo is not a member of the workspace", async () => {
-    const outsider = await UserModel.create({
-      name: "Outsider",
-      email: `outsider-${Date.now()}@example.com`,
-    });
+    const { user, workspace, project } = await seed();
+    const outsider = await createTestUser();
 
     await expect(
-      createTaskService(workspaceId, projectId, userId, {
+      createTaskService(workspace.id, project.id, user.id, {
         title: "T",
-        priority: "MEDIUM",
-        status: "TODO",
-        assignedTo: outsider._id.toString(),
+        assignedTo: outsider.id,
+        taskCode: generateTaskCode(),
       })
     ).rejects.toThrow("Assigned user is not a member of this workspace");
   });
 
   it("creates the task when assignedTo IS a real member of the workspace", async () => {
-    const role = await RoleModel.create({
-      name: Roles.MEMBER,
-      permissions: [],
-    });
-    const assignee = await UserModel.create({
-      name: "Assignee",
-      email: `assignee-${Date.now()}@example.com`,
-    });
-    await MemberModel.create({
-      userId: assignee._id,
-      workspaceId,
-      role: role._id,
-    });
+    const { user, workspace, project } = await seed();
+    const assignee = await createTestUser();
+    const memberRoleId = await getRoleIdByName("MEMBER");
+    await db.insert(workspaceMembers).values({ userId: assignee.id, workspaceId: workspace.id, roleId: memberRoleId });
 
-    const { task } = await createTaskService(workspaceId, projectId, userId, {
+    const { task } = await createTaskService(workspace.id, project.id, user.id, {
       title: "Assigned Task",
-      priority: "MEDIUM",
-      status: "TODO",
-      assignedTo: assignee._id.toString(),
+      assignedTo: assignee.id,
+      taskCode: generateTaskCode(),
     });
 
-    expect(String(task.assignedTo)).toBe(assignee._id.toString());
+    expect(task.assignedTo).toBe(assignee.id);
   });
 
-  it("rejects an update when assignedTo is not a member of the workspace (H1: the update path must enforce this exactly like create does)", async () => {
-    const { task } = await createTaskService(workspaceId, projectId, userId, {
+  it("rejects an update when assignedTo is not a member of the workspace (update path enforces the same rule as create)", async () => {
+    const { user, workspace, project } = await seed();
+    const { task } = await createTaskService(workspace.id, project.id, user.id, {
       title: "Needs reassignment",
-      priority: "MEDIUM",
-      status: "TODO",
+      taskCode: generateTaskCode(),
     });
-    const outsider = await UserModel.create({
-      name: "Outsider",
-      email: `outsider-update-${Date.now()}@example.com`,
-    });
+    const outsider = await createTestUser();
 
     await expect(
-      updateTaskService(workspaceId, projectId, String(task._id), {
+      updateTaskService(workspace.id, project.id, task.id, {
         title: "Needs reassignment",
         priority: "MEDIUM",
         status: "TODO",
-        assignedTo: outsider._id.toString(),
+        assignedTo: outsider.id,
       })
-    ).rejects.toThrow("Assigned user is not a member of this workspace");
+    ).rejects.toThrow(BadRequestException);
 
-    const refetched = await TaskModel.findById(task._id);
-    expect(refetched!.assignedTo).toBeNull();
+    const [refetched] = await db.select().from(tasks).where(eq(tasks.id, task.id));
+    expect(refetched.assignedTo).toBeNull();
   });
 
   it("update persists changes and a re-fetch reflects them", async () => {
-    const { task } = await createTaskService(workspaceId, projectId, userId, {
+    const { user, workspace, project } = await seed();
+    const { task } = await createTaskService(workspace.id, project.id, user.id, {
       title: "Before Update",
       priority: "LOW",
-      status: "TODO",
+      taskCode: generateTaskCode(),
     });
 
-    await updateTaskService(workspaceId, projectId, String(task._id), {
+    await updateTaskService(workspace.id, project.id, task.id, {
       title: "After Update",
       priority: "HIGH",
       status: "DONE",
     });
 
-    const refetched = await TaskModel.findById(task._id);
-    expect(refetched!.title).toBe("After Update");
-    expect(refetched!.priority).toBe("HIGH");
-    expect(refetched!.status).toBe("DONE");
+    const [refetched] = await db.select().from(tasks).where(eq(tasks.id, task.id));
+    expect(refetched.title).toBe("After Update");
+    expect(refetched.priority).toBe("HIGH");
+    expect(refetched.status).toBe("DONE");
   });
 
-  it("getAllTasksService filters by status and keyword against real seeded data", async () => {
-    await createTaskService(workspaceId, projectId, userId, {
+  it("getAllTasksService filters by status and keyword against real seeded rows", async () => {
+    const { user, workspace, project } = await seed();
+    await createTaskService(workspace.id, project.id, user.id, {
       title: "Fix login bug",
-      priority: "HIGH",
       status: "TODO",
+      priority: "HIGH",
+      taskCode: generateTaskCode(),
     });
-    await createTaskService(workspaceId, projectId, userId, {
+    await createTaskService(workspace.id, project.id, user.id, {
       title: "Write docs",
-      priority: "LOW",
       status: "DONE",
+      priority: "LOW",
+      taskCode: generateTaskCode(),
     });
 
     const result = await getAllTasksService(
-      workspaceId,
+      workspace.id,
       { status: ["TODO"], keyword: "login" },
       { pageSize: 10, pageNumber: 1 }
     );
@@ -189,44 +157,74 @@ describe("task.service (integration - real in-memory MongoDB)", () => {
     expect(result.tasks[0].title).toBe("Fix login bug");
   });
 
-  it("getTaskByIdService scopes correctly to workspace+project", async () => {
-    const { task } = await createTaskService(workspaceId, projectId, userId, {
-      title: "Scoped Task",
-      priority: "MEDIUM",
-      status: "TODO",
+  it("getAllTasksService leaves assignee null for an unassigned task instead of omitting it (leftJoin, not innerJoin)", async () => {
+    const { user, workspace, project } = await seed();
+    await createTaskService(workspace.id, project.id, user.id, {
+      title: "Unassigned",
+      taskCode: generateTaskCode(),
     });
 
-    const found = await getTaskByIdService(
-      workspaceId,
-      projectId,
-      String(task._id)
-    );
-    expect(String(found._id)).toBe(String(task._id));
+    const result = await getAllTasksService(workspace.id, {}, { pageSize: 10, pageNumber: 1 });
+
+    expect(result.tasks).toHaveLength(1);
+    expect(result.tasks[0].assignee).toBeNull();
+  });
+
+  it("getTaskByIdService scopes correctly to workspace+project", async () => {
+    const { user, workspace, project } = await seed();
+    const { task } = await createTaskService(workspace.id, project.id, user.id, {
+      title: "Scoped Task",
+      taskCode: generateTaskCode(),
+    });
+
+    const found = await getTaskByIdService(workspace.id, project.id, task.id);
+    expect(found.id).toBe(task.id);
   });
 
   it("delete removes the task from the real DB", async () => {
-    const { task } = await createTaskService(workspaceId, projectId, userId, {
+    const { user, workspace, project } = await seed();
+    const { task } = await createTaskService(workspace.id, project.id, user.id, {
       title: "To Delete",
-      priority: "MEDIUM",
-      status: "TODO",
+      taskCode: generateTaskCode(),
     });
 
-    await deleteTaskService(workspaceId, String(task._id));
+    await deleteTaskService(workspace.id, task.id);
 
-    const afterDelete = await TaskModel.findById(task._id);
-    expect(afterDelete).toBeNull();
+    const [afterDelete] = await db.select().from(tasks).where(eq(tasks.id, task.id));
+    expect(afterDelete).toBeUndefined();
   });
 
-  it("deleting a project cascades and removes its tasks (cross-service regression check)", async () => {
-    const { task } = await createTaskService(workspaceId, projectId, userId, {
+  it("deleting a project cascades and removes its tasks via ON DELETE CASCADE (Phase 1 cascade proof, now automated)", async () => {
+    const { user, workspace, project } = await seed();
+    const { task } = await createTaskService(workspace.id, project.id, user.id, {
       title: "Cascade Task",
-      priority: "MEDIUM",
-      status: "TODO",
+      taskCode: generateTaskCode(),
     });
 
-    await deleteProjectService(workspaceId, projectId);
+    await deleteProjectService(workspace.id, project.id);
 
-    const afterDelete = await TaskModel.findById(task._id);
-    expect(afterDelete).toBeNull();
+    const [afterDelete] = await db.select().from(tasks).where(eq(tasks.id, task.id));
+    expect(afterDelete).toBeUndefined();
+  });
+
+  it("getAllTasksService.pagination math matches pageSize/pageNumber/totalPages/skip", async () => {
+    const { user, workspace, project } = await seed();
+    for (let i = 0; i < 5; i++) {
+      await createTaskService(workspace.id, project.id, user.id, {
+        title: `Task ${i}`,
+        taskCode: generateTaskCode(),
+      });
+    }
+
+    const result = await getAllTasksService(workspace.id, {}, { pageSize: 2, pageNumber: 2 });
+
+    expect(result.tasks).toHaveLength(2);
+    expect(result.pagination).toEqual({
+      pageSize: 2,
+      pageNumber: 2,
+      totalCount: 5,
+      totalPages: 3,
+      skip: 2,
+    });
   });
 });

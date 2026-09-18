@@ -15,7 +15,7 @@ import {
   registerUserService,
   createSessionService,
   refreshAccessTokenService,
-  invalidateSessionService,
+  logoutByRefreshTokenService,
   invalidateAllSessionsService,
   getUserSessionsService,
   verifyUserService,
@@ -29,7 +29,6 @@ import {
 } from "../services/auth.service";
 import { BadRequestException, UnauthorizedException } from "../utils/appError";
 import { exchangeGoogleCodeForProfile } from "../providers/google.provider";
-import { verifyRefreshToken } from "../utils/jwt";
 import { logger } from "../utils/logger";
 
 const setRefreshTokenCookie = (res: Response, refreshToken: string): void => {
@@ -79,7 +78,7 @@ export const loginController = asyncHandler(
     const user = await verifyUserService(body);
 
     const { accessToken, refreshToken } = await createSessionService({
-      userId: user._id,
+      userId: user.id,
       userAgent: req.headers["user-agent"],
       ipAddress: req.ip,
     });
@@ -115,7 +114,7 @@ export const googleCallbackController = asyncHandler(
     const profile = await exchangeGoogleCodeForProfile(code as string);
 
     const { user } = await loginOrCreateAccountService({
-      provider: profile.provider,
+      provider: profile.provider as "GOOGLE",
       providerId: profile.providerId,
       email: profile.email,
       displayName: profile.name,
@@ -124,14 +123,14 @@ export const googleCallbackController = asyncHandler(
     });
 
     const { refreshToken } = await createSessionService({
-      userId: user._id,
+      userId: user.id,
       userAgent: req.headers["user-agent"],
       ipAddress: req.ip,
     });
 
     setRefreshTokenCookie(res, refreshToken);
 
-    const redirectUrl = `${config.FRONTEND_ORIGIN}/workspace/${user.currentWorkspace}`;
+    const redirectUrl = `${config.FRONTEND_ORIGIN}/workspace/${user.currentWorkspaceId}`;
     res.redirect(redirectUrl);
   }
 );
@@ -180,10 +179,7 @@ export const logOutController = asyncHandler(
 
     if (refreshToken) {
       try {
-        const result = verifyRefreshToken(refreshToken);
-        if (result.valid) {
-          await invalidateSessionService(result.payload.sessionId);
-        }
+        await logoutByRefreshTokenService(refreshToken);
       } catch (error) {
         (req.log ?? logger).error({ err: error }, "Logout error");
       }
@@ -206,7 +202,7 @@ export const logOutAllController = asyncHandler(
         .json({ message: "Not authenticated" });
     }
 
-    await invalidateAllSessionsService(user._id);
+    await invalidateAllSessionsService(user.id);
     clearRefreshTokenCookie(res);
 
     return res
@@ -229,16 +225,9 @@ export const getSessionsController = asyncHandler(
         .json({ message: "Not authenticated" });
     }
 
-    const sessions = await getUserSessionsService(user._id);
+    const sessions = await getUserSessionsService(user.id);
 
-    return res.status(HTTPSTATUS.OK).json({
-      sessions: sessions.map((s) => ({
-        id: s._id,
-        userAgent: s.userAgent,
-        ipAddress: s.ipAddress,
-        createdAt: s.createdAt,
-      })),
-    });
+    return res.status(HTTPSTATUS.OK).json({ sessions });
   }
 );
 
@@ -302,7 +291,7 @@ export const resendVerificationEmailController = asyncHandler(
         .json({ message: "Not authenticated" });
     }
 
-    await requestEmailVerificationService(user._id.toString());
+    await requestEmailVerificationService(user.id);
 
     return res.status(HTTPSTATUS.OK).json({
       message: "Verification email sent.",
@@ -328,12 +317,7 @@ export const changePasswordController = asyncHandler(
       req.body
     );
 
-    await changePasswordService(
-      user._id.toString(),
-      req.session?._id?.toString(),
-      currentPassword,
-      newPassword
-    );
+    await changePasswordService(user.id, user.sessionId, currentPassword, newPassword);
 
     return res.status(HTTPSTATUS.OK).json({
       message:
@@ -358,7 +342,7 @@ export const revokeSessionController = asyncHandler(
 
     const sessionId = sessionIdSchema.parse(req.params.id);
 
-    await revokeSessionService(user._id.toString(), sessionId);
+    await revokeSessionService(user.id, sessionId);
 
     return res.status(HTTPSTATUS.OK).json({
       message: "Session revoked successfully.",

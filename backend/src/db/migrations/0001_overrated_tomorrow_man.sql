@@ -1,0 +1,1 @@
+ALTER TABLE "users" ADD CONSTRAINT "users_current_workspace_id_workspaces_id_fk" FOREIGN KEY ("current_workspace_id") REFERENCES "public"."workspaces"("id") ON DELETE set null ON UPDATE no action;

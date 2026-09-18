@@ -1,35 +1,44 @@
 import crypto from "crypto";
-import mongoose from "mongoose";
-import UserModel from "../models/user.model";
-import AccountModel from "../models/account.model";
-import WorkspaceModel from "../models/workspace.model";
-import RoleModel from "../models/roles-permission.model";
-import SessionModel from "../models/session.model";
-import MemberModel from "../models/member.model";
-import PasswordResetTokenModel from "../models/passwordResetToken.model";
-import EmailVerificationTokenModel from "../models/emailVerificationToken.model";
+import { eq, and } from "drizzle-orm";
+import { db } from "../db/client";
+import { users, accounts, workspaces, roles, workspaceMembers } from "../db/schema";
 import { Roles } from "../enums/role.enum";
-import { ProviderEnum } from "../enums/account-provider.enum";
 import {
   BadRequestException,
   NotFoundException,
   UnauthorizedException,
 } from "../utils/appError";
+import { compareValue, hashValue } from "../utils/bcrypt";
 import {
-  generateTokenPair,
-  verifyRefreshToken,
+  signJwtToken,
+  verifyJwtToken,
   calculateExpiryDate,
+  accessTokenSignOptions,
+  refreshTokenSignOptions,
 } from "../utils/jwt";
+import { generateInviteCode } from "../utils/uuid";
 import { config } from "../config/app.config";
 import {
   sendPasswordResetEmail,
   sendVerificationEmail,
 } from "../providers/email.provider";
 import { logger } from "../utils/logger";
-import { compareValue } from "../utils/bcrypt";
+import { findAccountByProviderService } from "./account.service";
+import {
+  createSession,
+  getSession,
+  rotateSessionToken,
+  invalidateSession,
+  invalidateAllSessionsForUser,
+  invalidateAllSessionsForUserExcept,
+  listSessionsForUser,
+} from "./redis/session.service";
+import { storeToken, consumeToken } from "./redis/token.service";
+
+type TokenPayload = { userId: string; sessionId: string };
 
 interface CreateSessionParams {
-  userId: mongoose.Types.ObjectId;
+  userId: string;
   userAgent?: string;
   ipAddress?: string;
 }
@@ -46,6 +55,11 @@ interface TokenPairWithSession {
 const hashToken = (rawToken: string): string =>
   crypto.createHash("sha256").update(rawToken).digest("hex");
 
+const ttlSecondsUntil = (expiresIn: string): number => {
+  const expiryDate = calculateExpiryDate(expiresIn);
+  return Math.max(1, Math.round((expiryDate.getTime() - Date.now()) / 1000));
+};
+
 // ============================================
 // SHARED: session + token creation
 // used by both email/password login and OAuth
@@ -56,31 +70,17 @@ export const createSessionService = async ({
   userAgent,
   ipAddress,
 }: CreateSessionParams): Promise<TokenPairWithSession> => {
-  // Constructed (not `.create()`d) so the session's _id - which the token
-  // payload has to carry - is available BEFORE the insert, letting the
-  // session and the hash of the refresh token it's bound to be written in a
-  // single round trip.
-  const session = new SessionModel({
-    userId,
-    userAgent,
-    ipAddress,
-    isValid: true,
-    expiresAt: calculateExpiryDate(config.JWT.REFRESH_TOKEN_EXPIRES_IN),
-  });
+  // A placeholder refresh-token hash is written first so the session id -
+  // which the token payload has to carry - exists before the real token can
+  // be signed, mirroring the Mongo original's construct-then-save shape.
+  const sessionId = await createSession({ userId, userAgent, ipAddress, refreshTokenHash: "" });
 
-  const { accessToken, refreshToken } = generateTokenPair(
-    userId,
-    session._id.toString()
-  );
+  const accessToken = signJwtToken<TokenPayload>({ userId, sessionId }, accessTokenSignOptions);
+  const refreshToken = signJwtToken<TokenPayload>({ userId, sessionId }, refreshTokenSignOptions);
 
-  session.refreshTokenHash = hashToken(refreshToken);
-  await session.save();
+  await rotateSessionToken(sessionId, hashToken(refreshToken));
 
-  return {
-    accessToken,
-    refreshToken,
-    sessionId: session._id.toString(),
-  };
+  return { accessToken, refreshToken, sessionId };
 };
 
 // ============================================
@@ -93,76 +93,53 @@ export const registerUserService = async (body: {
   password: string;
 }) => {
   const { email, name, password } = body;
-  const session = await mongoose.startSession();
 
-  try {
-    session.startTransaction();
-
-    const existingUser = await UserModel.findOne({ email }).session(session);
+  const { userId, workspaceId } = await db.transaction(async (tx) => {
+    const [existingUser] = await tx.select().from(users).where(eq(users.email, email));
     if (existingUser) {
       throw new BadRequestException("Email already exists");
     }
 
-    const user = new UserModel({ email, name, password });
-    await user.save({ session });
+    const passwordHash = await hashValue(password);
+    const [user] = await tx.insert(users).values({ email, name, passwordHash }).returning();
 
-    const account = new AccountModel({
-      userId: user._id,
-      provider: ProviderEnum.EMAIL,
-      providerId: email,
-    });
-    await account.save({ session });
+    await tx.insert(accounts).values({ userId: user.id, provider: "EMAIL", providerId: email });
 
-    const workspace = new WorkspaceModel({
-      name: "My Workspace",
-      description: `Workspace created for ${user.name}`,
-      owner: user._id,
-    });
-    await workspace.save({ session });
-
-    const ownerRole = await RoleModel.findOne({ name: Roles.OWNER }).session(
-      session
-    );
+    const [ownerRole] = await tx.select().from(roles).where(eq(roles.name, Roles.OWNER));
     if (!ownerRole) {
       throw new NotFoundException("Owner role not found");
     }
 
-    const member = new MemberModel({
-      userId: user._id,
-      workspaceId: workspace._id,
-      role: ownerRole._id,
-      joinedAt: new Date(),
-    });
-    await member.save({ session });
+    const [workspace] = await tx
+      .insert(workspaces)
+      .values({
+        name: "My Workspace",
+        description: `Workspace created for ${user.name}`,
+        ownerId: user.id,
+        inviteCode: generateInviteCode(),
+      })
+      .returning();
 
-    user.currentWorkspace = workspace._id as mongoose.Types.ObjectId;
-    await user.save({ session });
+    await tx.insert(workspaceMembers).values({ userId: user.id, workspaceId: workspace.id, roleId: ownerRole.id });
+    await tx.update(users).set({ currentWorkspaceId: workspace.id }).where(eq(users.id, user.id));
 
-    await session.commitTransaction();
+    return { userId: user.id, workspaceId: workspace.id };
+  });
 
-    // Best-effort, outside the transaction (it already committed - the
-    // account exists regardless of what happens here). A hiccup creating
-    // the verification token or sending the email must NOT turn into a
-    // registration failure; the user can always request a new one later.
-    try {
-      await requestEmailVerificationService(user._id.toString());
-    } catch (verificationError) {
-      logger.error(
-        { err: verificationError },
-        "Failed to send verification email during registration"
-      );
-    }
-
-    return {
-      userId: user._id,
-      workspaceId: workspace._id,
-    };
-  } catch (error) {
-    await session.abortTransaction();
-    throw error;
-  } finally {
-    session.endSession();
+  // Best-effort, outside the transaction (it already committed - the
+  // account exists regardless of what happens here). A hiccup creating the
+  // verification token or sending the email must NOT turn into a
+  // registration failure; the user can always request a new one later.
+  try {
+    await requestEmailVerificationService(userId);
+  } catch (verificationError) {
+    logger.error(
+      { err: verificationError },
+      "Failed to send verification email during registration"
+    );
   }
+
+  return { userId, workspaceId };
 };
 
 // ============================================
@@ -173,50 +150,41 @@ export const registerUserService = async (body: {
 // against on the "no such account" branch below purely to burn the same
 // ~bcrypt-cost-10 wall-clock time that a real wrong-password comparison
 // would, so the two branches aren't distinguishable by response latency.
-// Never rotate this per-request (that would defeat the point); it only
-// needs to be *a* valid bcrypt hash, not a secret.
 const DUMMY_PASSWORD_HASH =
   "$2b$10$uoY4NVy6Uns2Luc7jnt9P.hOJUVlz40gP0G0Aunbvk.3vZ3w642ei";
 
 export const verifyUserService = async ({
   email,
   password,
-  provider = ProviderEnum.EMAIL,
 }: {
   email: string;
   password: string;
-  provider?: string;
 }) => {
-  const account = await AccountModel.findOne({ provider, providerId: email });
+  const account = await findAccountByProviderService("EMAIL", email);
+
   // Same exception (401) and same message as the wrong-password branch
-  // below. A 404 here would have made the login endpoint an email
-  // enumeration oracle: identical text, different status code is still a
-  // distinguishable response. Same discipline as
-  // requestPasswordResetService, which is deliberately indistinguishable
-  // for a known vs unknown email.
-  //
-  // Status code and message alone aren't enough, though: a real
-  // comparePassword() call below runs a deliberately slow bcrypt compare,
-  // so skipping straight to the throw here would still leak "no such
-  // account" via response latency. Burn the same bcrypt cost against a
-  // dummy hash first so both branches take statistically indistinguishable
-  // time.
+  // below - a 404 here would make the login endpoint an email enumeration
+  // oracle. Burn the same bcrypt cost against a dummy hash first so both
+  // branches take statistically indistinguishable time.
   if (!account) {
     await compareValue(password, DUMMY_PASSWORD_HASH);
     throw new UnauthorizedException("Invalid email or password");
   }
 
-  const user = await UserModel.findById(account.userId);
+  const [user] = await db.select().from(users).where(eq(users.id, account.userId));
   if (!user) {
     throw new NotFoundException("User not found for the given account");
   }
 
-  const isMatch = await user.comparePassword(password);
+  const isMatch = user.passwordHash ? await compareValue(password, user.passwordHash) : false;
   if (!isMatch) {
     throw new UnauthorizedException("Invalid email or password");
   }
 
-  return user.omitPassword();
+  await db.update(users).set({ lastLogin: new Date() }).where(eq(users.id, user.id));
+
+  const { passwordHash: _passwordHash, ...safeUser } = user;
+  return safeUser;
 };
 
 // ============================================
@@ -224,108 +192,91 @@ export const verifyUserService = async ({
 // ============================================
 
 export const loginOrCreateAccountService = async (data: {
-  provider: string;
+  provider: "GOOGLE" | "GITHUB" | "FACEBOOK" | "EMAIL";
   displayName: string;
   providerId: string;
   picture?: string;
   email?: string;
   // Whether the IdP itself confirmed the user controls this email. Only
-  // gates auto-linking to a PRE-EXISTING account (see below) - a brand new
-  // account is always fine to create regardless.
+  // gates auto-linking to a PRE-EXISTING account - a brand new account is
+  // always fine to create regardless.
   emailVerified?: boolean;
 }) => {
-  const { providerId, provider, displayName, email, picture, emailVerified } =
-    data;
-  const session = await mongoose.startSession();
+  const { providerId, provider, displayName, email, picture, emailVerified } = data;
 
-  try {
-    session.startTransaction();
-
-    const account = await AccountModel.findOne({
-      provider,
-      providerId,
-    }).session(session);
-
-    let user;
+  const user = await db.transaction(async (tx) => {
+    const [account] = await tx
+      .select()
+      .from(accounts)
+      .where(and(eq(accounts.provider, provider), eq(accounts.providerId, providerId)));
 
     if (account) {
-      user = await UserModel.findById(account.userId).session(session);
-      if (!user) {
+      const [existingUser] = await tx.select().from(users).where(eq(users.id, account.userId));
+      if (!existingUser) {
         throw new Error("Account exists but user not found");
       }
-    } else {
-      user = await UserModel.findOne({ email }).session(session);
+      return existingUser;
+    }
 
-      if (user) {
-        // Auto-linking a new OAuth identity to a PRE-EXISTING account by
-        // email match. Without the IdP confirming it verified this email,
-        // we can't tell "this is genuinely the same person" from "someone
-        // registered an OAuth app / IdP account using someone else's
-        // email" - refuse rather than risk linking (and thus granting
-        // login access) to the wrong account.
-        if (!emailVerified) {
-          throw new UnauthorizedException(
-            "This email is already registered. Log in with your password, or verify this email with your provider first."
-          );
-        }
+    let user = email ? (await tx.select().from(users).where(eq(users.email, email)))[0] : undefined;
+
+    if (user) {
+      // Auto-linking a new OAuth identity to a PRE-EXISTING account by
+      // email match - without the IdP confirming it verified this email, we
+      // can't tell "this is genuinely the same person" from "someone
+      // registered using someone else's email," so refuse rather than risk
+      // linking (and thus granting login access) to the wrong account.
+      if (!emailVerified) {
+        throw new UnauthorizedException(
+          "This email is already registered. Log in with your password, or verify this email with your provider first."
+        );
+      }
+    }
+
+    if (!user) {
+      if (!email) {
+        throw new BadRequestException("Email is required to create an account");
       }
 
-      if (!user) {
-        user = new UserModel({
+      const [newUser] = await tx
+        .insert(users)
+        .values({
           email,
           name: displayName,
           profilePicture: picture || null,
-          // A brand new account, not a link to an existing one - safe to
-          // trust the IdP's verification status directly since there's no
-          // pre-existing identity being taken over.
           isEmailVerified: !!emailVerified,
-        });
-        await user.save({ session });
+        })
+        .returning();
+      user = newUser;
 
-        const workspace = new WorkspaceModel({
+      const [ownerRole] = await tx.select().from(roles).where(eq(roles.name, Roles.OWNER));
+      if (!ownerRole) {
+        throw new NotFoundException("Owner role not found");
+      }
+
+      const [workspace] = await tx
+        .insert(workspaces)
+        .values({
           name: "My Workspace",
           description: `Workspace created for ${user.name}`,
-          owner: user._id,
-        });
-        await workspace.save({ session });
+          ownerId: user.id,
+          inviteCode: generateInviteCode(),
+        })
+        .returning();
 
-        const ownerRole = await RoleModel.findOne({
-          name: Roles.OWNER,
-        }).session(session);
-        if (!ownerRole) {
-          throw new NotFoundException("Owner role not found");
-        }
-
-        const member = new MemberModel({
-          userId: user._id,
-          workspaceId: workspace._id,
-          role: ownerRole._id,
-          joinedAt: new Date(),
-        });
-        await member.save({ session });
-
-        user.currentWorkspace = workspace._id as mongoose.Types.ObjectId;
-        await user.save({ session });
-      }
-      // If user exists (email match), we don't create new workspace
-
-      // NOW: Create the OAuth account link
-      const newAccount = new AccountModel({
-        userId: user._id,
-        provider,
-        providerId,
-      });
-      await newAccount.save({ session });
+      await tx.insert(workspaceMembers).values({ userId: user.id, workspaceId: workspace.id, roleId: ownerRole.id });
+      await tx.update(users).set({ currentWorkspaceId: workspace.id }).where(eq(users.id, user.id));
+      user = { ...user, currentWorkspaceId: workspace.id };
+      // If user exists (email match), we don't create a new workspace.
     }
 
-    await session.commitTransaction();
-    return { user };
-  } catch (error) {
-    await session.abortTransaction();
-    throw error;
-  } finally {
-    session.endSession();
-  }
+    await tx.insert(accounts).values({ userId: user.id, provider, providerId });
+
+    return user;
+  });
+
+  const { passwordHash: _passwordHash, ...safeUser } = user;
+  return { user: safeUser };
 };
 
 // ============================================
@@ -335,99 +286,76 @@ export const loginOrCreateAccountService = async (data: {
 export const refreshAccessTokenService = async (
   refreshToken: string
 ): Promise<{ accessToken: string; refreshToken: string }> => {
-  const result = verifyRefreshToken(refreshToken);
+  const result = verifyJwtToken<TokenPayload>(refreshToken, refreshTokenSignOptions.secret);
   if (!result.valid) {
     throw new UnauthorizedException(result.error);
   }
 
   const { userId, sessionId } = result.payload;
 
-  const session = await SessionModel.findById(sessionId);
-  if (!session || !session.isValid) {
+  const session = await getSession(sessionId);
+  if (!session || session.isValid !== "1") {
     throw new UnauthorizedException("Session expired or invalid");
-  }
-
-  if (session.expiresAt < new Date()) {
-    await SessionModel.findByIdAndDelete(sessionId);
-    throw new UnauthorizedException("Session expired");
   }
 
   // Refresh tokens are single-use. A structurally valid token whose hash is
   // no longer the one this session is bound to has already been rotated
-  // away - which means two parties hold tokens for this session, i.e. one
-  // was stolen. Kill the session outright rather than just rejecting this
-  // one request, so the thief and the victim both have to re-authenticate.
-  //
-  // `refreshTokenHash` is optional purely for backwards compatibility with
-  // sessions issued before rotation existed - those are adopted on their
-  // first refresh instead of being force-logged-out.
-  if (
-    session.refreshTokenHash &&
-    session.refreshTokenHash !== hashToken(refreshToken)
-  ) {
-    await invalidateSessionService(sessionId);
-    throw new UnauthorizedException(
-      "Refresh token reuse detected. Please log in again."
-    );
+  // away - two parties hold tokens for this session, i.e. one was stolen.
+  // Kill the session outright rather than just rejecting this one request.
+  if (session.refreshTokenHash && session.refreshTokenHash !== hashToken(refreshToken)) {
+    await invalidateSession(sessionId, userId);
+    throw new UnauthorizedException("Refresh token reuse detected. Please log in again.");
   }
 
-  const tokens = generateTokenPair(userId, sessionId);
+  const accessToken = signJwtToken<TokenPayload>({ userId, sessionId }, accessTokenSignOptions);
+  const rotatedRefreshToken = signJwtToken<TokenPayload>({ userId, sessionId }, refreshTokenSignOptions);
 
-  // Rotate in place on the SAME session document: the session (and the entry
-  // the user sees in their device list) is continuous across refreshes -
-  // only the token bound to it changes.
-  session.refreshTokenHash = hashToken(tokens.refreshToken);
-  await session.save();
+  // Rotate in place on the SAME session: it (and the entry the user sees in
+  // their device list) is continuous across refreshes - only the token
+  // bound to it changes.
+  await rotateSessionToken(sessionId, hashToken(rotatedRefreshToken));
 
-  return { accessToken: tokens.accessToken, refreshToken: tokens.refreshToken };
+  return { accessToken, refreshToken: rotatedRefreshToken };
 };
 
 // ============================================
 // LOGOUT (single session / all sessions)
 // ============================================
 
-export const invalidateSessionService = async (
-  sessionId: string
-): Promise<void> => {
-  await SessionModel.findByIdAndUpdate(sessionId, { isValid: false });
+export const invalidateSessionService = async (sessionId: string, userId: string): Promise<void> => {
+  await invalidateSession(sessionId, userId);
 };
 
-export const invalidateAllSessionsService = async (
-  userId: mongoose.Types.ObjectId | string
-): Promise<void> => {
-  await SessionModel.updateMany({ userId }, { isValid: false });
+export const invalidateAllSessionsService = async (userId: string): Promise<void> => {
+  await invalidateAllSessionsForUser(userId);
+};
+
+export const logoutByRefreshTokenService = async (refreshToken: string): Promise<void> => {
+  const result = verifyJwtToken<TokenPayload>(refreshToken, refreshTokenSignOptions.secret);
+  if (!result.valid) return;
+  await invalidateSession(result.payload.sessionId, result.payload.userId);
 };
 
 // ============================================
 // SESSION LISTING (manage devices)
 // ============================================
 
-export const getUserSessionsService = async (
-  userId: mongoose.Types.ObjectId | string
-) => {
-  return SessionModel.find({
-    userId,
-    isValid: true,
-    expiresAt: { $gt: new Date() },
-  }).select("userAgent ipAddress createdAt");
-};
-
-// ============================================
-// USER LOOKUP
-// ============================================
-
-export const findUserByIdService = async (userId: string) => {
-  return UserModel.findById(userId, { password: false });
+export const getUserSessionsService = async (userId: string) => {
+  const sessions = await listSessionsForUser(userId);
+  return sessions.map((s) => ({
+    id: s.sessionId,
+    userAgent: s.userAgent,
+    ipAddress: s.ipAddress,
+    createdAt: s.createdAt,
+  }));
 };
 
 // ============================================
 // PASSWORD RESET
 // ============================================
 
-export const requestPasswordResetService = async (
-  email: string
-): Promise<void> => {
-  const user = await UserModel.findOne({ email });
+export const requestPasswordResetService = async (email: string): Promise<void> => {
+  const [user] = await db.select().from(users).where(eq(users.email, email));
 
   // Deliberately the same outcome (no error, no distinguishing response)
   // whether or not the account exists - an unauthenticated "does this email
@@ -436,62 +364,45 @@ export const requestPasswordResetService = async (
     return;
   }
 
-  // Only the newest reset link should work - drop any previously issued,
-  // still-valid ones for this user.
-  await PasswordResetTokenModel.deleteMany({ userId: user._id });
-
   const rawToken = crypto.randomBytes(32).toString("hex");
-
-  await PasswordResetTokenModel.create({
-    userId: user._id,
-    tokenHash: hashToken(rawToken),
-    expiresAt: calculateExpiryDate(config.PASSWORD_RESET_TOKEN_EXPIRES_IN),
-  });
+  await storeToken(
+    "pwreset",
+    hashToken(rawToken),
+    user.id,
+    ttlSecondsUntil(config.PASSWORD_RESET_TOKEN_EXPIRES_IN)
+  );
 
   const resetUrl = `${config.FRONTEND_PASSWORD_RESET_URL}?token=${rawToken}`;
   await sendPasswordResetEmail(user.email, resetUrl);
 };
 
-export const resetPasswordService = async (
-  rawToken: string,
-  newPassword: string
-): Promise<void> => {
-  const tokenHash = hashToken(rawToken);
-
-  const resetToken = await PasswordResetTokenModel.findOne({ tokenHash });
-  if (!resetToken) {
+export const resetPasswordService = async (rawToken: string, newPassword: string): Promise<void> => {
+  const userId = await consumeToken("pwreset", hashToken(rawToken));
+  if (!userId) {
     throw new UnauthorizedException("Invalid or expired reset token");
   }
 
-  if (resetToken.expiresAt < new Date()) {
-    await PasswordResetTokenModel.findByIdAndDelete(resetToken._id);
-    throw new UnauthorizedException("Invalid or expired reset token");
-  }
-
-  const user = await UserModel.findById(resetToken.userId);
+  const [user] = await db.select().from(users).where(eq(users.id, userId));
   if (!user) {
     throw new NotFoundException("User not found");
   }
 
-  user.password = newPassword; // pre-save hook (user.model.ts) re-hashes it
-  await user.save();
+  const passwordHash = await hashValue(newPassword);
+  await db.update(users).set({ passwordHash }).where(eq(users.id, userId));
 
   // Single-use: this token (and any siblings from a repeated forgot-password
-  // request) is now spent. A password change is also a standard trigger to
-  // invalidate existing sessions - if the account was compromised, this
-  // resets that too.
-  await PasswordResetTokenModel.deleteMany({ userId: user._id });
-  await invalidateAllSessionsService(user._id);
+  // request) is now spent via GETDEL. A password change is also a standard
+  // trigger to invalidate existing sessions - if the account was
+  // compromised, this resets that too.
+  await invalidateAllSessionsForUser(userId);
 };
 
 // ============================================
 // EMAIL VERIFICATION (advisory only - never gates login)
 // ============================================
 
-export const requestEmailVerificationService = async (
-  userId: string
-): Promise<void> => {
-  const user = await UserModel.findById(userId);
+export const requestEmailVerificationService = async (userId: string): Promise<void> => {
+  const [user] = await db.select().from(users).where(eq(users.id, userId));
   if (!user) {
     throw new NotFoundException("User not found");
   }
@@ -500,45 +411,25 @@ export const requestEmailVerificationService = async (
     throw new BadRequestException("Email is already verified");
   }
 
-  // Only the newest verification link should work.
-  await EmailVerificationTokenModel.deleteMany({ userId: user._id });
-
   const rawToken = crypto.randomBytes(32).toString("hex");
-
-  await EmailVerificationTokenModel.create({
-    userId: user._id,
-    tokenHash: hashToken(rawToken),
-    expiresAt: calculateExpiryDate(config.EMAIL_VERIFICATION_TOKEN_EXPIRES_IN),
-  });
+  await storeToken(
+    "emailverify",
+    hashToken(rawToken),
+    user.id,
+    ttlSecondsUntil(config.EMAIL_VERIFICATION_TOKEN_EXPIRES_IN)
+  );
 
   const verifyUrl = `${config.FRONTEND_EMAIL_VERIFICATION_URL}?token=${rawToken}`;
   await sendVerificationEmail(user.email, verifyUrl);
 };
 
 export const verifyEmailService = async (rawToken: string): Promise<void> => {
-  const tokenHash = hashToken(rawToken);
-
-  const verificationToken = await EmailVerificationTokenModel.findOne({
-    tokenHash,
-  });
-  if (!verificationToken) {
+  const userId = await consumeToken("emailverify", hashToken(rawToken));
+  if (!userId) {
     throw new UnauthorizedException("Invalid or expired verification token");
   }
 
-  if (verificationToken.expiresAt < new Date()) {
-    await EmailVerificationTokenModel.findByIdAndDelete(verificationToken._id);
-    throw new UnauthorizedException("Invalid or expired verification token");
-  }
-
-  const user = await UserModel.findById(verificationToken.userId);
-  if (!user) {
-    throw new NotFoundException("User not found");
-  }
-
-  user.isEmailVerified = true;
-  await user.save();
-
-  await EmailVerificationTokenModel.deleteMany({ userId: user._id });
+  await db.update(users).set({ isEmailVerified: true }).where(eq(users.id, userId));
 };
 
 // ============================================
@@ -551,31 +442,27 @@ export const changePasswordService = async (
   currentPassword: string,
   newPassword: string
 ): Promise<void> => {
-  const user = await UserModel.findById(userId);
+  const [user] = await db.select().from(users).where(eq(users.id, userId));
   if (!user) {
     throw new NotFoundException("User not found");
   }
 
-  const isMatch = await user.comparePassword(currentPassword);
+  const isMatch = user.passwordHash ? await compareValue(currentPassword, user.passwordHash) : false;
   if (!isMatch) {
     throw new UnauthorizedException("Current password is incorrect");
   }
 
-  user.password = newPassword; // pre-save hook (user.model.ts) re-hashes it
-  await user.save();
+  const passwordHash = await hashValue(newPassword);
+  await db.update(users).set({ passwordHash }).where(eq(users.id, userId));
 
-  // Invalidate every OTHER session - the caller just proved who they are
-  // (current password + an already-authenticated request), so their
-  // current device shouldn't be logged out as a side effect of changing
-  // their own password. Every other device should be, in case the
+  // Invalidate every OTHER session - the caller just proved who they are,
+  // so their current device shouldn't be logged out as a side effect of
+  // changing their own password. Every other device should be, in case the
   // password change was prompted by a suspected compromise.
   if (currentSessionId) {
-    await SessionModel.updateMany(
-      { userId: user._id, _id: { $ne: currentSessionId } },
-      { isValid: false }
-    );
+    await invalidateAllSessionsForUserExcept(userId, currentSessionId);
   } else {
-    await invalidateAllSessionsService(user._id);
+    await invalidateAllSessionsForUser(userId);
   }
 };
 
@@ -583,20 +470,53 @@ export const changePasswordService = async (
 // SESSION REVOCATION (single device)
 // ============================================
 
-export const revokeSessionService = async (
-  userId: string,
-  sessionId: string
-): Promise<void> => {
-  const session = await SessionModel.findById(sessionId);
+export const revokeSessionService = async (userId: string, sessionId: string): Promise<void> => {
+  const session = await getSession(sessionId);
   if (!session) {
     throw new NotFoundException("Session not found");
   }
 
-  if (session.userId.toString() !== userId.toString()) {
+  if (session.userId !== userId) {
     // Don't leak whether the session id exists at all to a caller who
     // doesn't own it - 404, not 403.
     throw new NotFoundException("Session not found");
   }
 
-  await invalidateSessionService(sessionId);
+  await invalidateSession(sessionId, userId);
+};
+
+// ============================================
+// AUTHENTICATION (used by the auth middleware)
+// ============================================
+
+export const authenticateAccessTokenService = async (
+  accessToken: string
+): Promise<{ userId: string; sessionId: string }> => {
+  const result = verifyJwtToken<TokenPayload>(accessToken, accessTokenSignOptions.secret);
+  if (!result.valid) {
+    throw new UnauthorizedException(result.error);
+  }
+
+  const { userId, sessionId } = result.payload;
+
+  const [user] = await db.select().from(users).where(eq(users.id, userId));
+  if (!user) {
+    throw new UnauthorizedException("User not found");
+  }
+  if (!user.isActive) {
+    throw new UnauthorizedException("User is not active");
+  }
+
+  const session = await getSession(sessionId);
+  if (!session) {
+    throw new UnauthorizedException("Session not found");
+  }
+  if (session.isValid !== "1") {
+    throw new UnauthorizedException("Session has been revoked");
+  }
+  if (session.userId !== userId) {
+    throw new UnauthorizedException("Invalid Session");
+  }
+
+  return { userId, sessionId };
 };

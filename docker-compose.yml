@@ -1,0 +1,31 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: astrix-postgres
+    environment:
+      POSTGRES_USER: astrix
+      POSTGRES_PASSWORD: astrix_dev_only
+      POSTGRES_DB: astrix
+    ports:
+      - "55432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U astrix -d astrix"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  redis:
+    image: redis:7
+    container_name: astrix-redis
+    ports:
+      - "63790:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  pgdata:

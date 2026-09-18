@@ -1,7 +1,5 @@
 import { z } from "zod";
-import { TaskPriorityEnum, TaskStatusEnum } from "../enums/task.enum";
-
-const objectIdRegex = /^[0-9a-fA-F]{24}$/;
+import { TaskPriorityEnum, TaskStatusEnum, TaskPriorityEnumType, TaskStatusEnumType } from "../enums/task.enum";
 
 export const titleSchema = z.string().trim().min(1).max(255);
 export const descriptionSchema = z.string().trim().optional();
@@ -9,16 +7,16 @@ export const descriptionSchema = z.string().trim().optional();
 export const assignedToSchema = z
   .string()
   .trim()
-  .regex(objectIdRegex, { message: "Invalid assignedTo user ID" })
+  .uuid({ message: "Invalid assignedTo user ID" })
   .nullable()
   .optional();
 
 export const prioritySchema = z.enum(
-  Object.values(TaskPriorityEnum) as [string, ...string[]]
+  Object.values(TaskPriorityEnum) as [TaskPriorityEnumType, ...TaskPriorityEnumType[]]
 );
 
 export const statusSchema = z.enum(
-  Object.values(TaskStatusEnum) as [string, ...string[]]
+  Object.values(TaskStatusEnum) as [TaskStatusEnumType, ...TaskStatusEnumType[]]
 );
 
 export const dueDateSchema = z
@@ -34,10 +32,7 @@ export const dueDateSchema = z
     }
   );
 
-export const taskIdSchema = z
-  .string()
-  .trim()
-  .regex(objectIdRegex, { message: "Invalid task ID" });
+export const taskIdSchema = z.string().trim().uuid({ message: "Invalid task ID" });
 
 export const createTaskSchema = z.object({
   title: titleSchema,
@@ -57,10 +52,6 @@ export const updateTaskSchema = z.object({
   dueDate: dueDateSchema,
 });
 
-// Query params bypassed Zod entirely before (hand-parsed in the controller
-// via parseInt(...) || default and ad-hoc .split(",")) - unlike every
-// request body in this codebase. This also caps pageSize, which was
-// previously unbounded.
 export const paginationQuerySchema = z.object({
   pageSize: z.coerce.number().int().min(1).max(100).optional().default(10),
   pageNumber: z.coerce.number().int().min(1).optional().default(1),
@@ -77,11 +68,7 @@ const commaSeparatedEnum = (allowedValues: readonly string[]) =>
     });
 
 export const taskFiltersQuerySchema = z.object({
-  projectId: z
-    .string()
-    .trim()
-    .regex(objectIdRegex, { message: "Invalid projectId" })
-    .optional(),
+  projectId: z.string().trim().uuid({ message: "Invalid projectId" }).optional(),
   status: commaSeparatedEnum(Object.values(TaskStatusEnum)),
   priority: commaSeparatedEnum(Object.values(TaskPriorityEnum)),
   assignedTo: z
@@ -89,7 +76,7 @@ export const taskFiltersQuerySchema = z.object({
     .trim()
     .optional()
     .transform((val) => (val ? val.split(",") : undefined))
-    .refine((arr) => !arr || arr.every((v) => objectIdRegex.test(v)), {
+    .refine((arr) => !arr || arr.every((v) => z.string().uuid().safeParse(v).success), {
       message: "assignedTo must be a comma-separated list of valid ids",
     }),
   keyword: z.string().trim().max(100).optional(),

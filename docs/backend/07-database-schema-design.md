@@ -2,900 +2,476 @@
 
 # Database Schema Design
 
-Every backend that talks to a database eventually has to answer one question: when two pieces of data are related, where does that relationship live? In a relational database the answer is mostly forced on you — foreign keys and normal forms are the water you swim in. In a document database like MongoDB, the answer is a design decision made fresh for every relationship, and getting it wrong doesn't throw a schema error — it just quietly costs you either extra round trips or duplicated, driftable data years later. This chapter surveys how that decision gets made in general, then maps AstriX's 10 Mongoose models field-by-field, index-by-index, hook-by-hook, to see exactly which way AstriX leaned and whether it leaned consistently.
+Every backend that talks to a database eventually has to answer one question: when two pieces of data are related, where does that relationship live? In a relational database the answer is mostly forced on you — foreign keys and normal forms are the water you swim in; the database itself refuses a write that violates the shape you declared. AstriX runs on PostgreSQL, via Drizzle ORM, and this chapter maps the seven real tables in `backend/src/db/schema.ts` field-by-field, index-by-index, constraint-by-constraint, against the ten Mongoose models this schema replaced during the project's MongoDB → Postgres+Redis migration (`backend/migrations/`). That migration is finished — the Mongoose models, and MongoDB itself, no longer exist in this codebase — but the *shape* of the old models is genuinely useful context for understanding *why* the relational schema was designed the way it was, so this chapter keeps that comparison where it earns its place rather than pretending the schema was designed in a vacuum.
 
 ---
 
 ## 1. The Landscape
 
-MongoDB stores JSON-like documents (BSON) grouped into collections, and — critically — it does not enforce a shape on those documents at the database engine level. Any two documents in the same collection can technically have completely different fields. That single fact is the root of every design choice in this section: the database itself will not stop you from embedding, referencing, or doing both inconsistently. The schema has to be enforced somewhere else, or not at all.
+### 1.1 What a relational schema forces you to decide upfront
 
-### (a) Heavy embedding
+Unlike a document database, where a collection can silently hold documents of different shapes, a Postgres table has one column set, enforced by the database engine itself — `CREATE TABLE` is a contract the database will not let you violate. That has real consequences for how a schema gets designed:
 
-Related data is nested directly as subdocuments *inside* the parent document, so a single `findOne` returns the whole graph in one read.
+- **Every relationship is either a foreign key or nothing at all.** There is no middle ground like a document database's "embed a slice of the related row for read convenience" — Postgres has no native concept of one row containing a copy-with-drift of another row's fields. If you want that tradeoff in Postgres, you build it yourself (a materialized view, an application-level cache, a denormalized column kept in sync by a trigger), and you own the staleness problem explicitly rather than inheriting it from the database's document model.
+- **Cardinality and ownership have to be decided before the first `INSERT`, not discovered from usage over time.** A one-to-many relationship needs a foreign key on the "many" side; a genuine many-to-many needs a join table. There's no schema-on-read escape hatch.
+- **The database enforces referential integrity for free, if you ask for it.** A foreign key with `ON DELETE CASCADE`/`SET NULL`/`RESTRICT` is checked by Postgres itself, atomically, as part of the statement that touches the parent row — not by application code remembering to clean up related rows in the right order.
 
-```js
-// A blog post with embedded comments - one document, one query
-{
-  _id: ObjectId("..."),
-  title: "Why MongoDB?",
-  body: "...",
-  comments: [
-    { author: "alice", text: "Great post!", postedAt: ISODate("...") },
-    { author: "bob", text: "Disagree.", postedAt: ISODate("...") }
-  ]
-}
-```
+### 1.2 Normalization, precisely — not just "avoid duplication"
 
-This is the pattern MongoDB's own marketing leans on hardest, and for read-heavy, rarely-updated-independently data it's genuinely excellent: one round trip, no join, the whole aggregate loads atomically. The costs are structural, not stylistic. MongoDB documents have a **hard 16MB size cap** — an array of comments that grows without bound (a popular post, an active thread) can hit that ceiling. And because the embedded copy is the *only* copy, if the same real-world entity needs to be embedded in more than one place (say, a user's name shown on every comment they've ever made), updating that entity means finding and rewriting every embedded copy — the classic **update anomaly** normalization was invented to avoid.
+Normalization is a formal hierarchy (1NF, 2NF, 3NF, BCNF...), but the practically useful version for this schema is:
 
-### (b) Heavy referencing
+- **1NF**: every column holds a single, atomic value. Postgres does allow array and JSONB columns as a deliberate escape hatch from strict 1NF — this schema uses exactly one array column (`roles.permissions`), for a specific, argued reason (§3.4).
+- **2NF/3NF, informally**: every non-key column depends on the whole primary key, and nothing but the primary key. Concretely: if a `task` row stored `projectName` alongside `projectId` "for convenience," that's denormalization — the fix is to keep only the foreign key and `JOIN` to `projects` at read time.
 
-Every relationship is instead a separate collection, linked by an `ObjectId`, and reassembled on read via a join-like operation — in Mongoose, `.populate()`.
+### 1.3 Index theory this schema actually leans on
 
-```js
-// Two collections, linked by ObjectId
-// posts collection
-{ _id: ObjectId("p1"), title: "Why MongoDB?", body: "..." }
-// comments collection
-{ _id: ObjectId("c1"), postId: ObjectId("p1"), author: "alice", text: "Great post!" }
-```
+Postgres's default index type (`CREATE INDEX`) is a B-tree. Two properties of B-trees drive every indexing decision in this schema:
 
-```js
-// Mongoose read - a real .populate() call, not from AstriX, illustrative only
-const post = await Post.findById(postId).populate("comments");
-```
+- A B-tree serves `=`, `<`, `<=`, `>`, `>=`, `BETWEEN`, and leftmost `LIKE 'prefix%'` — not `LIKE '%suffix'` or full-text search.
+- **Compound index column order is a leftmost-prefix rule.** An index on `(workspace_id, status)` serves lookups on `workspace_id` alone or `workspace_id + status` together, but not `status` alone. This is why `tasks` carries two separate compound indexes rather than one four-column index — the query shapes that actually run (`getAllTasksService`'s workspace+project filter, and its workspace+status filter) don't share a common column order.
 
-This is much closer to relational normalization: one source of truth per entity, no duplication, updates are a single-document write. The cost is the mirror image of embedding's benefit — reading the full graph now costs multiple round trips (or a `$lookup` aggregation stage doing the join server-side), and there is no cross-collection foreign-key *enforcement* the way a relational database would give you for free; a dangling reference (the referenced document was deleted) is silently possible unless the application layer guards against it.
-
-### (c) Hybrid / denormalized-with-duplication ("Extended Reference" / "Subset" pattern)
-
-A deliberate middle ground: keep the relationship as a reference, but duplicate a *small, rarely-changing slice* of the related document alongside it, specifically to avoid a join on a hot read path.
-
-```js
-// comments collection - author is referenced AND a slice is duplicated
-{
-  _id: ObjectId("c1"),
-  postId: ObjectId("p1"),
-  authorId: ObjectId("u1"),
-  authorDisplayName: "alice",   // duplicated - avoids a User lookup per comment render
-  authorAvatarUrl: "https://...",
-  text: "Great post!"
-}
-```
-
-This is a named pattern in MongoDB's own schema-design-pattern literature (sometimes called the **Extended Reference pattern** or the **Subset pattern**, depending on how much of the related document is duplicated). The tradeoff is explicit and has to be accepted consciously: the duplicated slice can go **stale** — if `alice` changes her display name, every comment she's ever posted now shows the old name until something re-syncs it (a background job, a write-time fan-out, or just "we accept staleness because display names rarely change and nobody notices for a day"). This is the right tool exactly when the duplicated data changes rarely and the join it avoids is on a genuinely hot path — not a default to reach for casually.
-
-### (d) Schema-on-read vs. schema-on-write
-
-This is a distinction worth being precise about, because it's easy to collapse into "MongoDB is schemaless" and stop thinking. **MongoDB the database is schema-on-read at the engine level** — it will accept a document with any shape into a collection; validation, if any, has to be either bolted on via MongoDB's own (optional, rarely used in practice) `$jsonSchema` collection validators, or — far more commonly in the Node ecosystem — enforced one layer up, in the application, before the document is ever sent to the driver. **Mongoose is that application-level layer.** A Mongoose `Schema` declares required fields, types, enums, defaults, and uniqueness constraints, and Mongoose validates against that declaration *before* issuing the write. So "this codebase uses MongoDB" does not imply "this codebase has no schema" — it means the schema enforcement moved from the database engine to the ODM. That has a real consequence: the schema is only as strong as Mongoose's validation path. A raw `db.collection.insertOne()` call bypassing Mongoose entirely (a migration script, a one-off admin query) can still write a document that violates the Mongoose schema, because the database itself never checked.
+An index makes writes marginally slower (every `INSERT`/`UPDATE` also updates every index on the table) to make specific reads much faster — every index in this schema exists because a real query in the service layer filters on exactly that column or column combination, not speculatively.
 
 ---
 
 ## 2. AstriX's Choice
 
-AstriX is **predominantly reference-based**: every one of its 10 models is registered as its own top-level Mongoose collection, and every relationship between them is an `ObjectId` with a `ref`, resolved via `.populate()` or a second query rather than embedding. Mongoose provides application-level schema-on-write validation on top of MongoDB's naturally schema-on-read engine — required fields, enums, uniqueness, and defaults are all declared in the ten schema files under `backend/src/models/` and enforced before any document is written.
+AstriX's schema is a **normalized relational model**: seven tables (`users`, `workspaces`, `roles`, `workspace_members`, `projects`, `tasks`, `accounts`), every relationship expressed as a foreign key, defined once in `backend/src/db/schema.ts` using Drizzle ORM's `pgTable` builder. Drizzle's schema file is simultaneously the source Drizzle-kit generates SQL migrations from and the source of every query's TypeScript types — there is exactly one place table shape is declared, not a schema file plus a separately-maintained set of hand-written types.
 
-That claim was checked, not assumed, against all ten files read in full below: **there are zero embedded subdocuments anywhere in the ten AstriX models.** No array of subdocuments, no nested object schema, nothing that would show up as pattern (a) from the landscape above. Every one-to-many and many-to-many relationship in the domain — a workspace's members, a project's tasks, a role's permissions-as-strings (not permission *documents*, see §3.6) — is modeled as a separate collection referencing back by `ObjectId`, or, in the one many-to-many case (`Member`), as its own join-table-shaped collection. This is a consistent architectural choice, not an accident of a few files happening to look that way.
+Every one of the ten Mongoose collections this replaced mapped onto either a table (`User`→`users`, `Workspace`→`workspaces`, `Role`→`roles`, `Member`→`workspace_members`, `Project`→`projects`, `Task`→`tasks`, `Account`→`accounts`) or moved to Redis entirely (`Session`, `PasswordResetToken`, `EmailVerificationToken` — all three were TTL-expiring, access-pattern-simple records, and Redis's native key TTL is a better mechanical fit than a Postgres row with an `expires_at` column and no built-in sweep; see [`03-middleware-and-request-pipeline.md`](./03-middleware-and-request-pipeline.md) and the session/token services under `backend/src/services/redis/` for that half of the system — deliberately out of this chapter's scope, since none of it is a Postgres table).
 
 ---
 
 ## 3. AstriX Implementation
 
-All ten models live in `backend/src/models/`. Each is covered in full below — every field, every index, every hook and method actually present in the file.
+All seven tables live in `backend/src/db/schema.ts`. Every field, enum, index, and foreign key below is read directly from that file — nothing paraphrased.
 
-### 3.1 `User` — the identity root
+### 3.1 Enums
 
-`User` is the most-referenced model in the system: `Account`, `Session`, `Member`, `Project`, `Task`, `PasswordResetToken`, and `EmailVerificationToken` all point back to it.
+Postgres native enums (`CREATE TYPE ... AS ENUM`), not `TEXT` + `CHECK`, back every fixed-value column in this schema:
 
 ```ts
-// backend/src/models/user.model.ts:1-73
-import mongoose, { Document, Schema } from "mongoose";
-import { compareValue, hashValue } from "../utils/bcrypt";
+export const roleNameEnum = pgEnum("role_name", ["OWNER", "ADMIN", "MEMBER"]);
 
-export interface UserDocument extends Document {
-  name: string;
-  email: string;
-  password?: string;
-  profilePicture: string | null;
-  isActive: boolean;
-  // Advisory only - never gates login (see PLAN.md §3). Set true immediately
-  // for OAuth signups whose provider already confirmed the email.
-  isEmailVerified: boolean;
-  lastLogin: Date | null;
-  createdAt: Date;
-  updatedAt: Date;
-  currentWorkspace: mongoose.Types.ObjectId | null;
-  comparePassword(value: string): Promise<boolean>;
-  omitPassword(): Omit<UserDocument, "password">;
-}
+export const permissionEnum = pgEnum("permission", [
+  "CREATE_WORKSPACE", "DELETE_WORKSPACE", "EDIT_WORKSPACE", "MANAGE_WORKSPACE_SETTINGS",
+  "ADD_MEMBER", "CHANGE_MEMBER_ROLE", "REMOVE_MEMBER",
+  "CREATE_PROJECT", "EDIT_PROJECT", "DELETE_PROJECT",
+  "CREATE_TASK", "EDIT_TASK", "DELETE_TASK",
+  "VIEW_ONLY",
+]);
 
-const userSchema = new Schema<UserDocument>(
-  {
-    name: {
-      type: String,
-      required: false,
-      trim: true,
-    },
-    email: {
-      type: String,
-      required: true,
-      unique: true,
-      trim: true,
-      lowercase: true,
-    },
-    password: { type: String, select: true },
-    profilePicture: {
-      type: String,
-      default: null,
-    },
-    currentWorkspace: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: "Workspace",
-    },
-    isActive: { type: Boolean, default: true },
-    isEmailVerified: { type: Boolean, default: false },
-    lastLogin: { type: Date, default: null },
-  },
-  {
-    timestamps: true,
-  }
-);
+export const taskStatusEnum = pgEnum("task_status", [
+  "BACKLOG", "TODO", "IN_PROGRESS", "IN_REVIEW", "DONE",
+]);
 
-userSchema.pre("save", async function (next) {
-  if (this.isModified("password")) {
-    if (this.password) {
-      this.password = await hashValue(this.password);
-    }
-  }
-  next();
+export const taskPriorityEnum = pgEnum("task_priority", ["LOW", "MEDIUM", "HIGH"]);
+
+export const oauthProviderEnum = pgEnum("oauth_provider", ["GOOGLE", "GITHUB", "FACEBOOK", "EMAIL"]);
+```
+
+Native Postgres enums are stored as 4-byte values internally and self-document valid values in `\d` / `information_schema` — the closest relational equivalent to what the old Mongoose schemas expressed with `enum: Object.values(Roles)`-style field options. The one real tradeoff: adding a new enum value later requires `ALTER TYPE ... ADD VALUE`, a genuine (if minor, in modern Postgres) migration-discipline cost compared to a `TEXT` column — accepted here because every one of these five value sets is small and driven by a hardcoded TypeScript constant (`RolePermissions` in `utils/role-permission.ts`, the `Roles`/task enums in `enums/`), not user input, so churn is rare by construction.
+
+### 3.2 `users`
+
+```ts
+export const users = pgTable("users", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  name: text("name"),
+  email: text("email").notNull(),
+  passwordHash: text("password_hash"),
+  profilePicture: text("profile_picture"),
+  isActive: boolean("is_active").notNull().default(true),
+  isEmailVerified: boolean("is_email_verified").notNull().default(false),
+  lastLogin: timestamp("last_login", { withTimezone: true }),
+  currentWorkspaceId: uuid("current_workspace_id").references(
+    (): AnyPgColumn => workspaces.id,
+    { onDelete: "set null" }
+  ),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => ({
+  emailIdx: uniqueIndex("users_email_idx").on(t.email),
+}));
+```
+
+| Column | Type | Nullable | Notes |
+|---|---|---|---|
+| `id` | `uuid` | no (PK) | `gen_random_uuid()` default |
+| `name` | `text` | yes | |
+| `email` | `text` | no | unique via `users_email_idx` |
+| `password_hash` | `text` | yes | null for OAuth-only accounts |
+| `profile_picture` | `text` | yes | |
+| `is_active` | `boolean` | no | default `true` |
+| `is_email_verified` | `boolean` | no | default `false`, advisory only, never gates login |
+| `last_login` | `timestamptz` | yes | |
+| `current_workspace_id` | `uuid` | yes | FK → `workspaces.id`, `ON DELETE SET NULL` |
+| `created_at` / `updated_at` | `timestamptz` | no | default `now()` |
+
+**Naming convention, stated once here, holding for every table below:** Drizzle column definitions are camelCase TypeScript identifiers (`passwordHash`, `currentWorkspaceId`) mapped to snake_case Postgres column names via each builder's explicit string argument (`text("password_hash")`) — you write idiomatic TypeScript at the call site, the database gets idiomatic SQL naming. This is Drizzle's convention throughout the schema, not a per-table choice.
+
+**Decisions worth understanding against the old model, not just copying:**
+
+- **`password_hash` (was Mongoose's `password`, with `select: true`).** The rename says what the column actually stores. There is no Postgres/Drizzle equivalent of Mongoose's field-level `select: true`/`select: false` — every service that reads `users` explicitly lists the columns it wants (`getUserByIdService` in `backend/src/services/user.service.ts` never includes `passwordHash` in its column list; `verifyUserService` in `auth.service.ts` is one of the few call sites that does, because it needs to compare against it). This is arguably a strict improvement over the old `select: true`/`select: false` split: an explicit column list is visible at every call site in a code review, where a schema-level `select` flag is invisible unless you already know to check the model file.
+- **No password-hashing hook.** Mongoose's `pre("save")` middleware hashed `password` automatically whenever it changed. Postgres/Drizzle has no document lifecycle hooks — hashing happens explicitly in the service layer (`hashValue(password)` in `auth.service.ts`'s `registerUserService`, before the `INSERT`) rather than implicitly on save. This is more visible, at the cost of being one more thing a new call site has to remember to do correctly.
+- **`TIMESTAMPTZ`, never bare `TIMESTAMP`.** Every timestamp column in this schema is `timestamp(..., { withTimezone: true })`. A bare `TIMESTAMP` stores a naive wall-clock value with no timezone awareness — a real, common Postgres footgun once application, database, and any client aren't all in the same timezone. `TIMESTAMPTZ` stores UTC internally and converts on display, matching the timezone-aware-by-construction behavior JavaScript's `Date` (and therefore Mongoose's `Date` type) already had.
+- **`updated_at` has no automatic-update mechanism at the database level.** Mongoose's `{ timestamps: true }` schema option updated `updatedAt` automatically on every `.save()`/update call. This schema has no equivalent trigger — every service that mutates a row and wants `updatedAt` to reflect that sets it explicitly (`updatedAt: new Date()` appears in `updateTaskService`, `updateWorkspaceByIdService`, `updateProfileService`, and others). This is a real, deliberate simplicity tradeoff over adding a Postgres `BEFORE UPDATE` trigger: one line at each write call site versus one trigger function shared across every table — reasonable at this table count, worth revisiting if a future table update path is added and someone forgets the line.
+- **The circular reference: `users.current_workspace_id` ↔ `workspaces.owner_id`.** `users.currentWorkspaceId` points at a workspace; every `workspaces.ownerId` points at a user. Neither table can be declared "first" in the file if both FKs are meant to exist at once. The schema resolves this with Drizzle's documented pattern for mutually-referencing tables: `currentWorkspaceId` is declared with a thunk, `.references((): AnyPgColumn => workspaces.id, { onDelete: "set null" })`, evaluated lazily rather than at module-evaluation time, with an explicit `AnyPgColumn` return-type annotation. The annotation isn't cosmetic — TypeScript's inference genuinely cannot resolve the return type of a function referencing a not-yet-declared `const` inside its own initializer (`TS7022`/`TS7024` under `ts-node`'s real type-checker, even though it silently passes under `tsx`'s type-stripping-only compiler), so the annotation is required, not stylistic. Both nullable FK columns exist so a user or workspace row can be inserted with the reference left `NULL` and backfilled once both sides exist — which is exactly what application code does anyway: `registerUserService` creates the user row before the workspace exists, then updates `currentWorkspaceId` once it does, all inside one transaction (§3.9 in [`08-database-queries-and-transactions.md`](./08-database-queries-and-transactions.md)).
+
+### 3.3 `workspaces`
+
+```ts
+export const workspaces = pgTable("workspaces", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  name: text("name").notNull(),
+  description: text("description"),
+  ownerId: uuid("owner_id").notNull().references((): AnyPgColumn => users.id),
+  inviteCode: text("invite_code").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 });
-
-userSchema.methods.omitPassword = function (): Omit<UserDocument, "password"> {
-  const userObject = this.toObject();
-  delete userObject.password;
-  return userObject;
-};
-
-userSchema.methods.comparePassword = async function (value: string) {
-  return compareValue(value, this.password);
-};
-
-const UserModel = mongoose.model<UserDocument>("User", userSchema);
-export default UserModel;
 ```
 
-Notable points, all verified against the file above:
-- **`password` is optional and not marked `select: false`.** OAuth-only users have no password at all (`password?: string`), and — a detail worth flagging now and returning to in §6 — the schema option is `select: true`, meaning a plain `UserModel.findById(...)` **returns the password hash by default**, unlike the common Mongoose convention of `select: false` on sensitive fields.
-- **The password-hashing hook** runs on every `save()` where `password` was modified — not on `updateOne`/`findOneAndUpdate`, which bypass document middleware entirely (relevant if any future code path ever updates a password via those instead of loading-then-saving the document).
-- **`currentWorkspace`** is a nullable `ObjectId` reference to `Workspace` — the *only* field on `User` that points somewhere else; everything else on `User` is scalar.
-- Two instance methods exist: `comparePassword` (bcrypt compare, delegated to `utils/bcrypt.ts`) and `omitPassword` (a manual, load-then-strip pattern — see §6 for why this matters).
+| Column | Type | Nullable | Notes |
+|---|---|---|---|
+| `id` | `uuid` | no (PK) | |
+| `name` | `text` | no | |
+| `description` | `text` | yes | |
+| `owner_id` | `uuid` | no | FK → `users.id`, no `ON DELETE` clause |
+| `invite_code` | `text` | no | unique in practice (application-generated, checked at lookup time) |
+| `created_at` / `updated_at` | `timestamptz` | no | default `now()` |
 
-### 3.2 `Workspace` — the tenancy boundary
+**`owner_id`'s FK has no `ON DELETE` clause**, which defaults to Postgres's `NO ACTION` (behaving like `RESTRICT` for an immediate-mode constraint): **Postgres will refuse to delete a user who still owns a workspace.** This is a deliberate integrity rule, not an oversight — it forces the application to explicitly transfer ownership or delete the workspace first, which `deleteAccountService` in `backend/src/services/user.service.ts` already does by hand (it checks for owned workspaces and throws a `BadRequestException` before ever attempting the delete), but the constraint now makes it *impossible* to skip that check via some future code path that forgets to. The old Mongoose `Workspace.owner` field had no such enforcement — a `User.deleteOne()` call bypassing the service layer's own check (a migration script, a one-off admin query) could have silently orphaned a workspace; the FK closes that gap at the database layer regardless of which code path issues the delete.
+
+### 3.4 `roles`
 
 ```ts
-// backend/src/models/workspace.model.ts:1-45
-import mongoose, { Document, Schema } from "mongoose";
-import { generateInviteCode } from "../utils/uuid";
-
-export interface WorkspaceDocument extends Document {
-  name: string;
-  description: string;
-  owner: mongoose.Types.ObjectId;
-  inviteCode: string;
-  createdAt: string;
-  updatedAt: string;
-  resetInviteCode(): void;
-}
-
-const workspaceSchema = new Schema<WorkspaceDocument>(
-  {
-    name: { type: String, required: true, trim: true },
-    description: { type: String, required: false },
-    owner: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: "User", // Reference to User model (the workspace creator)
-      required: true,
-    },
-    inviteCode: {
-      type: String,
-      required: true,
-      unique: true,
-      default: generateInviteCode,
-    },
-  },
-  {
-    timestamps: true,
-  }
-);
-
-workspaceSchema.methods.resetInviteCode = function () {
-  this.inviteCode = generateInviteCode();
-};
-
-const WorkspaceModel = mongoose.model<WorkspaceDocument>(
-  "Workspace",
-  workspaceSchema
-);
-
-export default WorkspaceModel;
+export const roles = pgTable("roles", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  name: roleNameEnum("name").notNull(),
+  permissions: permissionEnum("permissions").array().notNull().default([]),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => ({
+  nameIdx: uniqueIndex("roles_name_idx").on(t.name),
+}));
 ```
 
-`owner` is a single `ObjectId` reference to `User` — a workspace has exactly one owner (membership for everyone else, owner included, is tracked separately by `Member`, §3.3). `inviteCode` is `unique` and auto-generated at creation via `generateInviteCode()`; `resetInviteCode()` is an instance method that mutates the in-memory document (the caller is still responsible for calling `.save()` — this method does not persist on its own, it only reassigns the field).
+| Column | Type | Nullable | Notes |
+|---|---|---|---|
+| `id` | `uuid` | no (PK) | |
+| `name` | `role_name` enum | no | unique via `roles_name_idx` |
+| `permissions` | `permission[]` | no | default `{}` |
+| `created_at` / `updated_at` | `timestamptz` | no | |
 
-### 3.3 `Member` — the Workspace↔User↔Role join
+**Why `permission[]` (a native Postgres array column) instead of a `role_permissions` join table** — this is a genuine modeling decision, not a default reached for casually, and it's worth stating the argument precisely because it's the one place this schema deliberately steps outside strict 1NF. A join table would be the "textbook normalized" answer for a many-to-many relationship between roles and permissions. But this data has three properties that make the array-column escape hatch the better call: the permission set per role rarely changes (it's driven by a hardcoded `RolePermissions` map in `utils/role-permission.ts`, not user input); nothing in the application ever needs to query "which roles have permission X" — permission checks only ever run in the other direction (given a role, what can it do, checked as `permissions.includes(requiredPermission)` after fetching one role row); and normalizing it into a join table would model for a query pattern (`WHERE permission = X`) that doesn't exist anywhere in the codebase. `workspace_members` (§3.5) is the genuine many-to-many in this schema, and it *is* a real join table — the contrast is the point: reach for a join table when bidirectional querying is real, reach for an array column when it isn't and the array is small and low-churn.
 
-This is the one genuinely many-to-many relationship in the schema: a `User` can belong to many `Workspace`s, a `Workspace` has many `User`s, and `Member` is the join collection that also carries the per-membership `Role`.
+The old Mongoose `Role.permissions` was `[String]` with an `enum` field-option — an array of plain scalar strings, not a set of references to any `Permission` collection, because no such collection ever existed. `permission[]` is the direct, honest port of that same shape into Postgres, with the database now also enforcing (via the `permission` enum type) that every array element is one of the fourteen valid permission strings — something Mongoose's `enum` option checked at the application layer, MongoDB itself never did.
+
+### 3.5 `workspace_members` — the one genuine many-to-many
 
 ```ts
-// backend/src/models/member.model.ts:1-45
-import mongoose, { Document, Schema } from "mongoose";
-import { RoleDocument } from "./roles-permission.model";
-
-export interface MemberDocument extends Document {
-  userId: mongoose.Types.ObjectId;
-  workspaceId: mongoose.Types.ObjectId;
-  role: RoleDocument;
-  joinedAt: Date;
-}
-
-const memberSchema = new Schema<MemberDocument>(
-  {
-    userId: {
-      type: Schema.Types.ObjectId,
-      ref: "User",
-      required: true,
-    },
-    workspaceId: {
-      type: Schema.Types.ObjectId,
-      ref: "Workspace",
-      required: true,
-    },
-    role: {
-      type: Schema.Types.ObjectId,
-      ref: "Role",
-      required: true,
-    },
-    joinedAt: {
-      type: Date,
-      default: Date.now,
-    },
-  },
-  {
-    timestamps: true,
-  }
-);
-
-// A user can only hold one membership per workspace. Without this, a race
-// between two concurrent "join workspace" requests (check-then-insert, no
-// natural atomicity) can create duplicate Member rows for the same pair.
-memberSchema.index({ userId: 1, workspaceId: 1 }, { unique: true });
-
-const MemberModel = mongoose.model<MemberDocument>("Member", memberSchema);
-export default MemberModel;
+export const workspaceMembers = pgTable("workspace_members", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  userId: uuid("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id, { onDelete: "cascade" }),
+  roleId: uuid("role_id").notNull().references(() => roles.id),
+  joinedAt: timestamp("joined_at", { withTimezone: true }).notNull().defaultNow(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => ({
+  userWorkspaceUnique: uniqueIndex("workspace_members_user_workspace_unique").on(t.userId, t.workspaceId),
+  workspaceIdx: index("workspace_members_workspace_id_idx").on(t.workspaceId),
+}));
 ```
 
-Three `ObjectId` references live on this one document (`userId` → `User`, `workspaceId` → `Workspace`, `role` → `Role`), which is exactly the shape of a classic relational join table translated into document form — nothing embedded, every edge is a reference. The compound unique index `{ userId: 1, workspaceId: 1 }` is the data-integrity backstop: it's what actually prevents a user from acquiring two memberships (possibly with two different roles) in the same workspace under concurrent requests, since Mongoose-level `findOne`-then-`create` application logic can't be atomic on its own.
+| Column | Type | Nullable | Notes |
+|---|---|---|---|
+| `id` | `uuid` | no (PK) | |
+| `user_id` | `uuid` | no | FK → `users.id`, `ON DELETE CASCADE` |
+| `workspace_id` | `uuid` | no | FK → `workspaces.id`, `ON DELETE CASCADE` |
+| `role_id` | `uuid` | no | FK → `roles.id`, no cascade |
+| `joined_at` | `timestamptz` | no | default `now()` |
+| `created_at` / `updated_at` | `timestamptz` | no | |
 
-### 3.4 `Role` — permissions as an embedded array of strings, not subdocuments
+Two indexes back two distinct real query shapes: `workspace_members_user_workspace_unique` — a **named, compound unique constraint** on `(user_id, workspace_id)` — is both the integrity rule ("a user can only hold one membership per workspace") and, because it's a real Postgres constraint rather than just an index, the target of an `ON CONFLICT (user_id, workspace_id) DO NOTHING`-shaped upsert if a future join-workspace path wants one; `workspace_members_workspace_id_idx` backs "list all members of this workspace," the read `getWorkspaceMembersService` issues on every workspace-members-page load.
+
+This directly replaces the old Mongoose `Member` collection's `{ userId: 1, workspaceId: 1 }` compound unique index — same integrity rule, same reasoning, now enforced as a named SQL constraint instead of a Mongoose schema index option. `joinWorkspaceByInviteService` in `backend/src/services/member.service.ts` still does an explicit pre-check-then-insert (not a raw `ON CONFLICT DO NOTHING`), but catches Postgres's `23505` unique-violation error code as the actual race guard against a concurrent duplicate join — the same reliance on the database-level constraint as the ultimate backstop that the old Mongoose code had, just surfaced as a Postgres error code instead of a MongoDB `E11000`.
+
+**Both FKs cascade (`ON DELETE CASCADE`)**: deleting a user removes their memberships everywhere; deleting a workspace removes every membership in it. This directly replaces manual cleanup code the old `deleteWorkspaceService`/`deleteAccountService` had to perform by hand (`MemberModel.deleteMany({...})`) — Postgres now does it atomically, as part of the same statement that deletes the parent row, with no possibility of "deleted the workspace but forgot to delete its members," a bug class that was structurally possible in the old code any time a new delete path was added and its author forgot the manual cleanup call.
+
+### 3.6 `projects`
 
 ```ts
-// backend/src/models/roles-permission.model.ts:1-38
-import mongoose, { Schema, Document } from "mongoose";
-import {
-  Permissions,
-  PermissionType,
-  Roles,
-  RoleType,
-} from "../enums/role.enum";
-import { RolePermissions } from "../utils/role-permission";
-
-export interface RoleDocument extends Document {
-  name: RoleType;
-  permissions: Array<PermissionType>;
-}
-
-const roleSchema = new Schema<RoleDocument>(
-  {
-    name: {
-      type: String,
-      enum: Object.values(Roles),
-      required: true,
-      unique: true,
-    },
-    permissions: {
-      type: [String],
-      enum: Object.values(Permissions),
-      required: true,
-      default: function (this: RoleDocument) {
-        return RolePermissions[this.name];
-      },
-    },
-  },
-  {
-    timestamps: true,
-  }
-);
-
-const RoleModel = mongoose.model<RoleDocument>("Role", roleSchema);
-export default RoleModel;
+export const projects = pgTable("projects", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  name: text("name").notNull(),
+  description: text("description"),
+  emoji: text("emoji").notNull().default("📊"),
+  workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id, { onDelete: "cascade" }),
+  createdBy: uuid("created_by").notNull().references(() => users.id),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => ({
+  workspaceIdx: index("projects_workspace_id_idx").on(t.workspaceId),
+}));
 ```
 
-This is worth calling out precisely because it's the closest thing in AstriX to an embedding decision, and it's easy to misclassify. `permissions` is `[String]` — an **array of plain enum strings**, not an array of subdocuments and not a set of references to some hypothetical `Permission` collection. There is no `Permission` model at all; `Permissions` (capitalized enum object, in `enums/role.enum.ts`) is a compile-time TypeScript constant, and `RolePermissions` (in `utils/role-permission.ts`) is a plain object mapping each `RoleType` to its default `PermissionType[]`:
+| Column | Type | Nullable | Notes |
+|---|---|---|---|
+| `id` | `uuid` | no (PK) | |
+| `name` | `text` | no | |
+| `description` | `text` | yes | |
+| `emoji` | `text` | no | default `"📊"` |
+| `workspace_id` | `uuid` | no | FK → `workspaces.id`, `ON DELETE CASCADE` |
+| `created_by` | `uuid` | no | FK → `users.id`, no cascade |
+| `created_at` / `updated_at` | `timestamptz` | no | |
+
+One index, `projects_workspace_id_idx`, backs `getProjectsInWorkspaceService`'s workspace-scoped, paginated listing — a direct port of the old `Project` model's `projectSchema.index({ workspace: 1 })`, same query shape, same B-tree index, just SQL syntax. `workspace_id ON DELETE CASCADE` means deleting a workspace removes its projects automatically; `created_by` deliberately does not cascade (deleting a user doesn't retroactively delete every project they created — a project's ownership history stays intact even if its creator's account is later removed via the workspace-transfer path, though in practice `deleteAccountService`'s owned-workspace check means this case is rare in the current flows).
+
+### 3.7 `tasks`
 
 ```ts
-// backend/src/utils/role-permission.ts:1-8 (excerpt)
-import { Permissions, PermissionType, RoleType } from "../enums/role.enum";
-
-export const RolePermissions: Record<RoleType, Array<PermissionType>> = {
-  OWNER: [
-    Permissions.CREATE_WORKSPACE,
-    Permissions.EDIT_WORKSPACE,
-    Permissions.DELETE_WORKSPACE,
-    Permissions.MANAGE_WORKSPACE_SETTINGS,
-    // ... ADD_MEMBER, CHANGE_MEMBER_ROLE, REMOVE_MEMBER, CREATE_PROJECT,
-    // EDIT_PROJECT, DELETE_PROJECT, CREATE_TASK, EDIT_TASK, DELETE_TASK,
-    // VIEW_ONLY
-  ],
-  // ADMIN and MEMBER get smaller, hand-authored subsets
-};
+export const tasks = pgTable("tasks", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  taskCode: text("task_code").notNull(),
+  title: text("title").notNull(),
+  description: text("description"),
+  projectId: uuid("project_id").notNull().references(() => projects.id, { onDelete: "cascade" }),
+  workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id, { onDelete: "cascade" }),
+  status: taskStatusEnum("status").notNull().default("TODO"),
+  priority: taskPriorityEnum("priority").notNull().default("MEDIUM"),
+  assignedTo: uuid("assigned_to").references(() => users.id, { onDelete: "set null" }),
+  createdBy: uuid("created_by").notNull().references(() => users.id),
+  dueDate: timestamp("due_date", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => ({
+  workspaceProjectIdx: index("tasks_workspace_project_idx").on(t.workspaceId, t.projectId),
+  workspaceStatusIdx: index("tasks_workspace_status_idx").on(t.workspaceId, t.status),
+  assignedToIdx: index("tasks_assigned_to_idx").on(t.assignedTo),
+}));
 ```
 
-So "permissions" in AstriX are not a modeled entity at all — they're an enum whose values happen to be stored, per role, as a string array on the `Role` document, with `RolePermissions` supplying the default set at document-creation time via a Mongoose `default` function that closes over `this.name`. `name` itself is `unique` — there is exactly one `Role` document per `RoleType` (`OWNER`, `ADMIN`, `MEMBER`) in the whole database, seeded once (see `seeders/`) and referenced by every `Member`.
+| Column | Type | Nullable | Notes |
+|---|---|---|---|
+| `id` | `uuid` | no (PK) | |
+| `task_code` | `text` | no | unique in practice, application-generated |
+| `title` | `text` | no | |
+| `description` | `text` | yes | |
+| `project_id` | `uuid` | no | FK → `projects.id`, `ON DELETE CASCADE` |
+| `workspace_id` | `uuid` | no | FK → `workspaces.id`, `ON DELETE CASCADE` |
+| `status` | `task_status` enum | no | default `"TODO"` — `BACKLOG`\|`TODO`\|`IN_PROGRESS`\|`IN_REVIEW`\|`DONE` |
+| `priority` | `task_priority` enum | no | default `"MEDIUM"` — `LOW`\|`MEDIUM`\|`HIGH` |
+| `assigned_to` | `uuid` | yes | FK → `users.id`, `ON DELETE SET NULL` |
+| `created_by` | `uuid` | no | FK → `users.id`, no cascade |
+| `due_date` | `timestamptz` | yes | |
+| `created_at` / `updated_at` | `timestamptz` | no | |
 
-### 3.5 `Project`
+`tasks` is the most heavily-referenced-out table in the schema — it points at `projects`, `workspaces`, and two separate `users` rows (`assignedTo`, nullable, and `createdBy`, required). `task_code` stays **application-generated**, same as the old model's `generateTaskCode` default function — Postgres has no direct equivalent to a Mongoose schema-level `default: someFunction`, so unique task-code generation is explicit code in the insert path (`createTaskService` in `backend/src/services/task.service.ts` takes `taskCode` as a parameter rather than computing a database-side default).
+
+Three indexes back three real, distinct list-query shapes `getAllTasksService` issues, all direct ports of the old Task model's three indexes:
+
+- `tasks_workspace_project_idx` on `(workspace_id, project_id)` — filtering a workspace's tasks by project.
+- `tasks_workspace_status_idx` on `(workspace_id, status)` — filtering a workspace's tasks by status (board columns).
+- `tasks_assigned_to_idx` on `assigned_to` alone — "my tasks" style queries.
+
+`assigned_to ... ON DELETE SET NULL` matches the field's nullable semantics exactly: removing a user from a workspace, or deleting their account, unassigns their tasks rather than deleting task history — the same "unassign, don't delete" behavior `removeMemberFromWorkspaceService` and `deleteAccountService` already implement explicitly in the service layer for the case where the FK's own automatic behavior isn't the whole story (a member being *removed from a workspace* without their account being deleted at all still needs explicit unassignment, since the FK-driven `SET NULL` only fires on an actual `DELETE FROM users`, not on a `workspace_members` row disappearing).
+
+### 3.8 `accounts` — OAuth and email/password login identities
 
 ```ts
-// backend/src/models/project.model.ts:1-47
-import mongoose, { Document, Schema } from "mongoose";
-
-export interface ProjectDocument extends Document {
-  name: string;
-  description: string | null; // Optional description for the project
-  emoji: string;
-  workspace: mongoose.Types.ObjectId;
-  createdBy: mongoose.Types.ObjectId;
-  createdAt: Date;
-  updatedAt: Date;
-}
-
-const projectSchema = new Schema<ProjectDocument>(
-  {
-    name: {
-      type: String,
-      required: true,
-      trim: true,
-    },
-    emoji: {
-      type: String,
-      required: false,
-      trim: true,
-      default: "📊",
-    },
-    description: { type: String, required: false },
-    workspace: {
-      type: Schema.Types.ObjectId,
-      ref: "Workspace",
-      required: true,
-    },
-    createdBy: {
-      type: Schema.Types.ObjectId,
-      ref: "User",
-      required: true,
-    },
-  },
-  {
-    timestamps: true,
-  }
-);
-
-// getProjectsInWorkspaceService lists/paginates by workspace on every call.
-projectSchema.index({ workspace: 1 });
-
-const ProjectModel = mongoose.model<ProjectDocument>("Project", projectSchema);
-export default ProjectModel;
+export const accounts = pgTable("accounts", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  userId: uuid("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  provider: oauthProviderEnum("provider").notNull(),
+  providerId: text("provider_id").notNull(),
+  refreshToken: text("refresh_token"),
+  tokenExpiry: timestamp("token_expiry", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
 ```
 
-Two references (`workspace`, `createdBy`), both required, both plain `ObjectId`s — no embedding of tasks inside the project document, which is the choice that most directly prevents the 16MB document-size ceiling from ever becoming a real concern here: a project with thousands of tasks stays a small, fixed-size document regardless of how many `Task` documents reference it. The single-field index on `workspace` exists specifically because workspace-scoped project listing is the dominant read pattern (see the inline comment in the source).
+| Column | Type | Nullable | Notes |
+|---|---|---|---|
+| `id` | `uuid` | no (PK) | |
+| `user_id` | `uuid` | no | FK → `users.id`, `ON DELETE CASCADE` |
+| `provider` | `oauth_provider` enum | no | `GOOGLE`\|`GITHUB`\|`FACEBOOK`\|`EMAIL` |
+| `provider_id` | `text` | no | unique in practice — a Google `sub`, or the raw email for the `EMAIL` provider |
+| `refresh_token` | `text` | yes | |
+| `token_expiry` | `timestamptz` | yes | |
+| `created_at` | `timestamptz` | no | |
 
-### 3.6 `Task`
+One user can have multiple `accounts` rows (email/password plus a linked Google identity, for instance) — the classic "one identity, many login methods" shape, carried over unchanged from the old `Account` model. One real, deliberate loss worth naming: the old Mongoose schema had a `toJSON.transform` that stripped `refreshToken` from every serialized response automatically, applied uniformly regardless of which code path serialized the document. There is no schema-level equivalent for a Drizzle-selected row — a plain `db.select().from(accounts)` returns every column, `refreshToken` included, and it is entirely the calling service's responsibility to exclude it from any response-shaping code, the same explicit-column-list discipline as `users.passwordHash` (§3.2). No current service actually returns raw `accounts` rows to a client (`findAccountByProviderService` and its callers stay internal to the auth flow), but this is worth flagging as a real, structural gap relative to the old model's automatic protection rather than assuming it away.
+
+### 3.9 Relations — Drizzle's typed join API
 
 ```ts
-// backend/src/models/task.model.ts:1-91
-import mongoose, { Document, Schema } from "mongoose";
-import {
-  TaskPriorityEnum,
-  TaskPriorityEnumType,
-  TaskStatusEnum,
-  TaskStatusEnumType,
-} from "../enums/task.enum";
-import { generateTaskCode } from "../utils/uuid";
+export const tasksRelations = relations(tasks, ({ one }) => ({
+  project: one(projects, { fields: [tasks.projectId], references: [projects.id] }),
+  assignee: one(users, { fields: [tasks.assignedTo], references: [users.id] }),
+}));
 
-export interface TaskDocument extends Document {
-  taskCode: string;
-  title: string;
-  description: string | null;
-  project: mongoose.Types.ObjectId;
-  workspace: mongoose.Types.ObjectId;
-  status: TaskStatusEnumType;
-  priority: TaskPriorityEnumType;
-  assignedTo: mongoose.Types.ObjectId | null;
-  createdBy: mongoose.Types.ObjectId;
-  dueDate: Date | null;
-  createdAt: Date;
-  updatedAt: Date;
-}
-
-const taskSchema = new Schema<TaskDocument>(
-  {
-    taskCode: {
-      type: String,
-      unique: true,
-      default: generateTaskCode,
-    },
-    title: {
-      type: String,
-      required: true,
-      trim: true,
-    },
-    description: {
-      type: String,
-      trim: true,
-      default: null,
-    },
-    project: {
-      type: Schema.Types.ObjectId,
-      ref: "Project",
-      required: true,
-    },
-    workspace: {
-      type: Schema.Types.ObjectId,
-      ref: "Workspace",
-      required: true,
-    },
-    status: {
-      type: String,
-      enum: Object.values(TaskStatusEnum),
-      default: TaskStatusEnum.TODO,
-    },
-    priority: {
-      type: String,
-      enum: Object.values(TaskPriorityEnum),
-      default: TaskPriorityEnum.MEDIUM,
-    },
-    assignedTo: {
-      type: Schema.Types.ObjectId,
-      ref: "User",
-      default: null,
-    },
-    createdBy: {
-      type: Schema.Types.ObjectId,
-      ref: "User",
-      required: true,
-    },
-    dueDate: {
-      type: Date,
-      default: null,
-    },
-  },
-  {
-    timestamps: true,
-  }
-);
-
-// getAllTasksService filters by workspace+project, workspace+status, and
-// assignedTo on every list call - none of these were indexed before.
-taskSchema.index({ workspace: 1, project: 1 });
-taskSchema.index({ workspace: 1, status: 1 });
-taskSchema.index({ assignedTo: 1 });
-
-const TaskModel = mongoose.model<TaskDocument>("Task", taskSchema);
-
-export default TaskModel;
+export const workspaceMembersRelations = relations(workspaceMembers, ({ one }) => ({
+  user: one(users, { fields: [workspaceMembers.userId], references: [users.id] }),
+  role: one(roles, { fields: [workspaceMembers.roleId], references: [roles.id] }),
+}));
 ```
 
-`Task` is the most heavily referenced-*out* model — it points to `Project`, `Workspace`, and two separate `User` references (`assignedTo`, nullable, and `createdBy`, required). There is no embedded subtasks array and no embedded comments array on `Task` — anywhere those concepts might eventually live, they don't exist yet in this schema; flagging that explicitly rather than assuming, since the task prompt specifically asked to check. Three indexes back the three real list-query shapes the application issues (workspace+project, workspace+status, assignedTo-alone) — this is denormalized *indexing* (three separate indexes covering overlapping query shapes), not denormalized *data*, and is a completely ordinary, expected pattern, distinct from the duplication tradeoff described in landscape item (c).
-
-### 3.7 `Account` — one row per linked login method
-
-```ts
-// backend/src/models/account.model.ts:1-45
-import mongoose, { Document, Schema } from "mongoose";
-import { ProviderEnum, ProviderEnumType } from "../enums/account-provider.enum";
-
-export interface AccountDocument extends Document {
-  provider: ProviderEnumType;
-  providerId: string; // Store the email, googleId, facebookId as the providerId
-  userId: mongoose.Types.ObjectId;
-  refreshToken: string | null;
-  tokenExpiry: Date | null;
-  createdAt: Date;
-}
-
-const accountSchema = new Schema<AccountDocument>(
-  {
-    userId: {
-      type: Schema.Types.ObjectId,
-      ref: "User",
-      required: true,
-    },
-    provider: {
-      type: String,
-      enum: Object.values(ProviderEnum),
-      required: true,
-    },
-    providerId: {
-      type: String,
-      required: true,
-      unique: true,
-    },
-    refreshToken: { type: String, default: null },
-    tokenExpiry: { type: Date, default: null },
-  },
-  {
-    timestamps: true,
-    toJSON: {
-      transform(doc, ret) {
-        delete (ret as Record<string, unknown>).refreshToken;
-      },
-    },
-  }
-);
-
-const AccountModel = mongoose.model<AccountDocument>("Account", accountSchema);
-export default AccountModel;
-```
-
-`Account` is the classic "one user, many login providers" shape — a single `User` can have multiple `Account` documents (email/password, Google, GitHub, Facebook — the four values of `ProviderEnum`), each referencing the same `userId`. `providerId` is globally `unique` across the whole collection, not scoped per-provider — that's a deliberate constraint, since a given provider's identifier (a Google `sub`, a raw email string for the `EMAIL` provider) is expected to be globally unique by construction regardless of which provider issued it. Note there is **no schema-level `discriminator`** here for the different providers — `provider` is a plain enum string field on one flat schema, not a Mongoose discriminator hierarchy (see §7 for whether that's a gap). A `toJSON.transform` strips `refreshToken` from any JSON serialization of this document — the schema-level analogue of `User.omitPassword()`, but automatic (applied on every `.toJSON()`/every `res.json()` of this document) rather than requiring a manual call at each use site — a meaningfully safer pattern than `User`'s, examined further in §6.
-
-### 3.8 `Session` — refresh-token storage with a TTL index
-
-```ts
-// backend/src/models/session.model.ts:1-76
-// backend/src/models/session.model.ts
-// ============================================
-// SESSION MODEL - Stores Refresh Tokens
-// ============================================
-
-/**
- * WHY STORE REFRESH TOKENS IN DATABASE?
- *
- * 1. REVOCATION: Can invalidate specific sessions (logout from one device)
- * 2. LOGOUT ALL: Can invalidate all user sessions (logout everywhere)
- * 3. SECURITY: If refresh token is compromised, can delete it
- * 4. AUDIT: Can see all active sessions for a user
- * 5. DEVICE MANAGEMENT: "Manage your devices" feature
- */
-
-import mongoose, { Document, Schema } from "mongoose";
-
-export interface SessionDocument extends Document {
-  userId: mongoose.Types.ObjectId;
-  userAgent?: string;
-  ipAddress?: string;
-  isValid: boolean; // Can be set to false to revoke
-  // SHA-256 of the refresh token this session is CURRENTLY bound to. Rotated
-  // on every successful /auth/refresh, so a previously issued (already
-  // rotated away) refresh token can be recognised as a replay rather than
-  // silently accepted. Only the hash is stored - same discipline as the
-  // password-reset and email-verification tokens.
-  refreshTokenHash?: string;
-  expiresAt: Date;
-  createdAt: Date;
-  updatedAt: Date;
-}
-
-const sessionSchema = new Schema<SessionDocument>(
-  {
-    userId: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: "User",
-      required: true,
-      index: true, // Index for fast lookup by user
-    },
-    userAgent: {
-      type: String,
-      default: null,
-    },
-    ipAddress: {
-      type: String,
-      default: null,
-    },
-    isValid: {
-      type: Boolean,
-      default: true,
-      index: true, // Index for fast filtering of valid sessions
-    },
-    refreshTokenHash: {
-      type: String,
-      default: null,
-    },
-    expiresAt: {
-      type: Date,
-      required: true,
-      index: { expireAfterSeconds: 0 }, // TTL index - MongoDB auto-deletes expired docs
-    },
-  },
-  {
-    timestamps: true,
-  }
-);
-
-// Compound index for efficient queries
-sessionSchema.index({ userId: 1, isValid: 1 });
-
-const SessionModel = mongoose.model<SessionDocument>("Session", sessionSchema);
-
-export default SessionModel;
-```
-
-`Session` never stores the raw refresh token — only `refreshTokenHash` (a SHA-256 digest, per the inline comment), rotated on every `/auth/refresh` call so a previously-issued, already-rotated-away token is detectable as a replay rather than silently honored. It carries **four indexes total**: single-field `userId`, single-field `isValid`, a compound `{ userId: 1, isValid: 1 }` (the shape "find this user's currently-valid sessions" actually queries by), and the TTL index on `expiresAt` — see §5 for what that last one buys for free.
-
-### 3.9 `PasswordResetToken` and 3.10 `EmailVerificationToken` — identical shape, same discipline
-
-These two are structurally the same model duplicated for two different flows, both hash-only, both TTL-expiring:
-
-```ts
-// backend/src/models/passwordResetToken.model.ts:1-46
-import mongoose, { Document, Schema } from "mongoose";
-
-/**
- * Stores a HASH of the reset token, never the raw value - the raw token
- * only ever exists in the email link and in memory during the request that
- * issued it. If this collection leaked, the hashes alone aren't usable to
- * reset anyone's password.
- */
-export interface PasswordResetTokenDocument extends Document {
-  userId: mongoose.Types.ObjectId;
-  tokenHash: string;
-  expiresAt: Date;
-  createdAt: Date;
-}
-
-const passwordResetTokenSchema = new Schema<PasswordResetTokenDocument>(
-  {
-    userId: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: "User",
-      required: true,
-      index: true,
-    },
-    tokenHash: {
-      type: String,
-      required: true,
-      unique: true,
-    },
-    expiresAt: {
-      type: Date,
-      required: true,
-      index: { expireAfterSeconds: 0 }, // TTL index - MongoDB auto-deletes expired docs
-    },
-  },
-  {
-    timestamps: true,
-  }
-);
-
-const PasswordResetTokenModel = mongoose.model<PasswordResetTokenDocument>(
-  "PasswordResetToken",
-  passwordResetTokenSchema
-);
-
-export default PasswordResetTokenModel;
-```
-
-```ts
-// backend/src/models/emailVerificationToken.model.ts:1-45
-import mongoose, { Document, Schema } from "mongoose";
-
-/**
- * Same shape and rationale as passwordResetToken.model.ts: only a HASH of
- * the token is ever persisted, never the raw value.
- */
-export interface EmailVerificationTokenDocument extends Document {
-  userId: mongoose.Types.ObjectId;
-  tokenHash: string;
-  expiresAt: Date;
-  createdAt: Date;
-}
-
-const emailVerificationTokenSchema = new Schema<EmailVerificationTokenDocument>(
-  {
-    userId: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: "User",
-      required: true,
-      index: true,
-    },
-    tokenHash: {
-      type: String,
-      required: true,
-      unique: true,
-    },
-    expiresAt: {
-      type: Date,
-      required: true,
-      index: { expireAfterSeconds: 0 }, // TTL index - MongoDB auto-deletes expired docs
-    },
-  },
-  {
-    timestamps: true,
-  }
-);
-
-const EmailVerificationTokenModel =
-  mongoose.model<EmailVerificationTokenDocument>(
-    "EmailVerificationToken",
-    emailVerificationTokenSchema
-  );
-
-export default EmailVerificationTokenModel;
-```
-
-Each carries a single-field index on `userId` (fast "does this user have a pending token" lookup), a `unique` constraint on `tokenHash` (a hash collision, or reissuing the identical hash, is rejected at the database level rather than only in application logic), and the same TTL pattern as `Session`. AstriX chose to model these as **two separate collections with identical shape** rather than one generic `Token` collection with a `type` discriminator field — a reasonable, if slightly repetitive, choice; a `type`-discriminated single collection would have meant every future field only relevant to one flow (e.g. a future "one-time-use consumed-at timestamp") ends up nullable on the other flow's documents too.
+These `relations()` calls declare, at the schema level, which foreign keys Drizzle's relational query API (`db.query.tasks.findMany({ with: { project: true } })`) is allowed to traverse — they generate no SQL DDL on their own (no new column, no new constraint; the actual foreign keys are the ones declared on the table definitions above). The current service layer (covered in full in [`08-database-queries-and-transactions.md`](./08-database-queries-and-transactions.md)) uses hand-written `.leftJoin()`/`.innerJoin()` calls rather than the relational query API's `with` syntax for every real query in the codebase — the `relations()` declarations exist and are correct, but are not the actual join mechanism currently in use anywhere in `backend/src/services/`.
 
 ---
 
 ## 4. Entity-Relationship Diagram
 
-Drawn directly from the `ref` targets and indexes actually present in the ten files above — no idealized or inferred relationships beyond what's written in the schemas.
+Drawn directly from the foreign keys and indexes actually present in `backend/src/db/schema.ts`.
 
 ```mermaid
 erDiagram
-    USER ||--o{ ACCOUNT : "has login methods"
-    USER ||--o{ SESSION : "has sessions"
-    USER ||--o{ MEMBER : "is member via"
-    USER ||--o{ WORKSPACE : "owns"
-    USER ||--o{ PROJECT : "created"
-    USER ||--o{ TASK : "created"
-    USER ||--o{ TASK : "assignedTo (nullable)"
-    USER ||--o| WORKSPACE : "currentWorkspace (nullable)"
-    USER ||--o{ PASSWORD_RESET_TOKEN : "requested"
-    USER ||--o{ EMAIL_VERIFICATION_TOKEN : "requested"
+    USERS ||--o{ ACCOUNTS : "has login methods"
+    USERS ||--o{ WORKSPACE_MEMBERS : "is member via"
+    USERS ||--o{ WORKSPACES : "owns"
+    USERS ||--o{ PROJECTS : "created"
+    USERS ||--o{ TASKS : "created"
+    USERS ||--o{ TASKS : "assigned_to (nullable)"
+    USERS ||--o| WORKSPACES : "current_workspace_id (nullable)"
 
-    WORKSPACE ||--o{ MEMBER : "has members"
-    WORKSPACE ||--o{ PROJECT : "contains"
-    WORKSPACE ||--o{ TASK : "contains"
+    WORKSPACES ||--o{ WORKSPACE_MEMBERS : "has members"
+    WORKSPACES ||--o{ PROJECTS : "contains"
+    WORKSPACES ||--o{ TASKS : "contains"
 
-    PROJECT ||--o{ TASK : "contains"
+    PROJECTS ||--o{ TASKS : "contains"
 
-    ROLE ||--o{ MEMBER : "assigned to"
+    ROLES ||--o{ WORKSPACE_MEMBERS : "assigned to"
 
-    USER {
-        ObjectId _id
-        string email UK
-        string password "select:true, hashed"
-        ObjectId currentWorkspace FK
+    USERS {
+        uuid id PK
+        text email UK
+        text password_hash "nullable, OAuth-only users have none"
+        uuid current_workspace_id FK "nullable, ON DELETE SET NULL"
     }
-    WORKSPACE {
-        ObjectId _id
-        ObjectId owner FK
-        string inviteCode UK
+    WORKSPACES {
+        uuid id PK
+        uuid owner_id FK "NOT NULL, no cascade (RESTRICT)"
+        text invite_code UK
     }
-    MEMBER {
-        ObjectId _id
-        ObjectId userId FK
-        ObjectId workspaceId FK
-        ObjectId role FK
+    WORKSPACE_MEMBERS {
+        uuid id PK
+        uuid user_id FK "ON DELETE CASCADE"
+        uuid workspace_id FK "ON DELETE CASCADE"
+        uuid role_id FK
     }
-    ROLE {
-        ObjectId _id
-        string name UK
-        string_array permissions "enum strings, not refs"
+    ROLES {
+        uuid id PK
+        role_name name UK "OWNER | ADMIN | MEMBER"
+        permission_array permissions "array column, not a join table"
     }
-    PROJECT {
-        ObjectId _id
-        ObjectId workspace FK
-        ObjectId createdBy FK
+    PROJECTS {
+        uuid id PK
+        uuid workspace_id FK "ON DELETE CASCADE"
+        uuid created_by FK
     }
-    TASK {
-        ObjectId _id
-        string taskCode UK
-        ObjectId project FK
-        ObjectId workspace FK
-        ObjectId assignedTo FK "nullable"
-        ObjectId createdBy FK
+    TASKS {
+        uuid id PK
+        text task_code UK
+        uuid project_id FK "ON DELETE CASCADE"
+        uuid workspace_id FK "ON DELETE CASCADE"
+        uuid assigned_to FK "nullable, ON DELETE SET NULL"
+        uuid created_by FK
+        task_status status
+        task_priority priority
     }
-    ACCOUNT {
-        ObjectId _id
-        ObjectId userId FK
-        string provider
-        string providerId UK
-        string refreshToken "stripped on toJSON"
-    }
-    SESSION {
-        ObjectId _id
-        ObjectId userId FK
-        boolean isValid
-        string refreshTokenHash
-        date expiresAt "TTL index"
-    }
-    PASSWORD_RESET_TOKEN {
-        ObjectId _id
-        ObjectId userId FK
-        string tokenHash UK
-        date expiresAt "TTL index"
-    }
-    EMAIL_VERIFICATION_TOKEN {
-        ObjectId _id
-        ObjectId userId FK
-        string tokenHash UK
-        date expiresAt "TTL index"
+    ACCOUNTS {
+        uuid id PK
+        uuid user_id FK "ON DELETE CASCADE"
+        oauth_provider provider
+        text provider_id UK
+        text refresh_token "no automatic stripping on read, see 3.8"
     }
 ```
 
-`MEMBER.role` deserves a callout the diagram compresses: it is an `ObjectId` referencing the small, near-static `ROLE` collection (three documents total, one per `RoleType`) — not an embedded permission set per membership. Every member with role `ADMIN` shares the exact same `Role` document and its `permissions` array; changing what `ADMIN` can do means updating one `Role` document, not touching every `Member`.
+`WORKSPACE_MEMBERS.role_id` is the one edge the diagram compresses: it references the small, near-static `ROLES` table (three rows total, one per `role_name` value, seeded once by `backend/src/db/seed-roles.ts`) — not a per-membership permission set. Every member with role `ADMIN` shares the exact same `roles` row and its `permissions` array; changing what `ADMIN` can do means updating one row, not touching every membership.
 
 ---
 
 ## 5. Request/Data Flow: Workspace → Member → Role → User
 
-A concrete, three-way-referenced trace: **listing a workspace's members with each member's name, email, and role permissions attached** — a real read that has to walk `Member` → `User` and `Member` → `Role` simultaneously, both being references off the same parent (`Workspace`).
+The real query behind "list a workspace's members with each member's name, email, and role attached" — `getWorkspaceMembersService` in `backend/src/services/workspace.service.ts`:
 
-1. **Entry point.** A `GET` to a workspace-scoped members endpoint arrives already carrying an authenticated `req.user` (see [02](./02-authentication-and-authorization.md)) and a `workspaceId` route param.
-2. **Membership query, not a `Workspace` field lookup.** Because `Member` — not `Workspace` — is the collection that owns the workspace↔user edges, the service layer queries `Member` by `workspaceId`, not by expanding an embedded array on the `Workspace` document (there is none):
-   ```ts
-   // illustrative shape of the actual pattern used across member.service.ts —
-   // the two populated fields are exactly the two ObjectId refs on MemberDocument
-   const members = await MemberModel.find({ workspaceId })
-     .populate("userId", "name email profilePicture")
-     .populate("role", "name permissions");
-   ```
-3. **Two `.populate()` calls, two joins, one round trip from the application's perspective.** `.populate("userId", ...)` resolves each `Member.userId` `ObjectId` against the `User` collection and replaces it in-memory with the selected fields (`name email profilePicture` — notably *not* `password`, which is how this particular read path avoids the `select: true` default entirely: an explicit field-selection string on `.populate()` acts the same as `.select()` would). `.populate("role", ...)` does the same against the tiny `Role` collection.
-4. **Under the hood**, Mongoose issues this as the original `Member.find()` query plus one additional query per populated path (effectively `User.find({ _id: { $in: [...] } })` and `Role.find({ _id: { $in: [...] } })`), not a single server-side aggregation — this is the referencing tradeoff from §1(b) made concrete: three logical collections, up to three round trips to answer one read, versus one round trip an embedded design would have cost.
-5. **Response shaping.** The controller returns the populated `Member` array as-is or maps it into a flatter DTO shape; because `.populate("role", "name permissions")` already excludes any fields not requested, the response naturally carries `role.name` and `role.permissions` without a separate `Role` fetch in the controller.
-6. **Authorization check, same three models, opposite direction.** Before this endpoint even reaches step 2, [`roleGuard`](./02-authentication-and-authorization.md) independently re-derives the requesting user's own `Member` row for this `workspaceId`, populates *its* `role`, and checks `permissions.includes(requiredPermission)` — the identical `Member`→`Role` reference walked a second time, for the *requester*, entirely separately from the *listed* members being fetched in step 2. That duplication (two separate `Member`→`Role` populations per request, one for auth, one for the response payload) is the direct cost of `Role` being a reference rather than, say, a permission set denormalized directly onto the JWT or the `Member` document at issuance time.
+```ts
+export const getWorkspaceMembersService = async (workspaceId: string) => {
+  const members = await db
+    .select({
+      id: workspaceMembers.id,
+      joinedAt: workspaceMembers.joinedAt,
+      user: {
+        id: users.id,
+        name: users.name,
+        email: users.email,
+        profilePicture: users.profilePicture,
+      },
+      role: { id: roles.id, name: roles.name },
+    })
+    .from(workspaceMembers)
+    .innerJoin(users, eq(workspaceMembers.userId, users.id))
+    .innerJoin(roles, eq(workspaceMembers.roleId, roles.id))
+    .where(eq(workspaceMembers.workspaceId, workspaceId));
+
+  return { members };
+};
+```
+
+1. **Entry point.** An authenticated `GET /api/workspace/members/:id` request reaches this service already carrying a `workspaceId` route param and a permission-checked `req.user` (see [`02-authentication-and-authorization.md`](./02-authentication-and-authorization.md)).
+2. **One query, one round trip, two joins pushed to Postgres.** This is the single most important structural difference from the old document-database version of this same read: the old Mongoose implementation issued `Member.find({ workspaceId }).populate("userId", ...).populate("role", ...)` — one query against `Member`, plus one additional query per `.populate()` call (effectively a `User.find({ _id: { $in: [...] } })` and a `Role.find({ _id: { $in: [...] } })`), stitched together in application memory by Mongoose. The Drizzle version above is **one SQL statement**: `workspace_members` joined to `users` and to `roles`, both joins evaluated server-side by Postgres's query planner in a single pass.
+3. **`innerJoin`, correctly, for both joins here** — every `workspace_members` row is guaranteed (by the `NOT NULL` FK columns) to have a real `users` row and a real `roles` row on the other end, so an inner join can never silently drop a member the way it would if either FK were nullable. Contrast this with `getAllTasksService`'s joins to `users`/`projects` (§2.6 in [`08-database-queries-and-transactions.md`](./08-database-queries-and-transactions.md)), where `assignedTo` genuinely is nullable and an `innerJoin` would be a real bug.
+4. **Response shaping.** The nested `user`/`role` objects in the `.select()` projection are exactly what the response needs — no separate mapping step, and no `password_hash`/`refresh_token`-shaped field is ever included in the projection to begin with, since Drizzle's typed `.select()` only returns the columns explicitly listed.
+5. **Authorization, the same edge, walked separately.** Before this service runs at all, the permission-checking middleware (`roleGuard`, [file 02](./02-authentication-and-authorization.md)) independently re-derives the *requesting* user's own `workspace_members` row for this workspace via `getMemberRoleInWorkspace` in `backend/src/services/member.service.ts`, joins to `roles`, and checks the permission array — a second `workspace_members`→`roles` join, for the requester, entirely separate from the members list being fetched here. That's the same duplication the old Mongoose version had (one `Member`→`Role` population for auth, one for the response payload) — normalizing `role` as a genuine foreign key rather than denormalizing the permission set onto the JWT or the membership row itself is the direct cause, in both the old and new schema.
 
 ---
 
 ## 6. Design Decisions & Tradeoffs
 
-**Why referencing over embedding, for the relationships AstriX actually has.** Every parent/child relationship in this domain — `Workspace`→`Project`, `Project`→`Task`, `Workspace`→`Member` — is unbounded-growth on the child side (a workspace can accumulate an arbitrary number of projects and tasks over its lifetime) and each child is independently addressable, updatable, and queryable on its own (a single task gets edited far more often than its parent project). Both of those properties point straight at referencing: embedding an unbounded, independently-mutated array inside a parent document is exactly the shape that runs into the 16MB ceiling and the "rewrite the whole parent to change one child" cost described in §1(a). Nothing in the ten schemas suggests this was accidental — every reference is explicit, typed, and paired with a `ref` string, and the one place a genuine array of scalars appears (`Role.permissions`) is a small, fixed-cardinality set of enum strings, not a growth-prone collection of independent entities, so it doesn't carry the same risk.
+**Why every relationship in this schema is a foreign key, never a duplicated slice.** Every parent/child edge here — `workspaces`→`projects`, `projects`→`tasks`, `workspaces`→`workspace_members` — has unbounded growth on the child side and each child row is independently addressable, updatable, and queryable on its own (a single task is edited far more often than its parent project). A relational schema doesn't offer a "duplicate a slice for read convenience" option the way a document database does — you either add a foreign key and `JOIN`, or you build denormalization yourself with an explicit staleness story (a materialized view, a cache with invalidation). This schema never does the latter for any relationship; every read that needs data from more than one table issues a `JOIN` at read time (§8 in [`08-database-queries-and-transactions.md`](./08-database-queries-and-transactions.md) covers exactly how, and the one correctness trap — `leftJoin` vs. `innerJoin` — those joins have to get right).
 
-**What a differently-modeled version of this domain would look like.** A schema leaning on embedding for the same problem might put a capped, recent-activity `tasks: [{ title, status, ... }]` array directly on `Project` for a fast "project overview" read, accepting that the full task history has to live elsewhere once it outgrows the cap — a real pattern (the "Outlier" or "Bucket" pattern in MongoDB's own terminology) but one that adds a second source of truth to keep consistent. AstriX gave up the single-query project-overview read in exchange for never having to reconcile two copies of task data, and in exchange for tasks being trivially and independently indexable (the three indexes in §3.6 wouldn't be nearly as effective, or would need to be reshaped entirely, against an embedded array).
+**What the old document-based version of this data actually looked like, and why the relational version isn't a regression.** The pre-migration schema (`backend/migrations/phase-1-schema-design-and-postgres-fundamentals.md` §1.2 records this in detail) was already, itself, reference-based rather than embedding-heavy — every one of the ten old Mongoose models was its own top-level collection, linked by `ObjectId`, resolved via `.populate()`. The client-side `TaskType`'s embedded-looking `project: { _id, emoji, name }` shape was a **read-shape** built by `.populate()` at query time, not actual duplicated storage — the Mongo documents themselves stored only a `project: ObjectId`. That matters here because it means the relational schema isn't recovering normalization that Mongo had thrown away; it's preserving normalization Mongo already had, while gaining something Mongo's document model couldn't offer at all: a database-enforced contract (the FK, the `ON DELETE` behavior) instead of an implicit convention that only held as long as every write path remembered to honor it by hand.
 
-**The `Session` TTL index solves a recurring-job problem for free.** Without `expiresAt: { index: { expireAfterSeconds: 0 } }`, an expired session document would sit in the collection forever unless something actively deleted it — which in most systems means writing, deploying, and monitoring a cron job (or a scheduled Lambda, or a `setInterval` in-process) whose entire job is "delete rows where `expiresAt < now`." MongoDB's TTL index moves that responsibility into the database engine itself: a background thread sweeps TTL-indexed collections roughly once a minute and deletes documents whose indexed date field has passed, no application code involved. `PasswordResetToken` and `EmailVerificationToken` get the identical benefit for the identical reason — all three collections are self-cleaning, and none of the three needed a bespoke cleanup job written for them.
+**`ON DELETE CASCADE` vs. `RESTRICT` vs. `SET NULL` — three different choices for three different relationships, on purpose.** `workspace_members`, `projects`, and `tasks` all cascade off `workspaces.id` — a workspace being deleted is a genuine "this whole subtree goes away" operation, and the old code already deleted all three by hand inside a transaction (`deleteWorkspaceService`); Postgres now does it atomically as a side effect of one `DELETE FROM workspaces` statement. `workspaces.owner_id` deliberately does **not** cascade off `users.id` — the opposite choice, because silently deleting a workspace (and everything in it) as a side effect of deleting one user account, with other members potentially still active in that workspace, is exactly the kind of surprising blast radius a relational schema's default-`RESTRICT` behavior exists to prevent; the application is forced to make that decision explicitly (`deleteAccountService`'s "delete or transfer ownership first" check). `tasks.assigned_to` and `users.current_workspace_id` both use `SET NULL` — a third choice again, because both are genuinely optional, UI-convenience-shaped pointers where losing the reference should degrade gracefully (an unassigned task, a user with no "current" workspace) rather than either cascading (which would be far too destructive — deleting a user shouldn't delete every task they were ever assigned to) or restricting (which would make normal account deletion impossible the moment anyone had ever been assigned a task).
+
+**The one place this schema intentionally isn't in strict 1NF.** `roles.permissions` as a `permission[]` array column is the schema's one deliberate escape hatch, argued in full in §3.4 — small, low-churn, no bidirectional-query need. It is not evidence of inconsistent normalization elsewhere; every other multi-valued relationship in the domain (`workspaces`↔`users` via `workspace_members`, most obviously) is a real join table specifically because it *does* need bidirectional querying, which is the actual test this schema applies consistently.
 
 ---
 
 ## 7. Security Considerations
 
-**Password hashes: two different real mechanisms found, not one.** The `User` schema sets `password: { type: String, select: true }` — explicitly *not* `select: false`. That means the common Mongoose convention of "sensitive fields are excluded from queries by default and must be explicitly re-`select`ed to see them" does **not** apply here; a bare `UserModel.findById(id)` returns the password hash unless the caller remembers to strip it. Checking how call sites actually handle this (rather than assuming) turned up three distinct patterns in use across the backend:
-- `services/user.service.ts` → `getCurrentUserService`: query-level exclusion via `.select("-password")`.
-- `services/auth.service.ts` → the "get authenticated user" helper: query-level exclusion via a projection object, `UserModel.findById(userId, { password: false })`.
-- `services/user.service.ts` → `updateProfileService`, and `services/auth.service.ts`'s post-login/register paths: **document-level** exclusion via the `omitPassword()` instance method (`user.omitPassword()`), which loads the full document (password hash included, in memory, however briefly) and only strips it when explicitly called before the response is shaped.
+**Password hashes: one explicit column-exclusion mechanism, not three.** The old model had three different manual mechanisms across the codebase for keeping `password` out of responses (`.select("-password")`, a projection object, and a `.omitPassword()` instance method — see the migration's own audit of this in `backend/migrations/phase-1-schema-design-and-postgres-fundamentals.md`). The current schema has no field-level `select` concept at all — every service that reads `users` writes out its column list explicitly, and `passwordHash` simply isn't in it unless the call site specifically needs to compare against it (`verifyUserService`, `changePasswordService`). This is more uniform than the old three-mechanism split, but it inherits the same underlying property: it's a call-site discipline, not something the schema itself can enforce the way a `NOT NULL` constraint enforces presence. A future service function that writes `db.select().from(users)` with no column list at all would return `passwordHash` in full — nothing in the schema stops that.
 
-None of these is wrong on its own, but three different manual mechanisms doing the same job is a real gap, not a false alarm: `select: false` at the schema level would make "leaves out the password by default" the property that holds *everywhere automatically*, including at any future call site nobody has written yet, rather than a property that holds only at the call sites someone remembered to add `.select("-password")` or `.omitPassword()` to. This is the single most actionable schema-level observation in this file.
+**`accounts.refresh_token` has no automatic stripping (§3.8).** The old model's `toJSON.transform` applied uniformly to every serialization of an `Account` document; the current schema has no equivalent, and this is a genuine, if currently low-risk (no service returns raw `accounts` rows to a client today), regression worth tracking rather than silently carrying forward as "fine because nothing hits it yet."
 
-**`Account.refreshToken` uses the safer of the two patterns.** Its `toJSON.transform` (§3.7) strips `refreshToken` automatically on every serialization — a class of protection the manual-`omitPassword()` half of `User`'s approach doesn't have, since a `transform` applies uniformly regardless of whether the code calling it remembers to do anything special. `Session.refreshTokenHash` has no such transform, but it is already a one-way hash rather than a usable secret, so its exposure risk is categorically smaller than a raw `refreshToken` or a password hash would be — though it's still not something a client response should ever need to see, and nothing in the schema itself prevents it from being serialized if a controller ever returned a raw `Session` document.
-
-**PII and error-message leakage.** `User.email`, `Workspace.inviteCode`, `Account.providerId`, `Role.name`, and `Task.taskCode` all carry `unique` constraints — a duplicate-key write against any of them fails at the database layer with a Mongo `E11000` error before the application's own validation gets a chance to reject it more gracefully. How that raw driver error gets turned into an HTTP response — and specifically whether the offending value (an email address, in the worst case) ends up echoed back in an error message — is the concern of [`04-error-handling-patterns.md`](./04-error-handling-patterns.md)'s handling of Mongoose `CastError`/duplicate-key mapping, not re-litigated here; the schema-level fact worth carrying forward is simply that five separate fields across four models are capable of triggering that code path, `User.email` being the one whose value is itself PII.
+**Unique constraints and error-message leakage.** `users.email`, `workspaces.invite_code`, `roles.name`, `workspace_members(user_id, workspace_id)`, and `accounts.provider_id` all carry unique constraints — a duplicate-value write against any of them fails at the database layer with Postgres error code `23505` before any application-level validation gets a chance to reject it more gracefully. `joinWorkspaceByInviteService` (`backend/src/services/member.service.ts`) explicitly catches `23505` and maps it to a clean `BadRequestException`; how the rest of the error-handling middleware maps a raw `23505` it doesn't explicitly catch — and specifically whether the offending value (an email address, in the worst case) ends up echoed back in an error message — is [`04-error-handling-patterns.md`](./04-error-handling-patterns.md)'s scope, not re-litigated here.
 
 ---
 
-## 8. Best Practice Check (2026)
+## 8. Best Practice Check
 
-- **`.lean()` for read-heavy queries.** A repository-wide search for `.lean(` across `backend/src` returns zero matches. Every Mongoose query in this codebase returns full hydrated Mongoose documents — complete with the change-tracking machinery, getters/setters, and instance methods that come with a Mongoose `Document` — even for pure read paths that only ever serialize the result to JSON and never call `.save()` on it. Current (2026) Mongoose guidance is to attach `.lean()` to any query whose result is read-only, which returns plain JavaScript objects instead and is meaningfully cheaper for large result sets (no document wrapping, no virtuals/getters overhead) — a real, if minor, gap here, and one that's easy to introduce incrementally since it's a per-query opt-in with no schema changes required.
-- **Schema versioning / migration strategy.** There is no `__v`-based manual migration tooling, no `migrate-mongo`/`umzug`-style migration runner, and no versioned-schema pattern (e.g. a `schemaVersion` field with per-version upgrade logic) anywhere in the ten models or the `seeders/` folder. Mongoose's own auto-managed `__v` (`versionKey`) exists on every document by default for optimistic-concurrency purposes, but that is not a migration strategy — it doesn't help reshape existing documents when a field is renamed or a type changes. This is a named absence, not an oversight to paper over: for a codebase at this stage, "no migration framework yet, schema changes are additive-only by convention" is a defensible-for-now position, but it's the kind of gap that becomes expensive to retrofit once the collections hold meaningful production data and a genuinely breaking field change is needed.
-- **Discriminators for polymorphic models.** `Account` is the one model in this domain that's a textbook candidate for a Mongoose discriminator — four `ProviderEnum` values, and at least conceivably provider-specific fields down the line (a Google-specific `googleWorkspaceDomain`, say). AstriX does not use a discriminator; `Account` is one flat schema with a `provider` enum string field and the same field set for every provider. For the current, small, uniform field set this is a perfectly reasonable, simpler choice — discriminators earn their complexity once different provider types genuinely need different fields, which none currently do here — so this reads as "matches practice for the actual requirement," not a gap.
-- **Where AstriX matches current practice cleanly:** consistent `timestamps: true` on every one of the ten schemas (no model hand-rolls `createdAt`/`updatedAt`), deliberate hash-only storage for every token-like secret (`Session`, `PasswordResetToken`, `EmailVerificationToken` all store a hash, never a raw secret), and correct, workload-driven compound/TTL indexing rather than indexing everything indiscriminately.
+- **UUID primary keys via `gen_random_uuid()`**, not serial/bigint auto-increment, on every table. This matches current (2026) practice for a schema where IDs may need to be generated client-side or across services eventually, and it's a straightforward carryover from the old model's `ObjectId` primary keys — the migration didn't have to choose between "sequential integer IDs" and "opaque IDs" as a tradeoff, since UUIDs were already the existing mental model.
+- **Native enums over `TEXT` + `CHECK`.** Matches current practice for small, code-controlled value sets (§3.1) — the ALTER TYPE migration cost is a real, known tradeoff, accepted deliberately rather than overlooked.
+- **Explicit, named indexes matching real query shapes**, not indexing every column defensively. Every index in this schema traces to an actual `WHERE`/`JOIN` clause in the service layer — verified directly against `backend/src/services/*.ts`, not asserted from the schema file alone.
+- **Where this schema still carries a gap forward from the old model, honestly:** no automatic `updated_at` trigger (§3.2) and no automatic sensitive-field stripping on `accounts.refresh_token` (§3.8) are both real, named absences — reasonable at this table count and this data-sensitivity level, but worth revisiting if either becomes a live incident rather than a theoretical gap.
+- **Drizzle-kit-generated migrations are the actual migration mechanism now**, replacing the old codebase's total absence of a schema-versioning story. `backend/src/db/migrations/0000_whole_microchip.sql`, `0001_overrated_tomorrow_man.sql`, and `0002_youthful_firestar.sql` are the three real, applied migrations — plain, readable SQL files generated from `schema.ts` by `drizzle-kit generate`, tracked in `backend/src/db/migrations/meta/_journal.json`. This is a genuine, structural improvement over the old model, which the migration's own schema-design notes flagged explicitly as having no migration framework, no `schemaVersion` field, and no reshaping strategy for existing documents at all.
 
 ---
 
 ## 9. Debug Drill
 
-**Scenario:** a `.populate()`d query is returning `null` (or silently omitting the populated field) for some documents but not others, and nothing threw an error.
+**Scenario:** a query joining two tables is returning fewer rows than expected — some rows that should be present are silently missing, and nothing threw an error.
 
-Work through it in this order, and the reasoning generalizes to any Mongoose codebase, not just this one:
+1. **Check whether the join is an `innerJoin` where it should be a `leftJoin`.** This is the single most common cause in this codebase specifically, and it's a *correctness* bug, not a performance one: an `innerJoin` against a column that can be `NULL` on one side (`tasks.assignedTo`, `tasks.projectId` in a hypothetical future nullable-project design) silently drops every row where that column is null, rather than erroring. `getAllTasksService`'s `leftJoin(users, eq(tasks.assignedTo, users.id))` exists specifically because an `innerJoin` there would make every unassigned task vanish from list results entirely — see §2.6/§6 in [`08-database-queries-and-transactions.md`](./08-database-queries-and-transactions.md) for the full worked example and its test.
+2. **Confirm the FK's `ON DELETE` behavior matches what you expect for that column.** A row that "should" be there but isn't might have been legitimately removed by a cascade — check whether the parent row was deleted, and whether the child's FK was declared `CASCADE` (row gone), `SET NULL` (row present, reference cleared — check for an unexpected `NULL`), or should have been `RESTRICT` (the delete should never have succeeded at all; if it did, the FK is missing or misconfigured).
+3. **Check the `WHERE` clause's condition list, not just the join.** `getAllTasksService` builds its `conditions` array incrementally from optional filters (`filters.status?.length`, `filters.keyword`, etc.) — a filter that's present but evaluates to an empty array/string can silently produce a `WHERE` clause that excludes everything, which reads identically to "the join is wrong" from the caller's side.
+4. **Run `EXPLAIN ANALYZE` on the actual query, not a paraphrase of it.** Confirm which indexes the planner actually chose — a query that "should" use `tasks_workspace_status_idx` but instead does a full sequential scan isn't a correctness bug on its own, but it's often the fastest way to notice that the `WHERE` clause isn't shaped the way you assumed it was (a filter condition that got compiled into a `sql` template literal slightly differently than intended, for instance).
 
-1. **Confirm the `ref` string matches a registered model name exactly.** `.populate("role")` only works if some file has actually executed `mongoose.model("Role", roleSchema)` — a typo'd `ref: "Roles"` (plural) on the schema, or a model file that's never imported anywhere so it never registers, produces silent `null` populates, not an error, because Mongoose can't know the ref was supposed to point anywhere real.
-2. **Check for orphaned/dangling references first**, since document databases (unlike relational ones) have no foreign-key constraint stopping this: if the referenced document was deleted — a `User` removed while a `Task.assignedTo` still points at their old `_id`, for instance — `.populate()` doesn't error, it just resolves that field to `null`. Query the raw `ObjectId` value directly against the target collection (`db.users.findOne({ _id: theId })`) to confirm the referenced document still exists before assuming the populate logic itself is broken.
-3. **Check whether the field was excluded by a projection somewhere in the chain.** A `.select("-someField")` or a restrictive projection object earlier in the same query chain can suppress the very field being populated, or the fields requested inside `.populate(path, selectString)` — this looks identical to "populate is broken" but is actually "populate is working, but you told it not to return that field."
-4. **Check `strictPopulate`.** Modern Mongoose throws (rather than silently no-ops) when you `.populate()` a path not declared as a `ref` in the schema — if you're instead getting a silent no-op, confirm the field genuinely has a `ref` in its schema definition rather than just holding an `ObjectId`-shaped value that happens to look like a reference.
-5. **For "some documents affected, not all," diff one affected document against one unaffected one field-by-field** — including checking whether the reference field is actually an `ObjectId` type versus, on the affected documents specifically, a raw string that was written by some older code path or a manual `db.collection.insertOne()` that bypassed Mongoose validation entirely (see §1(d) — schema-on-write only holds for writes that actually go through the ODM).
-
-**A related, equally common scenario:** a write fails with a unique-index violation you didn't expect. First check whether the index is a *compound* unique index (like `Member`'s `{ userId: 1, workspaceId: 1 }`) rather than a single-field one — a compound unique constraint is violated by the *combination*, and reading the raw Mongo `E11000` error message's `keyPattern`/`keyValue` payload (not just the generic "duplicate key" text) tells you exactly which field combination collided, rather than guessing from the field list in the schema.
+**A related, equally common scenario:** a write fails with a unique-constraint violation you didn't expect. First check whether the constraint is compound (`workspace_members_user_workspace_unique`, on `(user_id, workspace_id)` together) rather than single-column — a compound unique constraint is violated by the *combination*, and Postgres's `23505` error payload includes the actual `Key (...)=(...) already exists` detail naming exactly which columns and values collided, which is faster to read than re-deriving it from the schema file.
 
 ---
 
-Static schema shape stops here — how these models actually get queried (population strategies at scale, transactions across multiple of the collections above, connection pooling, and the `mongodb-memory-server` test setup) is [`08-database-queries-and-transactions.md`](./08-database-queries-and-transactions.md), which owns that scope deliberately to avoid duplicating it here.
+Static schema shape stops here — how these tables actually get queried (the `leftJoin`-vs-`innerJoin` correctness lesson in full, the `FILTER`-based analytics rewrite, `db.transaction()` usage, and connection pooling) is [`08-database-queries-and-transactions.md`](./08-database-queries-and-transactions.md), which owns that scope deliberately to avoid duplicating it here.

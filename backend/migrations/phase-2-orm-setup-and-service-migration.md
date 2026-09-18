@@ -569,11 +569,188 @@ verify script, run it, confirm `npm test` (Mongo suite) stays green.
 
 ---
 
-## 2.9 What to read next
+## 2.9 Actually done — status: ✅ complete, real code, verified against real Postgres
+
+Everything in this phase was actually written and run, not just described.
+Committed artifacts:
+
+- `backend/src/db/schema.ts` — the Drizzle schema, matching §2.2 exactly.
+- `backend/drizzle.config.ts`, `backend/src/db/client.ts` — pool config
+  exactly per §2.2/§2.3 (`max: 15`/`min: 2`, same reasoning as Mongo's
+  existing pool sizing).
+- `backend/src/db/migrations/000{0,1,2}_*.sql` — three generated migrations
+  (base schema, the deferred circular FK, a fix described below), applied
+  with `drizzle-kit migrate` against the Phase 0 Postgres container.
+- `backend/src/db/seed-roles.ts` — the roles seeder, replacing
+  `seeders/role.seeder.ts`.
+- `backend/src/services/pg/{user,workspace,task,project,account}.service.ts`
+  — every service this phase specifies: CRUD baseline (§2.4), the
+  transactional `createWorkspaceService` + simplified `deleteWorkspaceService`
+  (§2.5, §2.8 item 5), the `.populate()`→`leftJoin` rewrite for tasks (§2.6),
+  the `$facet`→`FILTER` rewrite for project analytics (§2.7), and the
+  remaining mechanical ports from §2.8 (`assertAssigneeIsWorkspaceMember`,
+  the 3-table `workspace_members`→`users`→`roles` join,
+  `changeMemberRoleService`).
+- `backend/scripts/verify-phase2-pg.ts`, `backend/scripts/explain-phase2-tasks.ts`
+  — the actual verify scripts §2.4-§2.8 call for, run against real data (not
+  mocked), reproduced below.
+- `GET /api/_internal/pg-check` added to `src/index.ts`, gated to
+  non-production — confirmed live and reachable alongside the untouched
+  Mongo `/health` route.
+
+### Two real bugs this phase's own execution caught
+
+Neither was hypothetical — both broke a real command before being fixed:
+
+1. **`roles.name` was missing its `UNIQUE` constraint in the Drizzle schema.**
+   Phase 1's hand-written DDL declares `name role_name NOT NULL UNIQUE`
+   (`phase-1-schema-design-and-postgres-fundamentals.md` §1.4), but this
+   phase's original Drizzle `roles` table definition (§2.2, as first
+   written) dropped it — a transcription gap between the two phases that
+   `psql`'s `\d roles` immediately exposed once `seed-roles.ts`'s
+   `.onConflictDoNothing()` had no constraint to target. Fixed by adding
+   `uniqueIndex("roles_name_idx").on(t.name)` to `schema.ts` and generating
+   `0002_youthful_firestar.sql` to apply it. This is the concrete version of
+   §2.2's own advice: "if Drizzle generated something you didn't expect,
+   that's a schema-definition bug to fix now, not later" — here it was the
+   opposite direction (something *missing*), caught the same way, by
+   actually running it rather than trusting the two docs agreed with each
+   other.
+2. **Circular-reference type inference (`users.currentWorkspaceId` ↔
+   `workspaces.ownerId`) fails under `ts-node`'s real type-checker**, even
+   though it type-checks fine under `tsx`'s type-stripping-only compiler:
+   `TS7022`/`TS7024`, "implicitly has type 'any' because it does not have a
+   type annotation and is referenced directly or indirectly in its own
+   initializer." This is a known Drizzle gotcha with mutually-referencing
+   tables, not a mistake specific to this schema — the fix is Drizzle's own
+   documented workaround, annotating each circular thunk's return type
+   explicitly: `.references((): AnyPgColumn => workspaces.id)` instead of
+   `.references(() => workspaces.id)`. Worth keeping in mind for Phase 5's
+   test suite too — if `vitest`/`ts-node` type-check test files strictly,
+   this exact error will resurface anywhere a table pair references each
+   other both ways.
+
+### A real infra collision worth recording — port 5432 conflict
+
+Connecting from the Node `pg` driver to `localhost:5432` (the address in
+Phase 0's own `DATABASE_URL`) hit **a pre-existing native Homebrew Postgres
+installation** already listening on `127.0.0.1:5432` on this machine, not
+the Docker container — `docker compose exec` (used for all of Phase 0/1's
+verification) bypasses host networking entirely, so this collision was
+invisible until an actual host-side TCP client (the Node driver) tried to
+connect. Symptom: `role "astrix" does not exist` — a real, misleading error
+that took inspecting `lsof -iTCP:5432` to diagnose correctly (two processes
+can each bind a *specific* address on the same port on macOS; the
+most-specific bound socket wins routing, so the native install's
+`127.0.0.1:5432` binding intercepted the connection ahead of Docker's
+`0.0.0.0:5432` forward). Fixed by remapping the container's host port in
+`docker-compose.yml` (`"55432:5432"` instead of `"5432:5432"`) and updating
+`DATABASE_URL` accordingly — a one-line, environment-specific fix, not a
+schema or code problem. Worth checking `lsof -iTCP:5432` on any machine
+before assuming Phase 0's default port mapping is free.
+
+### Verification — actually run, full output
+
+```
+--- 2.4 users: round-trip, passwordHash excluded ---
+OK - user round-trip matches, passwordHash absent from result
+
+--- 2.5 workspaces: transaction happy path ---
+OK - workspace + OWNER membership created atomically
+
+--- 2.5 workspaces: transaction rollback proof ---
+OK - workspace count unchanged after rollback (1 before, 1 after)
+
+--- 2.6 tasks: leftJoin, unassigned task keeps assignee:null ---
+OK - unassigned task appears with assignee: null; assigned task's assignee is joined correctly
+
+--- 2.6 tasks: assertAssigneeIsWorkspaceMember rejects a non-member ---
+OK - assigning a task to a non-member is rejected
+
+--- 2.6 tasks: cross-workspace task never appears ---
+OK - cross-workspace task does not appear
+
+--- 2.7 project analytics: FILTER-based counts ---
+OK - analytics: { totalTasks: 5, overdueTasks: 1, completedTasks: 1 }
+
+--- 2.8 workspace_members: 3-table join ---
+OK - 3-table join returns 2 members with user + role attached
+
+--- 2.8 changeMemberRoleService: rejects changing the owner's role ---
+OK - owner role-change correctly rejected
+
+--- 2.8 deleteProjectService: cascade deletes its tasks ---
+OK - project delete cascaded to its tasks (0 remain)
+
+--- 2.8 deleteWorkspaceService: cascade + currentWorkspace reassignment ---
+OK - deleteWorkspaceService result: { currentWorkspaceId: null }
+
+--- getTaskByIdService: 404 for wrong project/workspace ---
+OK - unknown task id correctly 404s
+
+All Phase 2 verifications passed.
+```
+
+Every claim this phase makes about behavior was checked directly, not just
+read as plausible: the OWNER membership is created in the same transaction
+as the workspace (§2.5), a deliberate throw before commit leaves **zero**
+trace (real rollback, not just "the try/catch didn't crash"), an unassigned
+task is present in results with `assignee: null` rather than silently
+dropped (the exact `leftJoin`-vs-`innerJoin` bug class §2.6 warns about),
+a task assigned to a non-member of the workspace is rejected, a task from
+another workspace never leaks into this workspace's list, the `FILTER`
+based analytics query's three counts match hand-computed values from
+deliberately-seeded mixed-state tasks, and both cascade deletes (project→
+tasks, workspace→members/projects/tasks) actually removed the child rows —
+none of this required inspecting Postgres logs or trusting the code, the
+assertions failed loudly on the first draft's real bugs (see above) and
+passed clean once those were fixed.
+
+### `EXPLAIN ANALYZE` at a realistic row count
+
+Phase 1 §1.7 found that on a near-empty table, Postgres correctly prefers a
+sequential scan over an index scan — the index existing doesn't guarantee
+it's used. Re-running the same query shape here against 500 seeded tasks
+(one workspace, mixed `TODO`/`DONE` status) confirms the other side of that
+lesson: once there's enough data for the index to actually pay off, the
+planner uses it without being told to:
+
+```
+Index Scan using tasks_workspace_status_idx on tasks
+  (cost=0.15..8.17 rows=1 width=208) (actual time=0.019..0.077 rows=400 loops=1)
+  Index Cond: ((workspace_id = '...'::uuid) AND (status = 'TODO'::task_status))
+Planning Time: 0.115 ms
+Execution Time: 0.103 ms
+```
+
+400 matching rows returned in 0.103ms via the compound index — this is
+`getAllTasksService`'s actual filter shape, not a paraphrase of it.
+
+### Mongo suite + build — confirmed unaffected
+
+```
+$ npm test
+ Test Files  46 passed (46)
+      Tests  561 passed | 1 skipped (562)
+
+$ npm run build
+tsc && cp ./package.json ./dist   # exit 0, no errors
+```
+
+Identical to the pre-migration baseline (root `PLAN.md`'s "561/562 tests
+passing" figure) — confirms nothing under `src/services/*.ts` (non-`pg/`),
+`src/models/*.ts`, or any live route was touched. The Postgres database was
+left holding only its three seeded roles afterward; every user/workspace/
+task/project row created during verification was explicitly deleted.
+
+---
+
+## 2.10 What to read next
 
 - [phase-3-redis-migration-and-ttl-data.md](./phase-3-redis-migration-and-ttl-data.md)
   — sessions, password reset/email verification tokens, rate limiting, and
   caching, with Redis data-structure theory.
-- [phase-4-nestjs-clean-architecture.md](./phase-4-nestjs-clean-architecture.md)
-  — restructuring these `pg/`-prefixed services into NestJS modules with a
-  proper repository/DI boundary, once both Postgres and Redis pieces exist.
+- [phase-4-clean-architecture-express.md](./phase-4-clean-architecture-express.md)
+  — restructuring these `pg/`-prefixed services behind repository
+  interfaces with a manual dependency-injection boundary (no framework),
+  once both Postgres and Redis pieces exist.

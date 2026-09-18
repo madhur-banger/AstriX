@@ -360,13 +360,133 @@ expiry).
 
 ---
 
-## 3.10 What to read next
+## 3.10 Actually done — status: ✅ complete, verified against real Docker Redis
 
-- [phase-4-nestjs-clean-architecture.md](./phase-4-nestjs-clean-architecture.md)
+Committed artifacts, all real code:
+
+- `backend/src/redis/client.ts` — the `ioredis` client, exactly per §3.3.
+- `backend/src/services/redis/session.service.ts` — `createSession`,
+  `getSession`, `rotateSessionToken`, `invalidateSession`,
+  `listSessionsForUser`, matching §3.5 exactly.
+- `backend/src/services/redis/token.service.ts` — the shared
+  `storeToken`/`consumeToken` pair replacing both
+  `passwordResetToken.model.ts` and `emailVerificationToken.model.ts`, per
+  §3.7.
+- `backend/src/services/redis/cache.ts` — `cacheAside`/`invalidateCache`,
+  per §3.9.
+- `backend/src/utils/rate-limiter.redis.ts` — the Redis-backed rate
+  limiter from §3.8, deliberately kept as a **parallel** file rather than
+  editing the live `rate-limiter.ts` in place: consistent with Phase 2's
+  "nothing here touches a live route" discipline, since `rate-limiter.ts`
+  is actually mounted in `src/index.ts`/`auth.route.ts` today. It gets
+  swapped in at Phase 6 cutover, same as every `pg/` service.
+- `backend/scripts/verify-phase3-redis.ts`,
+  `backend/scripts/verify-phase3-ratelimit.ts` — real verify scripts, run
+  against the actual Phase 0 Docker Redis container, output below.
+
+### A second port collision — the same lesson as Phase 2, on Redis this time
+
+Before any of this could be tested, `REDIS_URL=redis://localhost:6379`
+(Phase 0's default) hit the same problem Phase 2 found on Postgres:
+`lsof -iTCP:6379` showed **a native Homebrew Redis already listening on
+`127.0.0.1:6379`** on this machine, alongside Docker's forwarded port.
+Fixed the same way — remapped the container's host port in
+`docker-compose.yml` (`"63790:6379"`) and set `REDIS_URL` accordingly in
+`.env`. Worth generalizing the lesson from Phase 2 now that it's happened
+twice: **check `lsof -iTCP:<port>` for every port Phase 0's compose file
+claims, on any new machine**, before assuming the defaults are free — this
+machine happened to have both a native Postgres and a native Redis
+pre-installed, and both silently intercepted the standard port.
+
+### Verification — actually run, full output
+
+```
+--- 3.3 ioredis client: ping ---
+OK - PONG
+
+--- 3.5 sessions: create, TTL, fetch ---
+OK - session created, TTL=604800s, fetched matches
+
+--- 3.5 sessions: rotate token ---
+OK - refreshTokenHash updated after rotation
+
+--- 3.5 sessions: listSessionsForUser reflects create/invalidate ---
+OK - invalidated session gone from both the hash and the Set index
+
+--- 3.2/3.5 no-defensive-check proof: expired key returns nil immediately ---
+OK - session read as null the moment its TTL passed, no defensive check needed
+
+--- 3.6 stale Set member: listSessionsForUser filters it out ---
+OK - stale Set member (session2, key already expired) correctly filtered, not surfaced as a broken record
+
+--- 3.7 tokens: store, consume once, second consume fails ---
+OK - token consumed once via GETDEL, second consume correctly returns null
+
+--- 3.9 cache-aside: miss then hit, then invalidate ---
+OK - cache-aside: 1 fetch on miss, 0 fetches on hit, 1 more fetch after invalidation (total 2)
+
+All Phase 3 verifications passed.
+```
+
+Every non-obvious claim §3.2-§3.9 make was checked directly against a real
+Redis instance, not asserted from theory: `TTL session:<id>` reads
+`604800` (exactly 7 days, matching `SESSION_TTL_SECONDS`) immediately after
+creation; a session read 2.5 seconds after its TTL was manually shortened
+to 2 seconds returns `null` with **zero** defensive re-check in the calling
+code — the concrete proof of §3.2's "delete the entire category of bug"
+claim; the stale-Set-member scenario §3.6 warns about was deliberately
+constructed (let a session's key expire without ever calling
+`invalidateSession`/`srem` on it) and `listSessionsForUser` correctly
+filtered it out rather than returning a broken half-empty record; and the
+password-reset token's second `consumeToken` call correctly returned
+`null`, proving `GETDEL`'s single-use guarantee rather than just trusting
+it.
+
+### Rate limiter — a real Express app, real 429s
+
+```
+Statuses for 5 requests against max:3 -> [ 200, 200, 200, 429, 429 ]
+OK - 429s start exactly after the configured max
+OK - counter key 'ratelimit:verify-test:127.0.0.1' exists, TTL=900s (window is 900s)
+
+All Phase 3 rate-limit verifications passed.
+```
+
+Booted an actual throwaway Express app with `rate-limiter.redis.ts`'s
+`createRateLimiter` mounted on a real route, hit it 5 times with `max: 3`,
+and got exactly the boundary §3.8 predicts: the 4th and 5th requests are
+`429`, not the 3rd or the 6th. Confirmed the counter key lives under the
+`ratelimit:verify-test:` prefix (proving `rate-limit-redis`'s `prefix`
+option correctly replaces the current `withKeyPrefix` hand-rolled
+namespacing in `rate-limiter.ts`) with a TTL matching the 15-minute window.
+
+### Mongo suite + build + Redis cleanliness — confirmed unaffected
+
+```
+$ npm test
+ Test Files  46 passed (46)
+      Tests  561 passed | 1 skipped (562)
+
+$ npm run build
+tsc && cp ./package.json ./dist   # exit 0, no errors
+
+$ docker compose exec redis redis-cli KEYS '*'
+(empty)
+```
+
+Identical baseline to Phase 0/1/2 — confirms nothing under the live Mongo
+code path (including the still-live `rate-limiter.ts`) was touched, and
+every key created during verification was cleaned up, leaving Redis empty.
+
+---
+
+## 3.11 What to read next
+
+- [phase-4-clean-architecture-express.md](./phase-4-clean-architecture-express.md)
   — now that both Postgres services (Phase 2) and Redis services (this
-  phase) exist as plain functions, restructure them into NestJS modules with
-  injectable repositories — the clean/onion-architecture layer you asked
-  for.
+  phase) exist as plain functions, restructure them behind repository
+  interfaces with manual dependency injection (no framework) — the
+  clean/onion-architecture layer you asked for.
 - [phase-5-testing-strategy.md](./phase-5-testing-strategy.md) — how to test
-  all of this, Mongo-suite-parity included, with NestJS's DI-driven testing
-  patterns in mind.
+  all of this, Mongo-suite-parity included, with the interface-driven
+  testing patterns Phase 4's repositories enable.
