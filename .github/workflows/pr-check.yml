@@ -47,7 +47,7 @@ jobs:
         run: docker build -t astrix-backend:pr-${{ github.event.pull_request.number }} .
 
       - name: Scan image for vulnerabilities
-        uses: aquasecurity/trivy-action@0.24.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: astrix-backend:pr-${{ github.event.pull_request.number }}
           severity: CRITICAL,HIGH
